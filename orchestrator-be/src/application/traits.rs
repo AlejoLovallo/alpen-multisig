@@ -3,7 +3,9 @@
 //! Concrete implementations live in `crate::infrastructure`.
 
 use crate::domain::authority::Authority;
-use crate::domain::proposal::{ActionId, BroadcastStatus, Proposal, ProposalStatus};
+use crate::domain::proposal::{
+    ActionId, BroadcastAttempt, BroadcastStatus, Proposal, ProposalStatus,
+};
 use crate::error::AppError;
 
 /// Persistence contract for proposals.
@@ -38,6 +40,26 @@ pub(crate) trait ProposalRepository: Send + Sync {
     /// A proposal that is no longer approved does not count.
     /// `Err(Conflict)` carries `AUTHORITY_IN_FLIGHT`.
     async fn claim_broadcast(&self, action_id: &ActionId) -> Result<Proposal, AppError>;
+
+    /// Keep a commit + reveal pair a desktop registered (#605). Idempotent: a pair already kept
+    /// for this proposal (same reveal txid) is left as it was, broadcaster included.
+    async fn record_broadcast_attempt(
+        &self,
+        action_id: &ActionId,
+        attempt: BroadcastAttempt,
+    ) -> Result<(), AppError>;
+
+    /// Register another signer's pair beside the one in flight and make it the pair the row
+    /// tracks (`commit_broadcasted`, claim time now, error cleared) (#605).
+    ///
+    /// Decided under the repository's lock with `additional_pair_refusal`; a refusal is
+    /// `Err(Conflict)` carrying its text. Never touches another proposal: the authority's
+    /// in-flight bundle is already this one.
+    async fn register_additional_pair(
+        &self,
+        action_id: &ActionId,
+        attempt: BroadcastAttempt,
+    ) -> Result<Proposal, AppError>;
 
     /// Update broadcast sub-status and related txids/error for an approved proposal.
     async fn update_broadcast_status(

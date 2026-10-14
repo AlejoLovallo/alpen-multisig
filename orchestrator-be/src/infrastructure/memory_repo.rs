@@ -1,12 +1,12 @@
 //! In-memory proposal repository for POC and testing.
 
 use crate::application::proposals::{
-    broadcast_claim_allowed, BroadcastClaimFacts, AUTHORITY_IN_FLIGHT,
+    additional_pair_refusal, broadcast_claim_allowed, BroadcastClaimFacts, AUTHORITY_IN_FLIGHT,
 };
 use crate::application::traits::ProposalRepository;
 use crate::domain::authority::Authority;
 use crate::domain::proposal::{
-    ActionId, BroadcastStatus, Proposal, ProposalSignature, ProposalStatus,
+    ActionId, BroadcastAttempt, BroadcastStatus, Proposal, ProposalSignature, ProposalStatus,
 };
 use crate::error::AppError;
 use chrono::Utc;
@@ -165,6 +165,57 @@ impl ProposalRepository for InMemoryProposalRepository {
         Ok(proposal.clone())
     }
 
+    async fn record_broadcast_attempt(
+        &self,
+        action_id: &ActionId,
+        attempt: BroadcastAttempt,
+    ) -> Result<(), AppError> {
+        let mut proposals = self
+            .proposals
+            .write()
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("repo lock poisoned")))?;
+        let Some(proposal) = proposals.get_mut(action_id) else {
+            return Err(AppError::NotFound);
+        };
+        let kept = proposal
+            .broadcast_attempts
+            .iter()
+            .any(|kept| kept.reveal_txid.eq_ignore_ascii_case(&attempt.reveal_txid));
+        if !kept {
+            proposal.broadcast_attempts.push(attempt);
+        }
+        Ok(())
+    }
+
+    async fn register_additional_pair(
+        &self,
+        action_id: &ActionId,
+        attempt: BroadcastAttempt,
+    ) -> Result<Proposal, AppError> {
+        // The write lock serializes registrations in this process.
+        let mut proposals = self
+            .proposals
+            .write()
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("repo lock poisoned")))?;
+        let Some(proposal) = proposals.get_mut(action_id) else {
+            return Err(AppError::NotFound);
+        };
+        let broadcaster = attempt.broadcaster_pubkey.as_deref().unwrap_or_default();
+        if let Some(refusal) = additional_pair_refusal(proposal, broadcaster, &attempt.reveal_txid)
+        {
+            return Err(AppError::Conflict(refusal.to_string()));
+        }
+        let now = Utc::now();
+        proposal.broadcast_status = BroadcastStatus::CommitBroadcasted;
+        proposal.commit_txid = Some(attempt.commit_txid.clone());
+        proposal.reveal_txid = Some(attempt.reveal_txid.clone());
+        proposal.broadcast_error = None;
+        proposal.broadcast_claimed_at = Some(now);
+        proposal.updated_at = now;
+        proposal.broadcast_attempts.push(attempt);
+        Ok(proposal.clone())
+    }
+
     async fn update_broadcast_status(
         &self,
         action_id: &ActionId,
@@ -305,6 +356,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             broadcast_claimed_at: None,
+            broadcast_attempts: Vec::new(),
         }
     }
 

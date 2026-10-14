@@ -1,10 +1,10 @@
 use std::str::FromStr;
 
-use crate::application::proposals::AUTHORITY_IN_FLIGHT;
+use crate::application::proposals::{additional_pair_refusal, AUTHORITY_IN_FLIGHT};
 use crate::application::traits::ProposalRepository;
 use crate::domain::authority::Authority;
 use crate::domain::proposal::{
-    ActionId, BroadcastStatus, Proposal, ProposalSignature, ProposalStatus,
+    ActionId, BroadcastAttempt, BroadcastStatus, Proposal, ProposalSignature, ProposalStatus,
 };
 use crate::error::AppError;
 use chrono::{DateTime, Utc};
@@ -95,6 +95,37 @@ async fn load_signatures(
         .collect())
 }
 
+async fn load_broadcast_attempts<'e, E>(
+    executor: E,
+    action_id: &str,
+) -> Result<Vec<BroadcastAttempt>, AppError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let rows = sqlx::query(
+        r#"
+        SELECT broadcaster_pubkey, commit_txid, reveal_txid, created_at
+        FROM broadcast_attempts
+        WHERE action_id = $1
+        ORDER BY created_at ASC, reveal_txid ASC
+        "#,
+    )
+    .bind(action_id)
+    .fetch_all(executor)
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to load broadcast attempts: {e}")))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| BroadcastAttempt {
+            broadcaster_pubkey: row.get("broadcaster_pubkey"),
+            commit_txid: row.get("commit_txid"),
+            reveal_txid: row.get("reveal_txid"),
+            created_at: row.get("created_at"),
+        })
+        .collect())
+}
+
 fn row_to_proposal_no_sigs(
     row: &sqlx::postgres::PgRow,
     action_id: String,
@@ -127,6 +158,7 @@ fn row_to_proposal_no_sigs(
         created_at,
         updated_at,
         broadcast_claimed_at,
+        broadcast_attempts: Vec::new(),
     })
 }
 
@@ -224,6 +256,8 @@ impl ProposalRepository for PostgresProposalRepository {
         let signatures = load_signatures(&self.pool, &action_id_str).await?;
         let mut proposal = row_to_proposal_no_sigs(&row, action_id_str)?;
         proposal.signatures = signatures;
+        proposal.broadcast_attempts =
+            load_broadcast_attempts(&self.pool, &proposal.action_id.0).await?;
         Ok(Some(proposal))
     }
 
@@ -311,6 +345,10 @@ impl ProposalRepository for PostgresProposalRepository {
             let signatures = load_signatures(&self.pool, &action_id_str).await?;
             let mut proposal = row_to_proposal_no_sigs(&row, action_id_str)?;
             proposal.signatures = signatures;
+            proposal.broadcast_attempts =
+                load_broadcast_attempts(&self.pool, &proposal.action_id.0).await?;
+            proposal.broadcast_attempts =
+                load_broadcast_attempts(&self.pool, &proposal.action_id.0).await?;
             proposals.push(proposal);
         }
 
@@ -398,7 +436,111 @@ impl ProposalRepository for PostgresProposalRepository {
         let signatures = load_signatures(&self.pool, &action_id_str).await?;
         let mut proposal = row_to_proposal_no_sigs(&row, action_id_str)?;
         proposal.signatures = signatures;
+        proposal.broadcast_attempts =
+            load_broadcast_attempts(&self.pool, &proposal.action_id.0).await?;
         Ok(proposal)
+    }
+
+    async fn record_broadcast_attempt(
+        &self,
+        action_id: &ActionId,
+        attempt: BroadcastAttempt,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            r#"
+            INSERT INTO broadcast_attempts(action_id, broadcaster_pubkey, commit_txid, reveal_txid, created_at)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (action_id, reveal_txid) DO NOTHING
+            "#,
+        )
+        .bind(&action_id.0)
+        .bind(attempt.broadcaster_pubkey.as_deref())
+        .bind(&attempt.commit_txid)
+        .bind(&attempt.reveal_txid)
+        .bind(attempt.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            AppError::Internal(anyhow::anyhow!("failed to record broadcast attempt: {e}"))
+        })?;
+        Ok(())
+    }
+
+    async fn register_additional_pair(
+        &self,
+        action_id: &ActionId,
+        attempt: BroadcastAttempt,
+    ) -> Result<Proposal, AppError> {
+        // Lock the row so two registrations — or one beside a claim or a report — are decided
+        // one after the other on what the previous one wrote.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to begin tx: {e}")))?;
+
+        let row = sqlx::query(&format!(
+            "SELECT {SELECT_PROPOSAL_COLS} FROM proposals WHERE action_id = $1 FOR UPDATE"
+        ))
+        .bind(&action_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to lock proposal: {e}")))?;
+        let Some(row) = row else {
+            return Err(AppError::NotFound);
+        };
+        let mut current = row_to_proposal_no_sigs(&row, action_id.0.clone())?;
+        current.broadcast_attempts = load_broadcast_attempts(&mut *tx, &action_id.0).await?;
+
+        let broadcaster = attempt.broadcaster_pubkey.as_deref().unwrap_or_default();
+        if let Some(refusal) = additional_pair_refusal(&current, broadcaster, &attempt.reveal_txid)
+        {
+            return Err(AppError::Conflict(refusal.to_string()));
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO broadcast_attempts(action_id, broadcaster_pubkey, commit_txid, reveal_txid, created_at)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(&action_id.0)
+        .bind(attempt.broadcaster_pubkey.as_deref())
+        .bind(&attempt.commit_txid)
+        .bind(&attempt.reveal_txid)
+        .bind(attempt.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            AppError::Internal(anyhow::anyhow!("failed to register broadcast attempt: {e}"))
+        })?;
+
+        sqlx::query(
+            r#"
+            UPDATE proposals
+            SET broadcast_status = 'commit_broadcasted',
+                commit_txid = $2,
+                reveal_txid = $3,
+                broadcast_error = NULL,
+                broadcast_claimed_at = NOW(),
+                updated_at = NOW()
+            WHERE action_id = $1
+            "#,
+        )
+        .bind(&action_id.0)
+        .bind(&attempt.commit_txid)
+        .bind(&attempt.reveal_txid)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to track the new pair: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to commit tx: {e}")))?;
+
+        self.find_by_action_id(action_id)
+            .await?
+            .ok_or(AppError::NotFound)
     }
 
     async fn update_broadcast_status(
@@ -460,6 +602,8 @@ impl ProposalRepository for PostgresProposalRepository {
         let signatures = load_signatures(&self.pool, &action_id_str).await?;
         let mut proposal = row_to_proposal_no_sigs(&row, action_id_str)?;
         proposal.signatures = signatures;
+        proposal.broadcast_attempts =
+            load_broadcast_attempts(&self.pool, &proposal.action_id.0).await?;
         Ok(Some(proposal))
     }
 

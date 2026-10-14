@@ -5,8 +5,8 @@
 use crate::application::traits::ProposalRepository;
 use crate::domain::authority::Authority;
 use crate::domain::proposal::{
-    compute_action_id, ActionId, BroadcastStatus, Proposal, ProposalSignature, ProposalStatus,
-    SeqNo,
+    compute_action_id, ActionId, BroadcastAttempt, BroadcastStatus, Proposal, ProposalSignature,
+    ProposalStatus, SeqNo,
 };
 use crate::error::AppError;
 use crate::infrastructure::asm_role_membership::{
@@ -90,6 +90,7 @@ pub(crate) async fn create_update_action(
         created_at: Utc::now(),
         updated_at: Utc::now(),
         broadcast_claimed_at: None,
+        broadcast_attempts: Vec::new(),
     };
 
     repo.save_proposal(proposal.clone()).await?;
@@ -469,6 +470,93 @@ pub(crate) async fn claim_broadcast_coordination(
     repo.claim_broadcast(action_id).await
 }
 
+/// Conflict text when there is no pair in flight to send another one beside (#605).
+pub(crate) const NO_PAIR_IN_FLIGHT: &str =
+    "this proposal has no commit and reveal in flight to send another pair beside";
+
+/// Conflict text when the caller already registered a pair for this proposal (#605).
+pub(crate) const OWN_PAIR_EXISTS: &str = "you already sent a commit and reveal for this proposal";
+
+/// Why another commit + reveal pair may not be registered for `proposal`, or `None` (#605).
+///
+/// Only beside a pair that is on its way: the row is approved and `commit_broadcasted` with a
+/// txid, `commit_confirmed` or `reveal_broadcasted`. An empty claim is a signer still at the
+/// device; `idle`, `failed` and a stale empty claim go through the claim instead. One pair per
+/// signer: whoever already sent one bumps its fee, and the desktop holds one stored bundle per
+/// proposal. Shared by both repositories, which evaluate it under their own lock.
+pub(crate) fn additional_pair_refusal(
+    proposal: &Proposal,
+    broadcaster_pubkey: &str,
+    reveal_txid: &str,
+) -> Option<&'static str> {
+    let in_flight = proposal.status == ProposalStatus::Approved
+        && match proposal.broadcast_status {
+            BroadcastStatus::CommitBroadcasted => proposal.reveal_txid.is_some(),
+            BroadcastStatus::CommitConfirmed | BroadcastStatus::RevealBroadcasted => true,
+            _ => false,
+        };
+    if !in_flight {
+        return Some(NO_PAIR_IN_FLIGHT);
+    }
+    let already_sent = proposal.broadcast_attempts.iter().any(|attempt| {
+        attempt
+            .broadcaster_pubkey
+            .as_deref()
+            .is_some_and(|pubkey| pubkey.eq_ignore_ascii_case(broadcaster_pubkey))
+            || attempt.reveal_txid.eq_ignore_ascii_case(reveal_txid)
+    });
+    already_sent.then_some(OWN_PAIR_EXISTS)
+}
+
+fn require_txid(name: &str, txid: &str) -> Result<(), AppError> {
+    if txid.len() == 64 && txid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(());
+    }
+    Err(AppError::BadRequest(format!(
+        "{name} must be a 64-char hex txid"
+    )))
+}
+
+/// Register a signer's own commit + reveal pair beside the one already in flight (#605).
+///
+/// A low-fee bundle can sit in the mempool while the other signers have no way to advance it.
+/// Every pair carries the same signed payload, so whichever reveal is mined first is the one the
+/// ASM acts on and the rest are rejected on the sequence number. The new pair becomes the one the
+/// row tracks (`commit_broadcasted`); the earlier ones stay listed and the reconcile still promotes
+/// the row if one of them is mined first. Registered before anything is broadcast, like the
+/// claimer's pre-registration (#516).
+pub(crate) async fn register_additional_pair(
+    repo: &dyn ProposalRepository,
+    session: SessionContext<'_>,
+    asm_rpc_url: &str,
+    action_id: &ActionId,
+    commit_txid: &str,
+    reveal_txid: &str,
+) -> Result<Proposal, AppError> {
+    require_txid("commit_txid", commit_txid)?;
+    require_txid("reveal_txid", reveal_txid)?;
+    let raw = repo
+        .find_by_action_id(action_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_proposal_authority(&raw, session.authority)?;
+
+    let proposal = require_approved(raw)?;
+    ensure_threshold_snapshot_current(&proposal, asm_rpc_url).await?;
+    ensure_seq_no_still_open(&proposal, asm_rpc_url).await?;
+
+    repo.register_additional_pair(
+        action_id,
+        BroadcastAttempt {
+            broadcaster_pubkey: Some(normalize_signer_pubkey_hex(session.signer_pubkey)),
+            commit_txid: commit_txid.to_ascii_lowercase(),
+            reveal_txid: reveal_txid.to_ascii_lowercase(),
+            created_at: Utc::now(),
+        },
+    )
+    .await
+}
+
 /// Refuse to broadcast a bundle the ASM will refuse.
 ///
 /// Upstream accepts an action only when its seqno is strictly above the role's `last_seqno`, so a
@@ -487,6 +575,60 @@ async fn ensure_seq_no_still_open(proposal: &Proposal, asm_rpc_url: &str) -> Res
          this proposal can no longer be broadcast and needs to be recreated",
         proposal.seq_no, last_seqno
     )))
+}
+
+/// The pair whose reveal was mined, out of every pair registered for a proposal (#605).
+enum MinedPair {
+    /// The pair the row already tracks.
+    Tracked,
+    /// An earlier pair, mined before the one the row tracks.
+    Other {
+        commit_txid: String,
+        reveal_txid: String,
+    },
+}
+
+/// The pair mined first: the lowest block height, the row's own pair on a tie. Two reveals in one
+/// block activate at the same height whichever the ASM took. `None` when no reveal is mined, or the
+/// node could not say.
+async fn first_mined_pair(
+    proposal: &Proposal,
+    btc_client: &dyn BitcoinRpcClient,
+) -> Option<MinedPair> {
+    let mut best: Option<(u64, MinedPair)> = None;
+    if let Some(reveal_txid) = proposal.reveal_txid.as_deref() {
+        if let Ok(height) = btc_client.get_block_height_for_txid(reveal_txid).await {
+            best = Some((height, MinedPair::Tracked));
+        }
+    }
+    for attempt in &proposal.broadcast_attempts {
+        let tracked = proposal
+            .reveal_txid
+            .as_deref()
+            .is_some_and(|txid| txid.eq_ignore_ascii_case(&attempt.reveal_txid));
+        if tracked {
+            continue;
+        }
+        let Ok(height) = btc_client
+            .get_block_height_for_txid(&attempt.reveal_txid)
+            .await
+        else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(best_height, _)| height < *best_height)
+        {
+            best = Some((
+                height,
+                MinedPair::Other {
+                    commit_txid: attempt.commit_txid.clone(),
+                    reveal_txid: attempt.reveal_txid.clone(),
+                },
+            ));
+        }
+    }
+    best.map(|(_, pair)| pair)
 }
 
 /// Notice a reveal that confirmed while nothing was watching.
@@ -516,23 +658,25 @@ async fn confirm_reveal_if_mined(
     ) {
         return proposal;
     }
-    let Some(reveal_txid) = proposal.reveal_txid.clone() else {
+    let Some(winner) = first_mined_pair(&proposal, btc_client).await else {
         return proposal;
     };
-    if btc_client
-        .get_block_height_for_txid(&reveal_txid)
-        .await
-        .is_err()
-    {
-        return proposal;
-    }
+    // The row tracks the latest pair; when another one was mined first, that is the one the ASM
+    // acted on, so it becomes the row's pair and the activation height is read from it (#605).
+    let (commit_txid, reveal_txid) = match winner {
+        MinedPair::Tracked => (None, None),
+        MinedPair::Other {
+            commit_txid,
+            reveal_txid,
+        } => (Some(commit_txid), Some(reveal_txid)),
+    };
     let updated = repo
         .update_broadcast_status(
             &proposal.action_id,
             BroadcastStatus::RevealConfirmed,
             None,
-            None,
-            None,
+            commit_txid.as_deref(),
+            reveal_txid.as_deref(),
             None,
         )
         .await;
@@ -964,6 +1108,7 @@ pub(crate) async fn create_cancel_proposal(
         created_at: Utc::now(),
         updated_at: Utc::now(),
         broadcast_claimed_at: None,
+        broadcast_attempts: Vec::new(),
     };
 
     repo.save_proposal(proposal.clone()).await?;
@@ -993,7 +1138,7 @@ async fn compute_and_store_activation_height(
 pub(crate) async fn report_broadcast_progress(
     repo: &dyn ProposalRepository,
     asm_rpc_url: &str,
-    session_authority: Authority,
+    session: SessionContext<'_>,
     action_id: &ActionId,
     btc_client: &dyn BitcoinRpcClient,
     body: ReportBroadcastProgressRequest,
@@ -1002,7 +1147,24 @@ pub(crate) async fn report_broadcast_progress(
         .find_by_action_id(action_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    require_proposal_authority(&raw, session_authority)?;
+    require_proposal_authority(&raw, session.authority)?;
+
+    // A report about a pair the row no longer tracks comes from a bundle another signer's pair
+    // replaced (#605): its `failed` or `reveal_broadcasted` would overwrite the pair now in
+    // flight. It changes nothing; if that reveal is mined, the reconcile finds it among the pairs.
+    if let (Some(reported), Some(tracked)) =
+        (body.reveal_txid.as_deref(), raw.reveal_txid.as_deref())
+    {
+        if !reported.eq_ignore_ascii_case(tracked) {
+            tracing::info!(
+                action_id = %action_id.0,
+                reported,
+                tracked,
+                "broadcast report for a pair the row no longer tracks; ignored"
+            );
+            return Ok(raw);
+        }
+    }
 
     let broadcast_status: BroadcastStatus = body.broadcast_status.parse()?;
     let proposal_status = match body.proposal_status.as_deref() {
@@ -1049,6 +1211,22 @@ pub(crate) async fn report_broadcast_progress(
             )));
         }
     };
+
+    // Every pair a desktop registers is kept, so a later pair beside it cannot hide it (#605).
+    if let (Some(commit_txid), Some(reveal_txid)) =
+        (body.commit_txid.as_deref(), body.reveal_txid.as_deref())
+    {
+        repo.record_broadcast_attempt(
+            action_id,
+            BroadcastAttempt {
+                broadcaster_pubkey: Some(normalize_signer_pubkey_hex(session.signer_pubkey)),
+                commit_txid: commit_txid.to_string(),
+                reveal_txid: reveal_txid.to_string(),
+                created_at: Utc::now(),
+            },
+        )
+        .await?;
+    }
 
     let updated = repo
         .update_broadcast_status(
@@ -1613,6 +1791,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             broadcast_claimed_at: None,
+            broadcast_attempts: Vec::new(),
         };
         repo.save_proposal(proposal.clone()).await.unwrap();
 
@@ -2193,6 +2372,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             broadcast_claimed_at: None,
+            broadcast_attempts: Vec::new(),
         };
         repo.save_proposal(foreign).await.unwrap();
         repo.stage_broadcast_claim(
@@ -2380,6 +2560,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             broadcast_claimed_at: None,
+            broadcast_attempts: Vec::new(),
         };
         repo.save_proposal(alpen_proposal).await.unwrap();
 
@@ -2454,6 +2635,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 broadcast_claimed_at: None,
+                broadcast_attempts: Vec::new(),
             };
             repo.save_proposal(proposal.clone()).await.unwrap();
 
@@ -2511,6 +2693,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             broadcast_claimed_at: None,
+            broadcast_attempts: Vec::new(),
         };
 
         let err = ensure_threshold_snapshot_current(&proposal, "mock://asm-membership")
@@ -2601,7 +2784,10 @@ mod tests {
         let updated = report_broadcast_progress(
             &repo,
             "mock://asm-membership",
-            Authority::StrataAdmin,
+            SessionContext {
+                authority: Authority::StrataAdmin,
+                signer_pubkey: &sig_a().signer_pubkey,
+            },
             &action_id,
             &mock_btc(),
             ReportBroadcastProgressRequest {
@@ -2627,7 +2813,10 @@ mod tests {
         let err = report_broadcast_progress(
             &repo,
             "mock://asm-membership",
-            Authority::StrataAdmin,
+            SessionContext {
+                authority: Authority::StrataAdmin,
+                signer_pubkey: &sig_a().signer_pubkey,
+            },
             &action_id,
             &mock_btc(),
             ReportBroadcastProgressRequest {
@@ -3470,5 +3659,342 @@ mod tests {
             1,
             "only one signature from sig_b must be stored"
         );
+    }
+
+    // ── #605: another signer's commit + reveal pair ─────────────────────────
+
+    const COMMIT_A: &str = "aa00000000000000000000000000000000000000000000000000000000000000";
+    const REVEAL_A: &str = "aa11111111111111111111111111111111111111111111111111111111111111";
+    const COMMIT_B: &str = "bb00000000000000000000000000000000000000000000000000000000000000";
+    const REVEAL_B: &str = "bb11111111111111111111111111111111111111111111111111111111111111";
+
+    /// Mines only the txids it is given, each at its own height.
+    struct MinedTxids(std::collections::HashMap<&'static str, u64>);
+
+    #[async_trait::async_trait]
+    impl BitcoinRpcClient for MinedTxids {
+        async fn estimate_fee_rate_sats_per_vb(
+            &self,
+            _target_blocks: u16,
+        ) -> Result<u64, AppError> {
+            Ok(1)
+        }
+
+        async fn get_block_height_for_txid(&self, txid: &str) -> Result<u64, AppError> {
+            self.0
+                .get(txid)
+                .copied()
+                .ok_or_else(|| AppError::Internal(anyhow::anyhow!("not in a block")))
+        }
+
+        async fn get_chain_tip(&self) -> Result<u64, AppError> {
+            Ok(800_000)
+        }
+    }
+
+    fn session_of(sig: &ProposalSignature) -> SessionContext<'_> {
+        SessionContext {
+            authority: Authority::StrataAdmin,
+            signer_pubkey: &sig.signer_pubkey,
+        }
+    }
+
+    fn report(
+        status: &str,
+        commit: Option<&str>,
+        reveal: Option<&str>,
+    ) -> ReportBroadcastProgressRequest {
+        ReportBroadcastProgressRequest {
+            broadcast_status: status.to_string(),
+            proposal_status: None,
+            commit_txid: commit.map(str::to_string),
+            reveal_txid: reveal.map(str::to_string),
+            broadcast_error: None,
+        }
+    }
+
+    /// Signer A claimed, pre-registered its pair and sent it: the row is `reveal_broadcasted`.
+    async fn save_with_pair_of_a(repo: &InMemoryProposalRepository) -> ActionId {
+        // A decodable action, so the confirmed reveal yields an activation height.
+        let created = create_update_action(
+            repo,
+            session_of(&sig_a()),
+            1,
+            &test_fixture_action_hex(),
+            &sig_a(),
+            2,
+            None,
+        )
+        .await
+        .unwrap();
+        let action_id = created.action_id;
+        approve_action(repo, session_of(&sig_b()), &action_id, &sig_b())
+            .await
+            .unwrap();
+        transition_to_approved(
+            repo,
+            session_of(&sig_b()),
+            "mock://asm-membership",
+            &action_id,
+        )
+        .await
+        .unwrap();
+        claim_broadcast_coordination(
+            repo,
+            Authority::StrataAdmin,
+            "mock://asm-membership",
+            &action_id,
+        )
+        .await
+        .unwrap();
+        for status in ["commit_broadcasted", "reveal_broadcasted"] {
+            report_broadcast_progress(
+                repo,
+                "mock://asm-membership",
+                session_of(&sig_a()),
+                &action_id,
+                &mock_btc(),
+                report(status, Some(COMMIT_A), Some(REVEAL_A)),
+            )
+            .await
+            .unwrap();
+        }
+        action_id
+    }
+
+    async fn register_pair_of_b(
+        repo: &InMemoryProposalRepository,
+        action_id: &ActionId,
+    ) -> Result<Proposal, AppError> {
+        register_additional_pair(
+            repo,
+            session_of(&sig_b()),
+            "mock://asm-membership",
+            action_id,
+            COMMIT_B,
+            REVEAL_B,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_claimers_pair_is_kept_with_its_broadcaster() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        assert_eq!(
+            proposal.broadcast_attempts.len(),
+            1,
+            "one pair, reported twice"
+        );
+        let attempt = &proposal.broadcast_attempts[0];
+        assert_eq!(
+            attempt.broadcaster_pubkey.as_deref(),
+            Some(sig_a().signer_pubkey.as_str())
+        );
+        assert_eq!(
+            (attempt.commit_txid.as_str(), attempt.reveal_txid.as_str()),
+            (COMMIT_A, REVEAL_A)
+        );
+    }
+
+    #[tokio::test]
+    async fn another_signer_sends_their_own_pair_beside_one_in_flight() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+
+        let proposal = register_pair_of_b(&repo, &action_id).await.unwrap();
+
+        assert_eq!(
+            proposal.broadcast_status,
+            BroadcastStatus::CommitBroadcasted
+        );
+        assert_eq!(proposal.commit_txid.as_deref(), Some(COMMIT_B));
+        assert_eq!(proposal.reveal_txid.as_deref(), Some(REVEAL_B));
+        let reveals: Vec<&str> = proposal
+            .broadcast_attempts
+            .iter()
+            .map(|attempt| attempt.reveal_txid.as_str())
+            .collect();
+        assert_eq!(reveals, [REVEAL_A, REVEAL_B], "the first pair stays listed");
+    }
+
+    #[tokio::test]
+    async fn a_signer_who_already_sent_a_pair_is_refused() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+
+        let err = register_additional_pair(
+            &repo,
+            session_of(&sig_a()),
+            "mock://asm-membership",
+            &action_id,
+            COMMIT_B,
+            REVEAL_B,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Conflict(ref m) if m == OWN_PAIR_EXISTS),
+            "{err:?}"
+        );
+
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+        let err = register_pair_of_b(&repo, &action_id).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::Conflict(ref m) if m == OWN_PAIR_EXISTS),
+            "{err:?}"
+        );
+    }
+
+    /// Nothing on its way means nothing to send beside: `idle` and `failed` go through the claim,
+    /// and an empty claim is a signer still at the device.
+    #[tokio::test]
+    async fn a_pair_is_refused_without_one_in_flight() {
+        let repo = new_repo();
+        let action_id = save_approved(&repo, 1).await;
+        let err = register_pair_of_b(&repo, &action_id).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::Conflict(ref m) if m == NO_PAIR_IN_FLIGHT),
+            "idle: {err:?}"
+        );
+
+        claim_broadcast_coordination(
+            &repo,
+            Authority::StrataAdmin,
+            "mock://asm-membership",
+            &action_id,
+        )
+        .await
+        .unwrap();
+        let err = register_pair_of_b(&repo, &action_id).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::Conflict(ref m) if m == NO_PAIR_IN_FLIGHT),
+            "empty claim: {err:?}"
+        );
+
+        repo.stage_broadcast_claim(
+            &action_id,
+            BroadcastStatus::Failed,
+            Some(COMMIT_A),
+            Some(REVEAL_A),
+            None,
+            Some("rejected"),
+        )
+        .unwrap();
+        let err = register_pair_of_b(&repo, &action_id).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::Conflict(ref m) if m == NO_PAIR_IN_FLIGHT),
+            "failed: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pair_needs_real_txids() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        let err = register_additional_pair(
+            &repo,
+            session_of(&sig_b()),
+            "mock://asm-membership",
+            &action_id,
+            "commit",
+            REVEAL_B,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)), "{err:?}");
+    }
+
+    /// The first pair's bundle is still being watched by its own desktop. Once a later pair is the
+    /// one the row tracks, that desktop's `failed` must not mark the new pair failed.
+    #[tokio::test]
+    async fn a_report_about_a_replaced_pair_changes_nothing() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+
+        let mut stale = report("failed", Some(COMMIT_A), Some(REVEAL_A));
+        stale.broadcast_error = Some(DROPPED_FOR_TEST.to_string());
+        let after = report_broadcast_progress(
+            &repo,
+            "mock://asm-membership",
+            session_of(&sig_a()),
+            &action_id,
+            &mock_btc(),
+            stale,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(after.broadcast_status, BroadcastStatus::CommitBroadcasted);
+        assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_B));
+        assert!(after.broadcast_error.is_none());
+    }
+
+    const DROPPED_FOR_TEST: &str = "dropped";
+
+    /// The first pair was mined after all: that is the one the ASM acted on, so it becomes the
+    /// row's pair and the activation height is read from its block.
+    #[tokio::test]
+    async fn an_earlier_pair_mined_first_becomes_the_rows_pair() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        let btc = MinedTxids([(REVEAL_A, 800_010)].into_iter().collect());
+
+        let confirmed =
+            confirm_reveal_if_mined(&repo, proposal, &btc, "mock://asm-membership").await;
+
+        assert_eq!(confirmed.broadcast_status, BroadcastStatus::RevealConfirmed);
+        assert_eq!(confirmed.commit_txid.as_deref(), Some(COMMIT_A));
+        assert_eq!(confirmed.reveal_txid.as_deref(), Some(REVEAL_A));
+        let stored = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        // the reveal's block + the uniform mock lock period 2016
+        assert_eq!(stored.activation_height, Some(802_026));
+    }
+
+    #[tokio::test]
+    async fn of_two_mined_pairs_the_lower_block_wins() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        let btc = MinedTxids(
+            [(REVEAL_A, 800_011), (REVEAL_B, 800_010)]
+                .into_iter()
+                .collect(),
+        );
+
+        let confirmed =
+            confirm_reveal_if_mined(&repo, proposal, &btc, "mock://asm-membership").await;
+
+        assert_eq!(
+            confirmed.reveal_txid.as_deref(),
+            Some(REVEAL_B),
+            "the row's own pair, mined first"
+        );
+        let stored = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        assert_eq!(stored.activation_height, Some(802_026));
+    }
+
+    #[tokio::test]
+    async fn no_mined_pair_leaves_the_row_in_flight() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        let btc = MinedTxids(std::collections::HashMap::new());
+
+        let unchanged =
+            confirm_reveal_if_mined(&repo, proposal, &btc, "mock://asm-membership").await;
+
+        assert_eq!(
+            unchanged.broadcast_status,
+            BroadcastStatus::CommitBroadcasted
+        );
+        assert_eq!(unchanged.reveal_txid.as_deref(), Some(REVEAL_B));
     }
 }
