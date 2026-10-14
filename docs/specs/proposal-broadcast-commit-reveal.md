@@ -137,7 +137,15 @@ Request body:
 
 ### 3) Read proposal status
 
-`GET /proposals` and `GET /proposals/:action_id` include `broadcastStatus`, `commitTxid`, `revealTxid`, `broadcastError` when present, and `broadcastClaimStale` (see "One broadcast in flight per authority").
+`GET /proposals` and `GET /proposals/:action_id` include `broadcastStatus`, `commitTxid`, `revealTxid`, `broadcastError` when present, `broadcastClaimStale` (see "One broadcast in flight per authority"), and `broadcastAttempts` — every commit + reveal pair sent, oldest first (see "Another signer's commit + reveal").
+
+### 4) Register another signer's pair (#605)
+
+`POST /proposals/:action_id/broadcast/attempts` with `{ "commit_txid": "hex", "reveal_txid": "hex" }` (64-char txids).
+
+- Same checks as the claim: session authority, `approved`, threshold snapshot, sequence number still open.
+- `409` when there is no pair in flight to send beside, or when the caller already sent a pair for this proposal.
+- Returns the updated `Proposal` JSON. See "Another signer's commit + reveal".
 
 ## Technical Design
 
@@ -377,6 +385,47 @@ server clock, so no desktop's clock can reopen Send early, and a payload without
 `false`. Rows that were already `commit_broadcasted`, `commit_confirmed` or `reveal_broadcasted`
 when the column was added copy `updated_at` into it. Postgres locks every proposal of the authority before the update, so two
 claims of different proposals cannot both pass.
+
+### Another signer's commit + reveal (#605)
+
+PRD 5.c.ii.3.a. A pair broadcast at a low fee can sit in the mempool while every other signer is
+locked out: the claim is taken, and recreating the proposal fails on the sequence number. Any
+signer of the authority who has **not** sent a pair for the proposal can send their own beside it.
+Every pair carries the same signed payload, so whichever reveal is mined first is the one the ASM
+acts on; the others are refused on the sequence number and cost only their fees.
+
+- **Pairs.** Every pair is kept in `broadcast_attempts` (`broadcaster_pubkey`, `commit_txid`,
+  `reveal_txid`, `created_at`; key `(action_id, reveal_txid)`). A progress report carrying both
+  txids records the pair with the reporting signer (idempotent), so the claimer's pre-registration
+  is the first pair. Pairs registered before #605 are backfilled with no broadcaster.
+- **When.** Only beside a pair on its way: `approved` and `commit_broadcasted` with a txid,
+  `commit_confirmed` or `reveal_broadcasted` (`additional_pair_refusal`). An empty claim is a
+  signer still at the device; `idle`, `failed` and a stale empty claim go through the claim. One
+  pair per signer: whoever already sent one bumps its fee (CPFP on the reveal change), and the
+  desktop holds one stored bundle per proposal.
+- **The row tracks the latest pair.** Registering sets the row's `commit_txid` / `reveal_txid` to
+  the new pair, `commit_broadcasted`, claim time now, error cleared — under a row lock. From there
+  the new sender's desktop reports on the row as any claimer would; the per-authority gate is
+  unchanged, since this proposal is already the authority's in-flight one.
+- **Reports about a replaced pair change nothing.** A `PATCH` whose `reveal_txid` differs from the
+  row's is ignored and returns the row as it is: the earlier sender's settle loop would otherwise
+  mark the new pair `failed` or move its status. The desktop already reports only to a row that
+  carries its own reveal txid (`BundleRow::Ours`), and a `failed` report now names its pair.
+- **Reconcile picks the pair mined first.** `confirm_reveal_if_mined` looks up the row's reveal and
+  every listed pair's; the lowest block height wins, the row's own pair on a tie (two reveals in one
+  block activate at the same height). A winner other than the row's pair becomes the row's pair
+  before `reveal_confirmed` is written, so the activation height and the queue id come from it.
+- **Desktop.** The detail screen offers *Send your own commit + reveal* under the in-flight stage
+  (`canSendAdditionalPair`) and lists every pair once there is more than one (*Current*, *Sent*,
+  *Mined*, *Not used*). The send screen opens with `?pair=additional`; while a pair is in flight it
+  prepares a fresh send instead of resuming, and `proposals_broadcast` runs with
+  `additional_pair: true` (`SendMode::AdditionalPair`): no claim, the pair is registered through the
+  endpoint above instead of the pre-registration report — not retried, since a repeat is refused
+  as already sent — and nothing is reported on the row until it is, so a refusal leaves the other
+  signer's pair untouched. Build, reservation, `PendingReveals`, broadcast and settle are unchanged.
+- **Accepted limits.** A sender whose own pair is rejected after registering reports `failed`; the
+  row then offers *Retry send* through the claim, while the earlier pair stays listed and is still
+  promoted if mined. A pair backfilled with no broadcaster does not lock its sender out.
 
 ### Frontend (`desktop-app/src`)
 
