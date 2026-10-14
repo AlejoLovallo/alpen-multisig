@@ -17,7 +17,8 @@ use strata_l1_txfmt::MagicBytes;
 use crate::application::commit_funding::CommitFunding;
 use crate::application::orchestrator_client::{
     ApproveActionRequest, CreateCancelProposalRequest, CreateProposalRequest, OrchestratorClient,
-    OrchestratorError, ReportBroadcastProgressRequest, TransitionProposalRequest,
+    OrchestratorError, RegisterBroadcastAttemptRequest, ReportBroadcastProgressRequest,
+    TransitionProposalRequest,
 };
 use crate::application::pending_reveals::PendingReveals;
 use crate::application::tx_broadcaster::{
@@ -339,7 +340,56 @@ pub async fn submit_commit_then_reveal(
     pending: &PendingReveals,
     envelope_cache: &EnvelopeKeyCache,
 ) -> Result<(String, String), BroadcastError> {
-    let proposal = client.claim_broadcast(action_id).await.map_err(|e| {
+    submit_pair(
+        client,
+        broadcasters,
+        asm_rpc_url,
+        magic_bytes,
+        network,
+        action_id,
+        fee_rate,
+        commit_funding,
+        reveal_change_spk,
+        pending,
+        envelope_cache,
+        SendMode::Claim,
+    )
+    .await
+}
+
+/// How a send takes its place on the proposal (#605).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendMode {
+    /// Take the claim: the first send, or a retry after `failed`.
+    Claim,
+    /// Send this signer's own pair beside the one another signer has in flight. No claim: the
+    /// pair is registered with the orchestrator instead of pre-registered on a claimed row, and
+    /// until it is, the row is not this desktop's to report on.
+    AdditionalPair,
+}
+
+/// [`submit_commit_then_reveal`] in either [`SendMode`]. The bundle itself — build, sign, store,
+/// broadcast, settle — is the same; only how the row is taken differs.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_pair(
+    client: &dyn OrchestratorClient,
+    broadcasters: &[std::sync::Arc<dyn TxBroadcaster>],
+    asm_rpc_url: &str,
+    magic_bytes: MagicBytes,
+    network: Network,
+    action_id: &str,
+    fee_rate: FeeRate,
+    commit_funding: &dyn CommitFunding,
+    reveal_change_spk: ScriptBuf,
+    pending: &PendingReveals,
+    envelope_cache: &EnvelopeKeyCache,
+    mode: SendMode,
+) -> Result<(String, String), BroadcastError> {
+    let taken = match mode {
+        SendMode::Claim => client.claim_broadcast(action_id).await,
+        SendMode::AdditionalPair => client.get_proposal(action_id).await,
+    };
+    let proposal = taken.map_err(|e| {
         if let OrchestratorError::Backend {
             status: 409,
             message,
@@ -388,7 +438,12 @@ pub async fn submit_commit_then_reveal(
     // What the error path must undo (#516): a signed commit that never reached the broadcast
     // gives its reserved inputs back; a commit that may be live is never reported `failed`.
     let mut unbroadcast_commit: Option<bitcoin::Txid> = None;
-    let mut report_failed = true;
+    // A claimed row is this desktop's from the claim on. Beside another signer's pair it becomes
+    // ours only once our pair is registered: a failure before that must not touch the row.
+    let mut report_failed = mode == SendMode::Claim;
+    // The pair the row tracks once registered, named on a `failed` report so the orchestrator
+    // can tell it from a pair registered after it (#605).
+    let mut registered_pair: Option<(String, String)> = None;
 
     let broadcast_result: Result<(String, String), BroadcastError> = async {
         // Step 1: Pre-sign commit tx.
@@ -449,18 +504,42 @@ pub async fn submit_commit_then_reveal(
         // orchestrator cannot track would be unrecoverable if the later reports never land, so
         // if this fails nothing is broadcast: the coins are released and `failed` reported by
         // the error path below.
-        if let Err(e) = report_with_retry(
-            client,
-            action_id,
-            "commit_broadcasted",
-            &commit_txid,
-            Some(&reveal_txid),
-        )
-        .await
-        {
+        let registered = match mode {
+            SendMode::Claim => {
+                report_with_retry(
+                    client,
+                    action_id,
+                    "commit_broadcasted",
+                    &commit_txid,
+                    Some(&reveal_txid),
+                )
+                .await
+            }
+            // Not retried: a second registration of the same pair is refused as ours already.
+            SendMode::AdditionalPair => client
+                .register_broadcast_attempt(
+                    action_id,
+                    RegisterBroadcastAttemptRequest {
+                        commit_txid: commit_txid.clone(),
+                        reveal_txid: reveal_txid.clone(),
+                    },
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| match e {
+                    OrchestratorError::Backend {
+                        status: 409,
+                        message,
+                    } => BroadcastError::Setup(claim_conflict_message(&message)),
+                    other => BroadcastError::Orchestrator(other),
+                }),
+        };
+        if let Err(e) = registered {
             crate::infrastructure::pending_reveals_store::remove_and_persist(pending, action_id);
             return Err(e);
         }
+        report_failed = true;
+        registered_pair = Some((commit_txid.clone(), reveal_txid.clone()));
 
         // Step 6: Broadcast — Electrum first, node fallback. From here the broadcasters' answer
         // settles the commit's reservation and whether `failed` may be reported (#516).
@@ -504,13 +583,17 @@ pub async fn submit_commit_then_reveal(
             commit_funding.release(txid);
         }
         if report_failed {
+            let (commit_txid, reveal_txid) = match &registered_pair {
+                Some((commit, reveal)) => (Some(commit.as_str()), Some(reveal.as_str())),
+                None => (None, None),
+            };
             let _ = report_broadcast(
                 client,
                 action_id,
                 "failed",
                 None,
-                None,
-                None,
+                commit_txid,
+                reveal_txid,
                 Some(&e.to_string()),
             )
             .await;
@@ -1317,8 +1400,15 @@ pub async fn resubmit_reveal(
 /// "not approved" and "sequence already used" are different refusals.
 fn claim_conflict_message(body: &str) -> String {
     const GATE: &str = "a broadcast for this authority is already in flight";
+    // The orchestrator's refusals of another signer's pair (#605).
+    const OWN_PAIR: &str = "you already sent a commit and reveal for this proposal";
+    const NO_PAIR: &str = "no commit and reveal in flight to send another pair beside";
     if body.contains(GATE) {
         "A broadcast for this authority is already in flight.".to_string()
+    } else if body.contains(OWN_PAIR) {
+        "You already sent a commit and reveal for this proposal.".to_string()
+    } else if body.contains(NO_PAIR) {
+        "This proposal has no commit and reveal in flight to send yours beside.".to_string()
     } else {
         format!("broadcast already in progress: {body}")
     }
@@ -1543,9 +1633,18 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
+                broadcast_attempts: Vec::new(),
             };
             *self.last_create_request.lock().unwrap() = Some(request);
             Ok(response)
+        }
+
+        async fn register_broadcast_attempt(
+            &self,
+            _: &str,
+            _: crate::application::orchestrator_client::RegisterBroadcastAttemptRequest,
+        ) -> Result<OrcProposal, OrchestratorError> {
+            unimplemented!()
         }
 
         async fn create_cancel_proposal(
@@ -1586,6 +1685,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
+                broadcast_attempts: Vec::new(),
             };
             *self.last_cancel_request.lock().unwrap() =
                 Some((target_action_id.to_string(), request));
@@ -1621,6 +1721,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
+                broadcast_attempts: Vec::new(),
             })
         }
 
@@ -1680,6 +1781,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
+                broadcast_attempts: Vec::new(),
             })
         }
 
@@ -1721,6 +1823,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
+                broadcast_attempts: Vec::new(),
             })
         }
 
@@ -1756,6 +1859,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
+                broadcast_attempts: Vec::new(),
             }])
         }
 
@@ -1799,6 +1903,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
+                broadcast_attempts: Vec::new(),
             })
         }
 
@@ -1839,6 +1944,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
+                broadcast_attempts: Vec::new(),
             })
         }
     }
@@ -2307,6 +2413,13 @@ mod tests {
         events: Option<std::sync::Arc<Mutex<Vec<String>>>>,
         /// `get_proposal` answers with this `(broadcast_status, reveal_txid)` when set.
         row: Option<(&'static str, String)>,
+        /// Whether `claim_broadcast` was called.
+        claimed: Mutex<bool>,
+        /// Every pair registered beside one in flight (#605).
+        registered:
+            Mutex<Vec<crate::application::orchestrator_client::RegisterBroadcastAttemptRequest>>,
+        /// `register_broadcast_attempt` answers 409 with this body when set.
+        refuse_registration: Option<&'static str>,
     }
 
     impl MockOrchestratorClientLargeAction {
@@ -2398,6 +2511,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
+                broadcast_attempts: Vec::new(),
             })
         }
         async fn get_cancel_target_status(
@@ -2437,6 +2551,7 @@ mod tests {
             unimplemented!()
         }
         async fn claim_broadcast(&self, action_id: &str) -> Result<OrcProposal, OrchestratorError> {
+            *self.claimed.lock().unwrap() = true;
             Ok(OrcProposal {
                 action_id: action_id.to_string(),
                 authority: Authority::StrataAdmin,
@@ -2459,6 +2574,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
+                broadcast_attempts: Vec::new(),
             })
         }
         async fn report_broadcast_progress(
@@ -2504,7 +2620,22 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
+                broadcast_attempts: Vec::new(),
             })
+        }
+        async fn register_broadcast_attempt(
+            &self,
+            action_id: &str,
+            request: crate::application::orchestrator_client::RegisterBroadcastAttemptRequest,
+        ) -> Result<OrcProposal, OrchestratorError> {
+            if let Some(body) = self.refuse_registration {
+                return Err(OrchestratorError::Backend {
+                    status: 409,
+                    message: body.to_string(),
+                });
+            }
+            self.registered.lock().unwrap().push(request.clone());
+            self.get_proposal(action_id).await
         }
         async fn create_cancel_proposal(
             &self,
@@ -2758,6 +2889,90 @@ mod tests {
             pending.lock().unwrap().get("action-submit-only").is_some(),
             "PendingReveals entry must be present after submit (awaiting confirmation)"
         );
+    }
+
+    /// #605: beside another signer's pair in flight, the send registers its own pair instead of
+    /// claiming, and from there reports like any other send.
+    #[tokio::test]
+    async fn an_additional_pair_is_registered_not_claimed() {
+        use bitcoin::{Network, ScriptBuf};
+        use strata_l1_txfmt::MagicBytes;
+
+        let spy = SpyCommitFunding::new("ignored");
+        let mock_client = MockOrchestratorClientLargeAction::new();
+        let pending = crate::application::pending_reveals::new();
+
+        let (commit_txid, reveal_txid) = submit_pair(
+            &mock_client,
+            &ok_broadcasters(),
+            "mock://asm-membership",
+            MagicBytes::new([0x62, 0x74, 0x00, 0x00]),
+            Network::Regtest,
+            "action-additional",
+            crate::domain::fee_rate::FeeRate::from_raw_clamped(1_000),
+            &spy,
+            ScriptBuf::new(),
+            &pending,
+            &crate::infrastructure::admin_wallet::EnvelopeKeyCache::default(),
+            SendMode::AdditionalPair,
+        )
+        .await
+        .expect("the additional pair is sent");
+
+        assert!(
+            !*mock_client.claimed.lock().unwrap(),
+            "no claim beside a pair in flight"
+        );
+        let registered = mock_client.registered.lock().unwrap().clone();
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].commit_txid, commit_txid);
+        assert_eq!(registered[0].reveal_txid, reveal_txid);
+        assert_eq!(mock_client.reported_statuses(), vec!["reveal_broadcasted"]);
+        assert!(pending.lock().unwrap().get("action-additional").is_some());
+    }
+
+    /// #605: a refused registration leaves the row to the signer whose pair it tracks — nothing is
+    /// broadcast, nothing stored, and no `failed` overwrites their pair.
+    #[tokio::test]
+    async fn a_refused_additional_pair_reports_nothing() {
+        use bitcoin::{Network, ScriptBuf};
+        use strata_l1_txfmt::MagicBytes;
+
+        let spy = SpyCommitFunding::new("ignored");
+        let mock_client = MockOrchestratorClientLargeAction {
+            refuse_registration: Some(
+                r#"{"error":"conflict: you already sent a commit and reveal for this proposal","errorCode":"conflict"}"#,
+            ),
+            ..MockOrchestratorClientLargeAction::default()
+        };
+        let pending = crate::application::pending_reveals::new();
+
+        let err = submit_pair(
+            &mock_client,
+            &ok_broadcasters(),
+            "mock://asm-membership",
+            MagicBytes::new([0x62, 0x74, 0x00, 0x00]),
+            Network::Regtest,
+            "action-refused",
+            crate::domain::fee_rate::FeeRate::from_raw_clamped(1_000),
+            &spy,
+            ScriptBuf::new(),
+            &pending,
+            &crate::infrastructure::admin_wallet::EnvelopeKeyCache::default(),
+            SendMode::AdditionalPair,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, BroadcastError::Setup(m) if m == "You already sent a commit and reveal for this proposal."),
+            "{err:?}"
+        );
+        assert!(
+            mock_client.reported_statuses().is_empty(),
+            "no report on a row that is not ours"
+        );
+        assert!(pending.lock().unwrap().get("action-refused").is_none());
     }
 
     /// REGRESSION (issue #382): the commit address shown in the broadcast preview must equal

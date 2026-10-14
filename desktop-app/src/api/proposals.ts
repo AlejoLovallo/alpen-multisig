@@ -56,6 +56,20 @@ export type Proposal = {
 	updatedAtMs: number
 	/** Served by the backend that enforces the window (#551); `null` from one that predates it. */
 	expiresAtMs: number | null
+	/**
+	 * Every commit + reveal pair sent for the proposal, oldest first (#605). Absent on proposals
+	 * built locally (the manual generator), which have no orchestrator row.
+	 */
+	broadcastAttempts?: BroadcastAttempt[]
+}
+
+/** One commit + reveal pair sent for a proposal. The ASM acts on whichever reveal is mined first (#605). */
+export type BroadcastAttempt = {
+	/** The signer who sent it; `null` for pairs sent before the backend kept track. */
+	broadcasterPubkey: string | null
+	commitTxid: string
+	revealTxid: string
+	createdAtMs: number
 }
 
 export type PrepareBroadcastResult = {
@@ -132,6 +146,8 @@ export type BroadcastInput = {
 	baseUrl: string
 	actionId: string
 	feeRateSatPerKvb: number
+	/** Send this signer's own pair beside another signer's pair in flight, without claiming (#605). */
+	additionalPair?: boolean
 }
 
 export function prepareBroadcast(input: BroadcastInput): Promise<ApiResult<PrepareBroadcastResult>> {

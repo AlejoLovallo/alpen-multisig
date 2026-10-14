@@ -117,6 +117,16 @@ pub struct ProposalDto {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub expires_at_ms: Option<u64>,
+    pub broadcast_attempts: Vec<BroadcastAttemptDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BroadcastAttemptDto {
+    pub broadcaster_pubkey: Option<String>,
+    pub commit_txid: String,
+    pub reveal_txid: String,
+    pub created_at_ms: u64,
 }
 
 #[tauri::command]
@@ -147,6 +157,10 @@ pub struct BroadcastInput {
     pub base_url: String,
     pub action_id: String,
     pub fee_rate_sat_per_kvb: u64,
+    /// Send this signer's own pair beside another signer's pair in flight, instead of claiming
+    /// the row (#605).
+    #[serde(default)]
+    pub additional_pair: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -244,6 +258,16 @@ fn map_proposal(proposal: Proposal) -> ProposalDto {
         created_at_ms,
         updated_at_ms,
         expires_at_ms,
+        broadcast_attempts: proposal
+            .broadcast_attempts
+            .into_iter()
+            .map(|attempt| BroadcastAttemptDto {
+                broadcaster_pubkey: attempt.broadcaster_pubkey,
+                commit_txid: attempt.commit_txid,
+                reveal_txid: attempt.reveal_txid,
+                created_at_ms: attempt.created_at as u64,
+            })
+            .collect(),
     }
 }
 
@@ -996,7 +1020,12 @@ pub async fn proposals_broadcast(
         .map_err(|e| e.to_string())?;
 
     // Submit synchronously — returns within seconds once both txs are broadcast.
-    let (commit_txid, reveal_txid) = proposals::submit_commit_then_reveal(
+    let mode = if input.additional_pair {
+        proposals::SendMode::AdditionalPair
+    } else {
+        proposals::SendMode::Claim
+    };
+    let (commit_txid, reveal_txid) = proposals::submit_pair(
         client.as_ref(),
         &broadcasters,
         &env.asm_rpc_url,
@@ -1008,6 +1037,7 @@ pub async fn proposals_broadcast(
         reveal_change_spk,
         &pending,
         &envelope_cache,
+        mode,
     )
     .await
     .map_err(map_broadcast_error)?;

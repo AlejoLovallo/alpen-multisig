@@ -16,7 +16,7 @@ import { adminWalletCapabilitySchema } from '@/api/ipc-schemas'
 import { initAdminWalletForAdapter } from '@/contexts/session-provider-vendor-branch'
 import type { WalletAdapter } from '@/wallet/types'
 import { deviceCopy } from '@/lib/device-copy'
-import { failedBroadcastDetail } from '@/lib/proposal-send-state'
+import { failedBroadcastDetail, hasPairInFlight } from '@/lib/proposal-send-state'
 
 import type { BroadcastError, BroadcastPhase } from '../model/broadcast-proposal'
 import { deriveBroadcastError, phaseForBroadcastStatus } from '../model/broadcast-proposal'
@@ -65,8 +65,13 @@ export function mergeBroadcastWithProposal(broadcast: BroadcastResult, proposal:
 	}
 }
 
-function buildBroadcastInput(baseUrl: string, actionId: string, feeRateSatPerKvb: number): BroadcastInput {
-	return { baseUrl, actionId, feeRateSatPerKvb }
+function buildBroadcastInput(
+	baseUrl: string,
+	actionId: string,
+	feeRateSatPerKvb: number,
+	additionalPair = false,
+): BroadcastInput {
+	return { baseUrl, actionId, feeRateSatPerKvb, additionalPair }
 }
 
 /**
@@ -81,6 +86,11 @@ export function useBroadcastProposal(
 	feeRateSatPerKvb: number | null,
 	signerKind: SignerKind = 'mnemonic',
 	adapter?: WalletAdapter,
+	/**
+	 * Opened to send this signer's own pair beside another signer's pair in flight (#605). Honoured
+	 * only while such a pair is in flight: on a row that has none, the screen sends as usual.
+	 */
+	additionalPair = false,
 ): UseBroadcastProposalReturn {
 	const [phase, setPhase] = useState<BroadcastPhase>('idle')
 	const [bundle, setBundle] = useState<PrepareBroadcastResult | null>(null)
@@ -90,6 +100,7 @@ export function useBroadcastProposal(
 	const broadcastStarted = useRef(false)
 	const hasPreparedOnce = useRef(false)
 	const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+	const sendsAdditionalPair = useRef(false)
 
 	const clearConfirmationPoll = useCallback(() => {
 		if (pollRef.current !== null) {
@@ -194,6 +205,13 @@ export function useBroadcastProposal(
 				if (proposalRes.ok) {
 					const p = proposalRes.data
 					setProposal(p)
+					// Beside a pair in flight there is nothing to resume: this signer sends their own.
+					sendsAdditionalPair.current = additionalPair && hasPairInFlight(p)
+					if (sendsAdditionalPair.current) {
+						setBundle(res.data)
+						setPhase('confirming')
+						return
+					}
 					if (p.broadcastStatus === 'failed') {
 						applyProposal(p)
 						setError(settledFailure(p.broadcastError))
@@ -224,7 +242,7 @@ export function useBroadcastProposal(
 			active = false
 			if (debounce !== null) clearTimeout(debounce)
 		}
-	}, [actionId, baseUrl, feeRateSatPerKvb, applyProposal, startConfirmationPoll])
+	}, [actionId, baseUrl, feeRateSatPerKvb, additionalPair, applyProposal, startConfirmationPoll])
 
 	async function prepare() {
 		if (feeRateSatPerKvb === null) return
@@ -284,7 +302,9 @@ export function useBroadcastProposal(
 			setPhase('broadcasting')
 		}
 		try {
-			const res = await broadcastProposal(buildBroadcastInput(baseUrl, actionId, feeRateSatPerKvb))
+			const res = await broadcastProposal(
+				buildBroadcastInput(baseUrl, actionId, feeRateSatPerKvb, sendsAdditionalPair.current),
+			)
 			if (!res.ok) {
 				setError(deriveBroadcastError(res.error))
 				setPhase('error')

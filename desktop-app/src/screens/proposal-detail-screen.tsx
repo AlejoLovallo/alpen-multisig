@@ -152,6 +152,7 @@ export function ProposalDetailScreen() {
 								decodedData={decodedData}
 								onSign={() => navigate(`/proposals/${actionId}/sign`)}
 								onBroadcast={() => navigate(`/proposals/${actionId}/broadcast`)}
+								onSendAdditionalPair={() => navigate(`/proposals/${actionId}/broadcast?pair=additional`)}
 								onPasteSignatures={(sigs, broadcastState) => void handlePasteSignatures(sigs, broadcastState)}
 								onManualExecute={() =>
 									navigate('/manual', {

@@ -46,6 +46,14 @@ const withoutExpiry: Record<string, unknown> = { ...proposalWithNullBroadcastFie
 delete withoutExpiry.expiresAtMs
 assert.equal(proposalSchema.parse(withoutExpiry).expiresAtMs, null)
 
+// Every pair sent for the proposal survives the schema (#605); an older backend sends none.
+assert.deepEqual(proposalSchema.parse(proposalWithNullBroadcastFields).broadcastAttempts, [])
+const pair = { broadcasterPubkey: null, commitTxid: 'c'.repeat(64), revealTxid: 'r'.repeat(64), createdAtMs: 1 }
+assert.deepEqual(
+	proposalSchema.parse({ ...proposalWithNullBroadcastFields, broadcastAttempts: [pair] }).broadcastAttempts,
+	[pair],
+)
+
 import { AuthRole } from '../types/auth-role.ts'
 import { authChallengeSchema, authSessionSchema } from './ipc-schemas.ts'
 
