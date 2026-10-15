@@ -668,6 +668,7 @@ fn broadcast_error_code(
         BroadcastError::BroadcastUncertain { .. } => "broadcast_uncertain",
         BroadcastError::RevealNotBroadcast { .. } => "reveal_not_broadcast",
         BroadcastError::BundleInFlight { .. } => "bundle_in_flight",
+        BroadcastError::PairNotRegistered => "Unknown",
         BroadcastError::Setup(_) => "Unknown",
         BroadcastError::Orchestrator(_) => "Unknown",
     }
@@ -748,6 +749,10 @@ fn map_broadcast_error_with_boundary(
         BroadcastError::BundleInFlight { commit_txid } => format!(
             "A bundle for this proposal was already sent from this app (commit {commit_txid}) and may be on the network. Do not send again: its coins stay reserved and the app settles it on its own."
         ),
+        BroadcastError::PairNotRegistered => {
+            "This commit and reveal was not registered, because the proposal already tracks another pair. Nothing was broadcast."
+                .to_string()
+        }
         BroadcastError::Setup(msg) => msg.clone(),
         BroadcastError::Orchestrator(e) => e.to_string(),
     };

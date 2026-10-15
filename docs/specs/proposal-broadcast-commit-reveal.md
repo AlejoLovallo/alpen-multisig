@@ -418,9 +418,12 @@ acts on; the others are refused on the sequence number and cost only their fees.
   able to confirm this one. A `PATCH` that names no reveal does not change a row that already
   tracks one (an untagged claim still accepts it — that is the pre-registration). The comparison is made
   in the write itself (`update_reported_pair_status`, a conditional `UPDATE`), so a pair registered after
-  the report read the row is not overwritten either. Txids are stored lowercase. The desktop already
+  the report read the row is not overwritten either. The pair is inserted in that same write, and only
+  when the update applies: a report that read an empty claim and lost the race is not listed. Txids are
+  stored lowercase. The desktop already
   reports only to a row that carries its own reveal txid (`BundleRow::Ours`), and a `failed` report now
-  names its pair.
+  names its pair. A pre-registration is a success only when the response still tracks that reveal; a
+  200 that tracks another pair aborts the send before anything is broadcast and reports nothing.
 - **Reconcile picks the pair mined first.** `confirm_reveal_if_mined` looks up the row's reveal and
   every listed pair's; the lowest block height wins, the row's own pair on a tie (two reveals in one
   block activate at the same height). A lookup the node cannot answer leaves the row alone — "not in a

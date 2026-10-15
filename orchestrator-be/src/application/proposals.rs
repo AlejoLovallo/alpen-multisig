@@ -1228,8 +1228,8 @@ pub(crate) async fn report_broadcast_progress(
     // either — the import screen reports any bundle against the open proposal, so they may belong
     // to another action. Every pair of this proposal is already listed: it was reported while the
     // row tracked it, or registered. A report that names no reveal does not qualify either, once
-    // the row is tagged. Checked here to skip the work, and again in the write for a pair
-    // registered in between.
+    // the row is tagged. Checked here to skip the work, and again in the write: a pair that lands
+    // after this read, including one that tags an empty claim, is not overwritten and not listed.
     if !reports_tracked_pair(reveal_txid.as_deref(), raw.reveal_txid.as_deref()) {
         log_report_for_replaced_pair(action_id, reveal_txid.as_deref(), &raw);
         return Ok(raw);
@@ -1291,16 +1291,8 @@ pub(crate) async fn report_broadcast_progress(
         }
     };
 
-    // Every pair a desktop registers is kept, so a later pair beside it cannot hide it (#605).
-    keep_reported_pair(
-        repo,
-        session,
-        action_id,
-        commit_txid.as_deref(),
-        reveal_txid.as_deref(),
-    )
-    .await?;
-
+    // Listed in the same write as the status, and only when that write applies (#605).
+    let attempt = reported_attempt(session, commit_txid.as_deref(), reveal_txid.as_deref());
     let updated = repo
         .update_reported_pair_status(
             action_id,
@@ -1309,6 +1301,7 @@ pub(crate) async fn report_broadcast_progress(
             commit_txid.as_deref(),
             reveal_txid.as_deref(),
             body.broadcast_error.as_deref(),
+            attempt,
         )
         .await?
         .ok_or(AppError::NotFound)?;
@@ -1327,28 +1320,20 @@ pub(crate) async fn report_broadcast_progress(
     Ok(updated)
 }
 
-/// Keep the pair a report names, stored lowercase so the case-sensitive key matches once (#605).
-/// A report with either txid missing names no pair.
-async fn keep_reported_pair(
-    repo: &dyn ProposalRepository,
+/// The pair a report names, stored lowercase so the case-sensitive key matches once (#605).
+/// `None` when either txid is missing: that report names no pair.
+fn reported_attempt(
     session: SessionContext<'_>,
-    action_id: &ActionId,
     commit_txid: Option<&str>,
     reveal_txid: Option<&str>,
-) -> Result<(), AppError> {
-    let (Some(commit_txid), Some(reveal_txid)) = (commit_txid, reveal_txid) else {
-        return Ok(());
-    };
-    repo.record_broadcast_attempt(
-        action_id,
-        BroadcastAttempt {
-            broadcaster_pubkey: Some(normalize_signer_pubkey_hex(session.signer_pubkey)),
-            commit_txid: commit_txid.to_ascii_lowercase(),
-            reveal_txid: reveal_txid.to_ascii_lowercase(),
-            created_at: Utc::now(),
-        },
-    )
-    .await
+) -> Option<BroadcastAttempt> {
+    let (commit_txid, reveal_txid) = commit_txid.zip(reveal_txid)?;
+    Some(BroadcastAttempt {
+        broadcaster_pubkey: Some(normalize_signer_pubkey_hex(session.signer_pubkey)),
+        commit_txid: commit_txid.to_ascii_lowercase(),
+        reveal_txid: reveal_txid.to_ascii_lowercase(),
+        created_at: Utc::now(),
+    })
 }
 
 fn log_report_for_replaced_pair(action_id: &ActionId, reported: Option<&str>, row: &Proposal) {
@@ -4088,6 +4073,7 @@ mod tests {
                 Some(COMMIT_A),
                 Some(&REVEAL_A.to_uppercase()),
                 Some(DROPPED_FOR_TEST),
+                None,
             )
             .await
             .unwrap()
@@ -4097,6 +4083,44 @@ mod tests {
         assert_eq!(after.commit_txid.as_deref(), Some(COMMIT_B));
         assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_B));
         assert!(after.broadcast_error.is_none());
+    }
+
+    /// The import read an empty claim, then the claimer's pre-registration tagged the row before
+    /// the import wrote. The write must not list the imported reveal: it may belong to another
+    /// action, and the reconcile would confirm this proposal on it (#605).
+    #[tokio::test]
+    async fn a_report_the_write_rejects_is_not_recorded() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+
+        let after = repo
+            .update_reported_pair_status(
+                &action_id,
+                BroadcastStatus::CommitBroadcasted,
+                None,
+                Some(COMMIT_C),
+                Some(REVEAL_C),
+                None,
+                Some(BroadcastAttempt {
+                    broadcaster_pubkey: Some(sig_a().signer_pubkey),
+                    commit_txid: COMMIT_C.to_string(),
+                    reveal_txid: REVEAL_C.to_string(),
+                    created_at: Utc::now(),
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(after.broadcast_status, BroadcastStatus::CommitBroadcasted);
+        assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_B));
+        let reveals: Vec<&str> = after
+            .broadcast_attempts
+            .iter()
+            .map(|attempt| attempt.reveal_txid.as_str())
+            .collect();
+        assert_eq!(reveals, [REVEAL_A, REVEAL_B]);
     }
 
     const DROPPED_FOR_TEST: &str = "dropped";

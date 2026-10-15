@@ -188,28 +188,6 @@ impl ProposalRepository for InMemoryProposalRepository {
         Ok(proposal.clone())
     }
 
-    async fn record_broadcast_attempt(
-        &self,
-        action_id: &ActionId,
-        attempt: BroadcastAttempt,
-    ) -> Result<(), AppError> {
-        let mut proposals = self
-            .proposals
-            .write()
-            .map_err(|_| AppError::Internal(anyhow::anyhow!("repo lock poisoned")))?;
-        let Some(proposal) = proposals.get_mut(action_id) else {
-            return Err(AppError::NotFound);
-        };
-        let kept = proposal
-            .broadcast_attempts
-            .iter()
-            .any(|kept| kept.reveal_txid.eq_ignore_ascii_case(&attempt.reveal_txid));
-        if !kept {
-            proposal.broadcast_attempts.push(attempt);
-        }
-        Ok(())
-    }
-
     async fn register_additional_pair(
         &self,
         action_id: &ActionId,
@@ -266,6 +244,7 @@ impl ProposalRepository for InMemoryProposalRepository {
         Ok(Some(proposal.clone()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn update_reported_pair_status(
         &self,
         action_id: &ActionId,
@@ -274,8 +253,11 @@ impl ProposalRepository for InMemoryProposalRepository {
         commit_txid: Option<&str>,
         reveal_txid: Option<&str>,
         error: Option<&str>,
+        attempt: Option<BroadcastAttempt>,
     ) -> Result<Option<Proposal>, AppError> {
         // Checked and written under one write lock, like the registration it must not overwrite.
+        // The pair is listed only when this same write applies, so a report that lost the race
+        // cannot leave a foreign reveal for the reconcile to confirm (#605).
         let mut proposals = self
             .proposals
             .write()
@@ -284,6 +266,15 @@ impl ProposalRepository for InMemoryProposalRepository {
             return Ok(None);
         };
         if reports_tracked_pair(reveal_txid, proposal.reveal_txid.as_deref()) {
+            if let Some(attempt) = attempt {
+                let kept = proposal
+                    .broadcast_attempts
+                    .iter()
+                    .any(|kept| kept.reveal_txid.eq_ignore_ascii_case(&attempt.reveal_txid));
+                if !kept {
+                    proposal.broadcast_attempts.push(attempt);
+                }
+            }
             apply_broadcast_status(
                 proposal,
                 status,

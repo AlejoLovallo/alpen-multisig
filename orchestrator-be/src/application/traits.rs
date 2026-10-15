@@ -41,14 +41,6 @@ pub(crate) trait ProposalRepository: Send + Sync {
     /// `Err(Conflict)` carries `AUTHORITY_IN_FLIGHT`.
     async fn claim_broadcast(&self, action_id: &ActionId) -> Result<Proposal, AppError>;
 
-    /// Keep a commit + reveal pair a desktop registered (#605). Idempotent: a pair already kept
-    /// for this proposal (same reveal txid) is left as it was, broadcaster included.
-    async fn record_broadcast_attempt(
-        &self,
-        action_id: &ActionId,
-        attempt: BroadcastAttempt,
-    ) -> Result<(), AppError>;
-
     /// Register another signer's pair beside the one in flight and make it the pair the row
     /// tracks (`commit_broadcasted`, claim time now, error cleared) (#605).
     ///
@@ -76,6 +68,10 @@ pub(crate) trait ProposalRepository: Send + Sync {
     /// while the row is untagged or still tracks the reported reveal. A report that names no
     /// reveal does not touch a tagged row. Decided in the write itself, so a pair registered
     /// after the report read the row is never overwritten; otherwise the row comes back as it is.
+    ///
+    /// `attempt` is recorded in that same write, and only when the update applies. A report that
+    /// loses the race is not listed, so a reveal from another action cannot later confirm this one.
+    #[allow(clippy::too_many_arguments)]
     async fn update_reported_pair_status(
         &self,
         action_id: &ActionId,
@@ -84,6 +80,7 @@ pub(crate) trait ProposalRepository: Send + Sync {
         commit_txid: Option<&str>,
         reveal_txid: Option<&str>,
         error: Option<&str>,
+        attempt: Option<BroadcastAttempt>,
     ) -> Result<Option<Proposal>, AppError>;
 
     /// Mark the proposal `reveal_confirmed` on this commit + reveal, but only while it still

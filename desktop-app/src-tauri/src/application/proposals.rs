@@ -50,6 +50,12 @@ pub enum BroadcastError {
     Orchestrator(#[from] OrchestratorError),
     #[error("broadcast setup error: {0}")]
     Setup(String),
+    /// The pre-registration was answered, but the row tracks a different reveal (#605). Nothing
+    /// was broadcast, and `failed` must not be reported: that row belongs to the other pair.
+    #[error(
+        "the orchestrator is tracking a different commit and reveal, so this one was not registered"
+    )]
+    PairNotRegistered,
     #[error("bitcoin RPC error: {0}")]
     BitcoinRpc(String),
     #[error("confirmation timeout for txid {txid}")]
@@ -185,6 +191,9 @@ async fn report_broadcast(
 }
 
 /// Reports broadcast progress, retrying up to [`REPORT_ATTEMPTS`] times (#516).
+///
+/// A response that tracks a different reveal is a decided refusal (#605): the orchestrator
+/// ignored the report, so retrying would not register this pair. The caller must not broadcast it.
 async fn report_with_retry(
     client: &dyn OrchestratorClient,
     action_id: &str,
@@ -194,23 +203,37 @@ async fn report_with_retry(
 ) -> Result<(), BroadcastError> {
     let mut attempt = 1;
     loop {
-        let reported = report_broadcast(
-            client,
-            action_id,
-            broadcast_status,
-            None,
-            Some(commit_txid),
-            reveal_txid,
-            None,
-        )
-        .await;
+        let reported = client
+            .report_broadcast_progress(
+                action_id,
+                ReportBroadcastProgressRequest {
+                    broadcast_status: broadcast_status.to_string(),
+                    proposal_status: None,
+                    commit_txid: Some(commit_txid.to_string()),
+                    reveal_txid: reveal_txid.map(str::to_string),
+                    broadcast_error: None,
+                },
+            )
+            .await;
         match reported {
+            Ok(proposal) => {
+                let kept = reveal_txid.is_none_or(|reveal| {
+                    proposal
+                        .reveal_txid
+                        .as_deref()
+                        .is_some_and(|tracked| tracked.eq_ignore_ascii_case(reveal))
+                });
+                if !kept {
+                    return Err(BroadcastError::PairNotRegistered);
+                }
+                return Ok(());
+            }
             Err(e) if attempt < REPORT_ATTEMPTS => {
                 tracing::warn!(action_id, broadcast_status, attempt, error = %e, "progress report failed; retrying");
                 tokio::time::sleep(REPORT_RETRY_DELAY).await;
                 attempt += 1;
             }
-            other => return other,
+            Err(e) => return Err(BroadcastError::Orchestrator(e)),
         }
     }
 }
@@ -528,6 +551,11 @@ pub async fn submit_commit_then_reveal(
         };
         if let Err(e) = registered {
             crate::infrastructure::pending_reveals_store::remove_and_persist(pending, action_id);
+            // The row already tracks another pair. A `failed` report is how a claim undoes
+            // itself; here it would be aimed at a row that is not ours (#605).
+            if matches!(e, BroadcastError::PairNotRegistered) {
+                report_failed = false;
+            }
             return Err(e);
         }
         report_failed = true;
@@ -2416,6 +2444,9 @@ mod tests {
         /// This many registrations are kept and then answered with a transport error, as when
         /// the orchestrator committed but the response was lost.
         lost_registrations: Mutex<u32>,
+        /// When set, a progress report is recorded and the response tracks this reveal instead
+        /// of the one the report named (#605).
+        tracked_reveal: Option<&'static str>,
     }
 
     impl MockOrchestratorClientLargeAction {
@@ -2594,6 +2625,10 @@ mod tests {
                     message: "orchestrator unavailable".to_string(),
                 });
             }
+            let reveal_txid = self
+                .tracked_reveal
+                .map(str::to_string)
+                .or(request.reveal_txid);
             Ok(OrcProposal {
                 action_id: action_id.to_string(),
                 authority: Authority::StrataAdmin,
@@ -2605,7 +2640,7 @@ mod tests {
                 signatures: vec![],
                 broadcast_status: request.broadcast_status,
                 commit_txid: request.commit_txid,
-                reveal_txid: request.reveal_txid,
+                reveal_txid,
                 broadcast_error: None,
                 target_action_id: None,
                 activation_height: None,
@@ -3025,6 +3060,52 @@ mod tests {
             "no report on a row that is not ours"
         );
         assert!(pending.lock().unwrap().get("action-refused").is_none());
+    }
+
+    /// #605: the pre-registration answer is 200 but the row tracks another reveal (an import
+    /// tagged the empty claim first). Broadcasting would put a pair on the network that the
+    /// orchestrator will never follow, so the send stops and reports nothing.
+    #[tokio::test]
+    async fn a_preregistration_the_row_did_not_keep_is_not_broadcast() {
+        use bitcoin::{Network, ScriptBuf};
+        use strata_l1_txfmt::MagicBytes;
+
+        let spy = SpyCommitFunding::new("ignored");
+        let mock_client = MockOrchestratorClientLargeAction {
+            tracked_reveal: Some("cc"),
+            ..MockOrchestratorClientLargeAction::default()
+        };
+        let pending = crate::application::pending_reveals::new();
+
+        let err = submit_commit_then_reveal(
+            &mock_client,
+            &ok_broadcasters(),
+            "mock://asm-membership",
+            MagicBytes::new([0x62, 0x74, 0x00, 0x00]),
+            Network::Regtest,
+            "action-ignored",
+            crate::domain::fee_rate::FeeRate::from_raw_clamped(1_000),
+            &spy,
+            ScriptBuf::new(),
+            &pending,
+            &crate::infrastructure::admin_wallet::EnvelopeKeyCache::default(),
+            SendMode::Claim,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, BroadcastError::PairNotRegistered), "{err:?}");
+        assert_eq!(
+            mock_client.reported_statuses(),
+            vec!["commit_broadcasted"],
+            "the ignored pre-registration is not retried, and nothing is reported failed"
+        );
+        assert!(
+            spy.recorded().is_empty(),
+            "the commit was not recorded as broadcast"
+        );
+        assert_eq!(spy.released().len(), 1, "the reserved coins are released");
+        assert!(pending.lock().unwrap().get("action-ignored").is_none());
     }
 
     /// REGRESSION (issue #382): the commit address shown in the broadcast preview must equal

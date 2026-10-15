@@ -1,6 +1,8 @@
 use std::str::FromStr;
 
-use crate::application::proposals::{decide_additional_pair, AdditionalPair, AUTHORITY_IN_FLIGHT};
+use crate::application::proposals::{
+    decide_additional_pair, reports_tracked_pair, AdditionalPair, AUTHORITY_IN_FLIGHT,
+};
 use crate::application::traits::ProposalRepository;
 use crate::domain::authority::Authority;
 use crate::domain::proposal::{
@@ -453,33 +455,6 @@ impl ProposalRepository for PostgresProposalRepository {
         Ok(proposal)
     }
 
-    async fn record_broadcast_attempt(
-        &self,
-        action_id: &ActionId,
-        attempt: BroadcastAttempt,
-    ) -> Result<(), AppError> {
-        // Txids arrive lowercase from the application and the backfill stores them lowercase, so
-        // the case-sensitive primary key alone keeps a pair once (#605).
-        sqlx::query(
-            r#"
-            INSERT INTO broadcast_attempts(action_id, broadcaster_pubkey, commit_txid, reveal_txid, created_at)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (action_id, reveal_txid) DO NOTHING
-            "#,
-        )
-        .bind(&action_id.0)
-        .bind(attempt.broadcaster_pubkey.as_deref())
-        .bind(&attempt.commit_txid)
-        .bind(&attempt.reveal_txid)
-        .bind(attempt.created_at)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| {
-            AppError::Internal(anyhow::anyhow!("failed to record broadcast attempt: {e}"))
-        })?;
-        Ok(())
-    }
-
     async fn register_additional_pair(
         &self,
         action_id: &ActionId,
@@ -591,6 +566,7 @@ impl ProposalRepository for PostgresProposalRepository {
         self.find_by_action_id(action_id).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn update_reported_pair_status(
         &self,
         action_id: &ActionId,
@@ -599,28 +575,71 @@ impl ProposalRepository for PostgresProposalRepository {
         commit_txid: Option<&str>,
         reveal_txid: Option<&str>,
         error: Option<&str>,
+        attempt: Option<BroadcastAttempt>,
     ) -> Result<Option<Proposal>, AppError> {
         let proposal_status_db = proposal_status.map(status_to_db);
 
-        // Same predicate as `reports_tracked_pair`, re-checked on the locked row: an untagged row
-        // accepts the report, a tagged row only when this reveal is the one it tracks. A report
-        // that names no reveal does not match a tagged row.
-        sqlx::query(&format!(
-            "{UPDATE_BROADCAST_STATUS} \
-             AND (reveal_txid IS NULL \
-                  OR ($4::text IS NOT NULL AND LOWER(reveal_txid) = LOWER($4)))"
+        // One transaction: the pair is inserted only when this same write applies. A report that
+        // read an empty claim and lost the race must not leave its reveal listed (#605).
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to begin tx: {e}")))?;
+
+        let row = sqlx::query(&format!(
+            "SELECT {SELECT_PROPOSAL_COLS} FROM proposals WHERE action_id = $1 FOR UPDATE"
         ))
-        .bind(status.to_string())
-        .bind(proposal_status_db)
-        .bind(commit_txid)
-        .bind(reveal_txid)
-        .bind(error)
         .bind(&action_id.0)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| {
-            AppError::Internal(anyhow::anyhow!("failed to update broadcast status: {e}"))
-        })?;
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to lock proposal: {e}")))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let current = row_to_proposal_no_sigs(&row, action_id.0.clone())?;
+        if !reports_tracked_pair(reveal_txid, current.reveal_txid.as_deref()) {
+            drop(tx);
+            return self.find_by_action_id(action_id).await;
+        }
+
+        if let Some(attempt) = attempt {
+            // Txids arrive lowercase. The case-sensitive primary key keeps a pair once.
+            sqlx::query(
+                r#"
+                INSERT INTO broadcast_attempts(action_id, broadcaster_pubkey, commit_txid, reveal_txid, created_at)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (action_id, reveal_txid) DO NOTHING
+                "#,
+            )
+            .bind(&action_id.0)
+            .bind(attempt.broadcaster_pubkey.as_deref())
+            .bind(&attempt.commit_txid)
+            .bind(&attempt.reveal_txid)
+            .bind(attempt.created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                AppError::Internal(anyhow::anyhow!("failed to record broadcast attempt: {e}"))
+            })?;
+        }
+
+        sqlx::query(UPDATE_BROADCAST_STATUS)
+            .bind(status.to_string())
+            .bind(proposal_status_db)
+            .bind(commit_txid)
+            .bind(reveal_txid)
+            .bind(error)
+            .bind(&action_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                AppError::Internal(anyhow::anyhow!("failed to update broadcast status: {e}"))
+            })?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to commit tx: {e}")))?;
 
         self.find_by_action_id(action_id).await
     }
