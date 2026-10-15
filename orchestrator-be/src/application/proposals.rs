@@ -477,16 +477,30 @@ pub(crate) const NO_PAIR_IN_FLIGHT: &str =
 /// Conflict text when the caller already registered a pair for this proposal (#605).
 pub(crate) const OWN_PAIR_EXISTS: &str = "you already sent a commit and reveal for this proposal";
 
-/// Whether a desktop's report is about the pair the row tracks (#605): its reveal is the tracked
-/// one, or either is unset. A report about a pair another signer's pair replaced changes nothing.
-/// Shared by both repositories, which evaluate it in the write itself.
+/// Whether a desktop's report may change the row (#605).
+///
+/// An untagged row (no reveal yet) accepts it: that is the claimer's pre-registration. A tagged
+/// row accepts it only when the report names that same reveal. A report that names no reveal, or a
+/// different one, must not move the row. Shared by both repositories, which evaluate it in the
+/// write itself.
 pub(crate) fn reports_tracked_pair(
     reported_reveal: Option<&str>,
     tracked_reveal: Option<&str>,
 ) -> bool {
     match (reported_reveal, tracked_reveal) {
+        (_, None) => true,
         (Some(reported), Some(tracked)) => reported.eq_ignore_ascii_case(tracked),
-        _ => true,
+        (None, Some(_)) => false,
+    }
+}
+
+/// Whether the row still carries the reveal a reconcile observed (#605). Either side moving on
+/// means the decision was made against a row that no longer exists, and the next read decides.
+pub(crate) fn row_still_has_reveal(observed: Option<&str>, tracked: Option<&str>) -> bool {
+    match (observed, tracked) {
+        (None, None) => true,
+        (Some(observed), Some(tracked)) => observed.eq_ignore_ascii_case(tracked),
+        _ => false,
     }
 }
 
@@ -601,17 +615,46 @@ enum MinedPair {
     },
 }
 
+/// What one reveal lookup told us. "Not in a block" is an answer; a node that could not answer is
+/// not, and must not be read as the reveal losing the race (#605).
+enum RevealHeight {
+    Mined(u64),
+    Unmined,
+    Unknown,
+}
+
+/// `get_block_height_for_txid` reports both "not in a block" and a failed node call as
+/// `BadRequest`. Only the first is a real answer.
+fn classify_reveal_height(result: Result<u64, AppError>) -> RevealHeight {
+    match result {
+        Ok(height) => RevealHeight::Mined(height),
+        Err(AppError::BadRequest(message)) if reveal_not_in_a_block(&message) => {
+            RevealHeight::Unmined
+        }
+        Err(_) => RevealHeight::Unknown,
+    }
+}
+
+fn reveal_not_in_a_block(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("not yet confirmed")
+        || message.contains("no such mempool")
+        || message.contains("no such transaction")
+}
+
 /// The pair mined first: the lowest block height, the row's own pair on a tie. Two reveals in one
 /// block activate at the same height whichever the ASM took. `None` when no reveal is mined, or the
-/// node could not say.
+/// node could not say about one of them.
 async fn first_mined_pair(
     proposal: &Proposal,
     btc_client: &dyn BitcoinRpcClient,
 ) -> Option<MinedPair> {
     let mut best: Option<(u64, MinedPair)> = None;
     if let Some(reveal_txid) = proposal.reveal_txid.as_deref() {
-        if let Ok(height) = btc_client.get_block_height_for_txid(reveal_txid).await {
-            best = Some((height, MinedPair::Tracked));
+        match classify_reveal_height(btc_client.get_block_height_for_txid(reveal_txid).await) {
+            RevealHeight::Mined(height) => best = Some((height, MinedPair::Tracked)),
+            RevealHeight::Unmined => {}
+            RevealHeight::Unknown => return None,
         }
     }
     for attempt in &proposal.broadcast_attempts {
@@ -622,11 +665,14 @@ async fn first_mined_pair(
         if tracked {
             continue;
         }
-        let Ok(height) = btc_client
-            .get_block_height_for_txid(&attempt.reveal_txid)
-            .await
-        else {
-            continue;
+        let height = match classify_reveal_height(
+            btc_client
+                .get_block_height_for_txid(&attempt.reveal_txid)
+                .await,
+        ) {
+            RevealHeight::Mined(height) => height,
+            RevealHeight::Unmined => continue,
+            RevealHeight::Unknown => return None,
         };
         if best
             .as_ref()
@@ -642,6 +688,28 @@ async fn first_mined_pair(
         }
     }
     best.map(|(_, pair)| pair)
+}
+
+/// The commit and reveal to write for `winner`. The tracked winner is named explicitly, so a pair
+/// registered after the read cannot be the one `COALESCE` leaves in place (#605).
+fn winner_txids(proposal: &Proposal, winner: MinedPair) -> Option<(String, String)> {
+    match winner {
+        MinedPair::Other {
+            commit_txid,
+            reveal_txid,
+        } => Some((commit_txid, reveal_txid)),
+        MinedPair::Tracked => {
+            let reveal_txid = proposal.reveal_txid.clone()?;
+            let commit_txid = proposal.commit_txid.clone().or_else(|| {
+                proposal
+                    .broadcast_attempts
+                    .iter()
+                    .find(|attempt| attempt.reveal_txid.eq_ignore_ascii_case(&reveal_txid))
+                    .map(|attempt| attempt.commit_txid.clone())
+            })?;
+            Some((commit_txid, reveal_txid))
+        }
+    }
 }
 
 /// Notice a reveal that confirmed while nothing was watching.
@@ -671,26 +739,22 @@ async fn confirm_reveal_if_mined(
     ) {
         return proposal;
     }
+    let observed_reveal = proposal.reveal_txid.clone();
     let Some(winner) = first_mined_pair(&proposal, btc_client).await else {
         return proposal;
     };
-    // The row tracks the latest pair; when another one was mined first, that is the one the ASM
-    // acted on, so it becomes the row's pair and the activation height is read from it (#605).
-    let (commit_txid, reveal_txid) = match winner {
-        MinedPair::Tracked => (None, None),
-        MinedPair::Other {
-            commit_txid,
-            reveal_txid,
-        } => (Some(commit_txid), Some(reveal_txid)),
+    // Name the winner's txids. The write applies only while the row still tracks the reveal this
+    // read observed: a pair registered in between is left for the next reconcile, which sees both
+    // (#605).
+    let Some((commit_txid, reveal_txid)) = winner_txids(&proposal, winner) else {
+        return proposal;
     };
     let updated = repo
-        .update_broadcast_status(
+        .confirm_tracked_reveal(
             &proposal.action_id,
-            BroadcastStatus::RevealConfirmed,
-            None,
-            commit_txid.as_deref(),
-            reveal_txid.as_deref(),
-            None,
+            observed_reveal.as_deref(),
+            &commit_txid,
+            &reveal_txid,
         )
         .await;
     match updated {
@@ -1162,13 +1226,32 @@ pub(crate) async fn report_broadcast_progress(
         .ok_or(AppError::NotFound)?;
     require_proposal_authority(&raw, session.authority)?;
 
-    // A report about a pair the row no longer tracks comes from a bundle another signer's pair
-    // replaced (#605): its `failed` or `reveal_broadcasted` would overwrite the pair now in
-    // flight. It changes nothing; if that reveal is mined, the reconcile finds it among the pairs.
-    // Checked here to skip the work, and again in the write for a pair registered in between.
-    if !reports_tracked_pair(body.reveal_txid.as_deref(), raw.reveal_txid.as_deref()) {
-        log_report_for_replaced_pair(action_id, body.reveal_txid.as_deref(), &raw);
-        return Ok(raw);
+    let commit_txid = body
+        .commit_txid
+        .as_deref()
+        .map(|txid| txid.to_ascii_lowercase());
+    let reveal_txid = body
+        .reveal_txid
+        .as_deref()
+        .map(|txid| txid.to_ascii_lowercase());
+
+    // A report about a pair the row no longer tracks must not move that row (#605): its `failed`
+    // or `reveal_broadcasted` would overwrite the pair now in flight. The pair itself is kept, so
+    // the reconcile can still select it if it is mined first. A report that names no reveal does
+    // not qualify either, once the row is tagged. Checked here to skip the work, and again in the
+    // write for a pair registered in between.
+    if !reports_tracked_pair(reveal_txid.as_deref(), raw.reveal_txid.as_deref()) {
+        keep_reported_pair(
+            repo,
+            session,
+            action_id,
+            commit_txid.as_deref(),
+            reveal_txid.as_deref(),
+        )
+        .await?;
+        let current = repo.find_by_action_id(action_id).await?.unwrap_or(raw);
+        log_report_for_replaced_pair(action_id, reveal_txid.as_deref(), &current);
+        return Ok(current);
     }
 
     let broadcast_status: BroadcastStatus = body.broadcast_status.parse()?;
@@ -1218,34 +1301,28 @@ pub(crate) async fn report_broadcast_progress(
     };
 
     // Every pair a desktop registers is kept, so a later pair beside it cannot hide it (#605).
-    if let (Some(commit_txid), Some(reveal_txid)) =
-        (body.commit_txid.as_deref(), body.reveal_txid.as_deref())
-    {
-        repo.record_broadcast_attempt(
-            action_id,
-            BroadcastAttempt {
-                broadcaster_pubkey: Some(normalize_signer_pubkey_hex(session.signer_pubkey)),
-                commit_txid: commit_txid.to_string(),
-                reveal_txid: reveal_txid.to_string(),
-                created_at: Utc::now(),
-            },
-        )
-        .await?;
-    }
+    keep_reported_pair(
+        repo,
+        session,
+        action_id,
+        commit_txid.as_deref(),
+        reveal_txid.as_deref(),
+    )
+    .await?;
 
     let updated = repo
         .update_reported_pair_status(
             action_id,
             broadcast_status,
             proposal_status,
-            body.commit_txid.as_deref(),
-            body.reveal_txid.as_deref(),
+            commit_txid.as_deref(),
+            reveal_txid.as_deref(),
             body.broadcast_error.as_deref(),
         )
         .await?
         .ok_or(AppError::NotFound)?;
-    if !reports_tracked_pair(body.reveal_txid.as_deref(), updated.reveal_txid.as_deref()) {
-        log_report_for_replaced_pair(action_id, body.reveal_txid.as_deref(), &updated);
+    if !reports_tracked_pair(reveal_txid.as_deref(), updated.reveal_txid.as_deref()) {
+        log_report_for_replaced_pair(action_id, reveal_txid.as_deref(), &updated);
         return Ok(updated);
     }
 
@@ -1256,12 +1333,36 @@ pub(crate) async fn report_broadcast_progress(
     Ok(updated)
 }
 
+/// Keep the pair a report names, stored lowercase so the case-sensitive key matches once (#605).
+/// A report with either txid missing names no pair.
+async fn keep_reported_pair(
+    repo: &dyn ProposalRepository,
+    session: SessionContext<'_>,
+    action_id: &ActionId,
+    commit_txid: Option<&str>,
+    reveal_txid: Option<&str>,
+) -> Result<(), AppError> {
+    let (Some(commit_txid), Some(reveal_txid)) = (commit_txid, reveal_txid) else {
+        return Ok(());
+    };
+    repo.record_broadcast_attempt(
+        action_id,
+        BroadcastAttempt {
+            broadcaster_pubkey: Some(normalize_signer_pubkey_hex(session.signer_pubkey)),
+            commit_txid: commit_txid.to_ascii_lowercase(),
+            reveal_txid: reveal_txid.to_ascii_lowercase(),
+            created_at: Utc::now(),
+        },
+    )
+    .await
+}
+
 fn log_report_for_replaced_pair(action_id: &ActionId, reported: Option<&str>, row: &Proposal) {
     tracing::info!(
         action_id = %action_id.0,
         reported,
         tracked = row.reveal_txid.as_deref(),
-        "broadcast report for a pair the row no longer tracks; ignored"
+        "broadcast report for a pair the row no longer tracks; status left unchanged"
     );
 }
 
@@ -2840,8 +2941,8 @@ mod tests {
             ReportBroadcastProgressRequest {
                 broadcast_status: "reveal_confirmed".to_string(),
                 proposal_status: Some("enacted".to_string()),
-                commit_txid: None,
-                reveal_txid: None,
+                commit_txid: Some("commit".to_string()),
+                reveal_txid: Some("reveal".to_string()),
                 broadcast_error: None,
             },
         )
@@ -3699,10 +3800,11 @@ mod tests {
         }
 
         async fn get_block_height_for_txid(&self, txid: &str) -> Result<u64, AppError> {
-            self.0
-                .get(txid)
-                .copied()
-                .ok_or_else(|| AppError::Internal(anyhow::anyhow!("not in a block")))
+            self.0.get(txid).copied().ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "getrawtransaction: tx {txid} has no blockhash — not yet confirmed"
+                ))
+            })
         }
 
         async fn get_chain_tip(&self) -> Result<u64, AppError> {
@@ -4042,5 +4144,148 @@ mod tests {
             BroadcastStatus::CommitBroadcasted
         );
         assert_eq!(unchanged.reveal_txid.as_deref(), Some(REVEAL_B));
+    }
+
+    const COMMIT_C: &str = "cc00000000000000000000000000000000000000000000000000000000000000";
+    const REVEAL_C: &str = "cc11111111111111111111111111111111111111111111111111111111111111";
+
+    /// A confirmation decided while the row tracked A must not land once the row tracks B. The
+    /// next read sees both pairs and decides again (#605).
+    #[tokio::test]
+    async fn a_confirmation_does_not_apply_once_the_row_tracks_another_pair() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+
+        let applied = repo
+            .confirm_tracked_reveal(&action_id, Some(REVEAL_A), COMMIT_A, REVEAL_A)
+            .await
+            .unwrap();
+
+        assert!(
+            applied.is_none(),
+            "the observed reveal is no longer the row's"
+        );
+        let stored = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        assert_eq!(stored.broadcast_status, BroadcastStatus::CommitBroadcasted);
+        assert_eq!(stored.reveal_txid.as_deref(), Some(REVEAL_B));
+        assert!(stored.activation_height.is_none());
+    }
+
+    /// Importing a bundle whose txids differ from the row's used to be dropped entirely. The
+    /// status stays, and the pair is kept so the reconcile can select it if it mines first.
+    #[tokio::test]
+    async fn a_report_about_an_untracked_pair_is_kept_without_moving_the_row() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+
+        let after = report_broadcast_progress(
+            &repo,
+            "mock://asm-membership",
+            session_of(&sig_a()),
+            &action_id,
+            &mock_btc(),
+            report(
+                "reveal_broadcasted",
+                Some(&COMMIT_C.to_uppercase()),
+                Some(&REVEAL_C.to_uppercase()),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(after.broadcast_status, BroadcastStatus::CommitBroadcasted);
+        assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_B));
+        let reveals: Vec<&str> = after
+            .broadcast_attempts
+            .iter()
+            .map(|attempt| attempt.reveal_txid.as_str())
+            .collect();
+        assert_eq!(reveals, [REVEAL_A, REVEAL_B, REVEAL_C]);
+    }
+
+    /// A report that does not name a reveal must not fail, or enact, the pair the row tracks.
+    #[tokio::test]
+    async fn a_report_that_names_no_reveal_leaves_a_tagged_row_alone() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+
+        let mut unnamed = report("failed", None, None);
+        unnamed.broadcast_error = Some(DROPPED_FOR_TEST.to_string());
+        let after = report_broadcast_progress(
+            &repo,
+            "mock://asm-membership",
+            session_of(&sig_a()),
+            &action_id,
+            &mock_btc(),
+            unnamed,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(after.broadcast_status, BroadcastStatus::CommitBroadcasted);
+        assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_B));
+        assert!(after.broadcast_error.is_none());
+        assert_eq!(after.broadcast_attempts.len(), 2);
+    }
+
+    /// The node failing to answer about the tracked reveal is not "that reveal lost". Confirming
+    /// the other pair would pin the activation height to the wrong block.
+    #[tokio::test]
+    async fn an_unreadable_reveal_leaves_the_row_in_flight() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+
+        let btc = RevealLookup {
+            heights: [(REVEAL_A, 800_010)].into_iter().collect(),
+            unreadable: REVEAL_B,
+        };
+        let unchanged =
+            confirm_reveal_if_mined(&repo, proposal, &btc, "mock://asm-membership").await;
+
+        assert_eq!(
+            unchanged.broadcast_status,
+            BroadcastStatus::CommitBroadcasted
+        );
+        assert_eq!(unchanged.reveal_txid.as_deref(), Some(REVEAL_B));
+        assert!(unchanged.activation_height.is_none());
+    }
+
+    /// Mines the txids it is given. One txid is a node failure rather than "not in a block".
+    struct RevealLookup {
+        heights: std::collections::HashMap<&'static str, u64>,
+        unreadable: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl BitcoinRpcClient for RevealLookup {
+        async fn estimate_fee_rate_sats_per_vb(
+            &self,
+            _target_blocks: u16,
+        ) -> Result<u64, AppError> {
+            Ok(1)
+        }
+
+        async fn get_block_height_for_txid(&self, txid: &str) -> Result<u64, AppError> {
+            if txid == self.unreadable {
+                return Err(AppError::BadRequest(
+                    "bitcoin rpc `getrawtransaction` request failed: connection refused"
+                        .to_string(),
+                ));
+            }
+            self.heights.get(txid).copied().ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "getrawtransaction: tx {txid} has no blockhash — not yet confirmed"
+                ))
+            })
+        }
+
+        async fn get_chain_tip(&self) -> Result<u64, AppError> {
+            Ok(800_000)
+        }
     }
 }

@@ -73,9 +73,9 @@ pub(crate) trait ProposalRepository: Send + Sync {
     ) -> Result<Option<Proposal>, AppError>;
 
     /// `update_broadcast_status` for a desktop's report about its own pair (#605): applied only
-    /// while the row still tracks that pair — its reveal is the reported one, or either is unset.
-    /// Decided in the write itself, so a pair registered after the report read the row is never
-    /// overwritten; otherwise the row comes back as it is.
+    /// while the row is untagged or still tracks the reported reveal. A report that names no
+    /// reveal does not touch a tagged row. Decided in the write itself, so a pair registered
+    /// after the report read the row is never overwritten; otherwise the row comes back as it is.
     async fn update_reported_pair_status(
         &self,
         action_id: &ActionId,
@@ -84,6 +84,19 @@ pub(crate) trait ProposalRepository: Send + Sync {
         commit_txid: Option<&str>,
         reveal_txid: Option<&str>,
         error: Option<&str>,
+    ) -> Result<Option<Proposal>, AppError>;
+
+    /// Mark the proposal `reveal_confirmed` on this commit + reveal, but only while it still
+    /// tracks `observed_reveal` and the broadcast is still unconfirmed (#605).
+    ///
+    /// `Ok(None)` when the row is gone or has moved on: the next reconcile reads it again and
+    /// decides from what it finds. The winner's txids are written outright, never left to COALESCE.
+    async fn confirm_tracked_reveal(
+        &self,
+        action_id: &ActionId,
+        observed_reveal: Option<&str>,
+        commit_txid: &str,
+        reveal_txid: &str,
     ) -> Result<Option<Proposal>, AppError>;
 
     /// Find the cancel proposal that targets the given action_id, if one exists.

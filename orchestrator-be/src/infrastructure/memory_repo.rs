@@ -1,8 +1,8 @@
 //! In-memory proposal repository for POC and testing.
 
 use crate::application::proposals::{
-    additional_pair_refusal, broadcast_claim_allowed, reports_tracked_pair, BroadcastClaimFacts,
-    AUTHORITY_IN_FLIGHT,
+    additional_pair_refusal, broadcast_claim_allowed, reports_tracked_pair, row_still_has_reveal,
+    BroadcastClaimFacts, AUTHORITY_IN_FLIGHT,
 };
 use crate::application::traits::ProposalRepository;
 use crate::domain::authority::Authority;
@@ -293,6 +293,38 @@ impl ProposalRepository for InMemoryProposalRepository {
                 error,
             );
         }
+        Ok(Some(proposal.clone()))
+    }
+
+    async fn confirm_tracked_reveal(
+        &self,
+        action_id: &ActionId,
+        observed_reveal: Option<&str>,
+        commit_txid: &str,
+        reveal_txid: &str,
+    ) -> Result<Option<Proposal>, AppError> {
+        let mut proposals = self
+            .proposals
+            .write()
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("repo lock poisoned")))?;
+        let Some(proposal) = proposals.get_mut(action_id) else {
+            return Ok(None);
+        };
+        let confirmable = matches!(
+            proposal.broadcast_status,
+            BroadcastStatus::CommitBroadcasted
+                | BroadcastStatus::CommitConfirmed
+                | BroadcastStatus::RevealBroadcasted
+                | BroadcastStatus::Failed
+        );
+        if !confirmable || !row_still_has_reveal(observed_reveal, proposal.reveal_txid.as_deref()) {
+            return Ok(None);
+        }
+        proposal.broadcast_status = BroadcastStatus::RevealConfirmed;
+        proposal.commit_txid = Some(commit_txid.to_ascii_lowercase());
+        proposal.reveal_txid = Some(reveal_txid.to_ascii_lowercase());
+        proposal.broadcast_error = None;
+        proposal.updated_at = Utc::now();
         Ok(Some(proposal.clone()))
     }
 

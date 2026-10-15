@@ -407,16 +407,21 @@ acts on; the others are refused on the sequence number and cost only their fees.
   the new pair, `commit_broadcasted`, claim time now, error cleared — under a row lock. From there
   the new sender's desktop reports on the row as any claimer would; the per-authority gate is
   unchanged, since this proposal is already the authority's in-flight one.
-- **Reports about a replaced pair change nothing.** A `PATCH` whose `reveal_txid` differs from the
-  row's is ignored and returns the row as it is: the earlier sender's settle loop would otherwise
-  mark the new pair `failed` or move its status. The comparison is made in the write itself
-  (`update_reported_pair_status`, a conditional `UPDATE`), so a pair registered after the report
-  read the row is not overwritten either. The desktop already reports only to a row that
-  carries its own reveal txid (`BundleRow::Ours`), and a `failed` report now names its pair.
+- **Reports about a replaced pair do not move the row.** A `PATCH` whose `reveal_txid` differs from the
+  row's leaves the status, txids and error as they are: the earlier sender's settle loop would otherwise
+  mark the new pair `failed` or move its status. The pair is still recorded, so the reconcile can select
+  it if that reveal is mined first. A `PATCH` that names no reveal does not change a row that already
+  tracks one (an untagged claim still accepts it — that is the pre-registration). The comparison is made
+  in the write itself (`update_reported_pair_status`, a conditional `UPDATE`), so a pair registered after
+  the report read the row is not overwritten either. Txids are stored lowercase. The desktop already
+  reports only to a row that carries its own reveal txid (`BundleRow::Ours`), and a `failed` report now
+  names its pair.
 - **Reconcile picks the pair mined first.** `confirm_reveal_if_mined` looks up the row's reveal and
   every listed pair's; the lowest block height wins, the row's own pair on a tie (two reveals in one
-  block activate at the same height). A winner other than the row's pair becomes the row's pair
-  before `reveal_confirmed` is written, so the activation height and the queue id come from it.
+  block activate at the same height). A lookup the node cannot answer leaves the row alone — "not in a
+  block" is the only miss that is skipped. The winner's txids are written explicitly, and only while the
+  row still tracks the reveal observed on that read (`confirm_tracked_reveal`); a pair registered in between
+  waits for the next read. The activation height and the queue id come from the winner.
 - **Desktop.** The detail screen offers *Send your own commit + reveal* under the in-flight stage
   (`canSendAdditionalPair`) and lists every pair once there is more than one (*Current*, *Sent*,
   *Mined*, *Not used*). The send screen opens with `?pair=additional`; while a pair is in flight it

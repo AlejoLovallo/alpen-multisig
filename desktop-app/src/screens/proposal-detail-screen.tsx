@@ -79,6 +79,10 @@ export function ProposalDetailScreen() {
 					actionId,
 					broadcastStatus: 'reveal_confirmed',
 					proposalStatus: 'enacted',
+					// Name the imported reveal. A report with no reveal does not move a row that
+					// already tracks a pair, so this cannot enact a different one (#605).
+					commitTxid: broadcastState.commitTxid ?? undefined,
+					revealTxid: broadcastState.revealTxid ?? undefined,
 				})
 			}
 		}

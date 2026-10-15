@@ -361,8 +361,6 @@ impl ProposalRepository for PostgresProposalRepository {
             proposal.signatures = signatures;
             proposal.broadcast_attempts =
                 load_broadcast_attempts(&self.pool, &proposal.action_id.0).await?;
-            proposal.broadcast_attempts =
-                load_broadcast_attempts(&self.pool, &proposal.action_id.0).await?;
             proposals.push(proposal);
         }
 
@@ -460,10 +458,16 @@ impl ProposalRepository for PostgresProposalRepository {
         action_id: &ActionId,
         attempt: BroadcastAttempt,
     ) -> Result<(), AppError> {
+        // Lowercase, and skip a pair already kept under any casing: the primary key is
+        // case-sensitive, so ON CONFLICT alone would store the same reveal twice (#605).
         sqlx::query(
             r#"
             INSERT INTO broadcast_attempts(action_id, broadcaster_pubkey, commit_txid, reveal_txid, created_at)
-            VALUES ($1, $2, $3, $4, $5)
+            SELECT $1, $2, LOWER($3), LOWER($4), $5
+            WHERE NOT EXISTS (
+                SELECT 1 FROM broadcast_attempts
+                WHERE action_id = $1 AND LOWER(reveal_txid) = LOWER($4)
+            )
             ON CONFLICT (action_id, reveal_txid) DO NOTHING
             "#,
         )
@@ -595,11 +599,13 @@ impl ProposalRepository for PostgresProposalRepository {
     ) -> Result<Option<Proposal>, AppError> {
         let proposal_status_db = proposal_status.map(status_to_db);
 
-        // Postgres re-checks the reveal condition on the locked row: a registration that commits
-        // first leaves this UPDATE matching nothing.
+        // Same predicate as `reports_tracked_pair`, re-checked on the locked row: an untagged row
+        // accepts the report, a tagged row only when this reveal is the one it tracks. A report
+        // that names no reveal does not match a tagged row.
         sqlx::query(&format!(
             "{UPDATE_BROADCAST_STATUS} \
-             AND ($4::text IS NULL OR reveal_txid IS NULL OR LOWER(reveal_txid) = LOWER($4))"
+             AND (reveal_txid IS NULL \
+                  OR ($4::text IS NOT NULL AND LOWER(reveal_txid) = LOWER($4)))"
         ))
         .bind(status.to_string())
         .bind(proposal_status_db)
@@ -613,6 +619,49 @@ impl ProposalRepository for PostgresProposalRepository {
             AppError::Internal(anyhow::anyhow!("failed to update broadcast status: {e}"))
         })?;
 
+        self.find_by_action_id(action_id).await
+    }
+
+    async fn confirm_tracked_reveal(
+        &self,
+        action_id: &ActionId,
+        observed_reveal: Option<&str>,
+        commit_txid: &str,
+        reveal_txid: &str,
+    ) -> Result<Option<Proposal>, AppError> {
+        // One UPDATE: the winner's txids are written only while the row still tracks the reveal
+        // the reconcile observed, and the broadcast has not already confirmed.
+        let updated = sqlx::query(
+            r#"
+            UPDATE proposals
+            SET broadcast_status = 'reveal_confirmed',
+                commit_txid = LOWER($2),
+                reveal_txid = LOWER($3),
+                broadcast_error = NULL,
+                updated_at = NOW()
+            WHERE action_id = $1
+              AND broadcast_status IN (
+                    'commit_broadcasted', 'commit_confirmed', 'reveal_broadcasted', 'failed'
+                  )
+              AND (
+                    ($4::text IS NULL AND reveal_txid IS NULL)
+                    OR ($4::text IS NOT NULL AND LOWER(reveal_txid) = LOWER($4))
+                  )
+            "#,
+        )
+        .bind(&action_id.0)
+        .bind(commit_txid)
+        .bind(reveal_txid)
+        .bind(observed_reveal)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            AppError::Internal(anyhow::anyhow!("failed to confirm tracked reveal: {e}"))
+        })?;
+
+        if updated.rows_affected() == 0 {
+            return Ok(None);
+        }
         self.find_by_action_id(action_id).await
     }
 
