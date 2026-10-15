@@ -1025,7 +1025,7 @@ pub async fn proposals_broadcast(
     } else {
         proposals::SendMode::Claim
     };
-    let (commit_txid, reveal_txid) = proposals::submit_pair(
+    let (commit_txid, reveal_txid) = proposals::submit_commit_then_reveal(
         client.as_ref(),
         &broadcasters,
         &env.asm_rpc_url,

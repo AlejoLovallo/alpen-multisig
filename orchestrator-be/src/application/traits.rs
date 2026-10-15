@@ -52,7 +52,7 @@ pub(crate) trait ProposalRepository: Send + Sync {
     /// Register another signer's pair beside the one in flight and make it the pair the row
     /// tracks (`commit_broadcasted`, claim time now, error cleared) (#605).
     ///
-    /// Decided under the repository's lock with `additional_pair_refusal`; a refusal is
+    /// Decided under the repository's lock with `decide_additional_pair`; a refusal is
     /// `Err(Conflict)` carrying its text. Never touches another proposal: the authority's
     /// in-flight bundle is already this one.
     async fn register_additional_pair(

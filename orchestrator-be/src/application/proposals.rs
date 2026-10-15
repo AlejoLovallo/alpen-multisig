@@ -504,18 +504,30 @@ pub(crate) fn row_still_has_reveal(observed: Option<&str>, tracked: Option<&str>
     }
 }
 
-/// Why another commit + reveal pair may not be registered for `proposal`, or `None` (#605).
+/// What registering another commit + reveal pair does to a proposal (#605).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AdditionalPair {
+    /// A new pair: keep it and make it the one the row tracks.
+    Register,
+    /// This signer already registered this very pair — a retry after a lost response. Nothing
+    /// changes; the desktop goes on to broadcast it.
+    AlreadyRegistered,
+}
+
+/// Whether another commit + reveal pair may be registered for `proposal`, or the conflict text
+/// refusing it (#605).
 ///
 /// Only beside a pair that is on its way: the row is approved and `commit_broadcasted` with a
 /// txid, `commit_confirmed` or `reveal_broadcasted`. An empty claim is a signer still at the
 /// device; `idle`, `failed` and a stale empty claim go through the claim instead. One pair per
 /// signer: whoever already sent one bumps its fee, and the desktop holds one stored bundle per
-/// proposal. Shared by both repositories, which evaluate it under their own lock.
-pub(crate) fn additional_pair_refusal(
+/// proposal — except that the same signer registering the same pair again is the retry of a
+/// registration whose response was lost, and succeeds. Shared by both repositories, which
+/// evaluate it under their own lock.
+pub(crate) fn decide_additional_pair(
     proposal: &Proposal,
-    broadcaster_pubkey: &str,
-    reveal_txid: &str,
-) -> Option<&'static str> {
+    attempt: &BroadcastAttempt,
+) -> Result<AdditionalPair, &'static str> {
     let in_flight = proposal.status == ProposalStatus::Approved
         && match proposal.broadcast_status {
             BroadcastStatus::CommitBroadcasted => proposal.reveal_txid.is_some(),
@@ -523,16 +535,31 @@ pub(crate) fn additional_pair_refusal(
             _ => false,
         };
     if !in_flight {
-        return Some(NO_PAIR_IN_FLIGHT);
+        return Err(NO_PAIR_IN_FLIGHT);
     }
-    let already_sent = proposal.broadcast_attempts.iter().any(|attempt| {
-        attempt
-            .broadcaster_pubkey
+    let same_signer = |kept: &BroadcastAttempt| {
+        kept.broadcaster_pubkey
             .as_deref()
-            .is_some_and(|pubkey| pubkey.eq_ignore_ascii_case(broadcaster_pubkey))
-            || attempt.reveal_txid.eq_ignore_ascii_case(reveal_txid)
-    });
-    already_sent.then_some(OWN_PAIR_EXISTS)
+            .zip(attempt.broadcaster_pubkey.as_deref())
+            .is_some_and(|(kept, new)| kept.eq_ignore_ascii_case(new))
+    };
+    let same_reveal =
+        |kept: &BroadcastAttempt| kept.reveal_txid.eq_ignore_ascii_case(&attempt.reveal_txid);
+    if proposal
+        .broadcast_attempts
+        .iter()
+        .any(|kept| same_signer(kept) && same_reveal(kept))
+    {
+        return Ok(AdditionalPair::AlreadyRegistered);
+    }
+    if proposal
+        .broadcast_attempts
+        .iter()
+        .any(|kept| same_signer(kept) || same_reveal(kept))
+    {
+        return Err(OWN_PAIR_EXISTS);
+    }
+    Ok(AdditionalPair::Register)
 }
 
 fn require_txid(name: &str, txid: &str) -> Result<(), AppError> {
@@ -604,17 +631,6 @@ async fn ensure_seq_no_still_open(proposal: &Proposal, asm_rpc_url: &str) -> Res
     )))
 }
 
-/// The pair whose reveal was mined, out of every pair registered for a proposal (#605).
-enum MinedPair {
-    /// The pair the row already tracks.
-    Tracked,
-    /// An earlier pair, mined before the one the row tracks.
-    Other {
-        commit_txid: String,
-        reveal_txid: String,
-    },
-}
-
 /// What one reveal lookup told us. "Not in a block" is an answer; a node that could not answer is
 /// not, and must not be read as the reveal losing the race (#605).
 enum RevealHeight {
@@ -642,74 +658,48 @@ fn reveal_not_in_a_block(message: &str) -> bool {
         || message.contains("no such transaction")
 }
 
-/// The pair mined first: the lowest block height, the row's own pair on a tie. Two reveals in one
-/// block activate at the same height whichever the ASM took. `None` when no reveal is mined, or the
-/// node could not say about one of them.
+/// The commit + reveal pair mined first, out of the row's own pair and every pair registered for
+/// the proposal (#605): the lowest block height, the row's own pair on a tie. Two reveals in one
+/// block activate at the same height whichever the ASM took. `None` when no reveal is mined, when
+/// the node could not say about one of them, or when the winner has no commit txid on record.
 async fn first_mined_pair(
     proposal: &Proposal,
     btc_client: &dyn BitcoinRpcClient,
-) -> Option<MinedPair> {
-    let mut best: Option<(u64, MinedPair)> = None;
-    if let Some(reveal_txid) = proposal.reveal_txid.as_deref() {
-        match classify_reveal_height(btc_client.get_block_height_for_txid(reveal_txid).await) {
-            RevealHeight::Mined(height) => best = Some((height, MinedPair::Tracked)),
-            RevealHeight::Unmined => {}
-            RevealHeight::Unknown => return None,
-        }
-    }
-    for attempt in &proposal.broadcast_attempts {
-        let tracked = proposal
-            .reveal_txid
-            .as_deref()
-            .is_some_and(|txid| txid.eq_ignore_ascii_case(&attempt.reveal_txid));
-        if tracked {
-            continue;
-        }
-        let height = match classify_reveal_height(
-            btc_client
-                .get_block_height_for_txid(&attempt.reveal_txid)
-                .await,
-        ) {
-            RevealHeight::Mined(height) => height,
-            RevealHeight::Unmined => continue,
-            RevealHeight::Unknown => return None,
-        };
-        if best
-            .as_ref()
-            .is_none_or(|(best_height, _)| height < *best_height)
-        {
-            best = Some((
-                height,
-                MinedPair::Other {
-                    commit_txid: attempt.commit_txid.clone(),
-                    reveal_txid: attempt.reveal_txid.clone(),
-                },
-            ));
-        }
-    }
-    best.map(|(_, pair)| pair)
-}
+) -> Option<(String, String)> {
+    let tracked = proposal.reveal_txid.as_deref();
+    // The row's own pair goes first, so a tie keeps it.
+    let candidates = tracked
+        .map(|reveal| (proposal.commit_txid.as_deref(), reveal))
+        .into_iter()
+        .chain(
+            proposal
+                .broadcast_attempts
+                .iter()
+                .filter(|attempt| {
+                    !tracked.is_some_and(|txid| txid.eq_ignore_ascii_case(&attempt.reveal_txid))
+                })
+                .map(|attempt| {
+                    (
+                        Some(attempt.commit_txid.as_str()),
+                        attempt.reveal_txid.as_str(),
+                    )
+                }),
+        );
 
-/// The commit and reveal to write for `winner`. The tracked winner is named explicitly, so a pair
-/// registered after the read cannot be the one `COALESCE` leaves in place (#605).
-fn winner_txids(proposal: &Proposal, winner: MinedPair) -> Option<(String, String)> {
-    match winner {
-        MinedPair::Other {
-            commit_txid,
-            reveal_txid,
-        } => Some((commit_txid, reveal_txid)),
-        MinedPair::Tracked => {
-            let reveal_txid = proposal.reveal_txid.clone()?;
-            let commit_txid = proposal.commit_txid.clone().or_else(|| {
-                proposal
-                    .broadcast_attempts
-                    .iter()
-                    .find(|attempt| attempt.reveal_txid.eq_ignore_ascii_case(&reveal_txid))
-                    .map(|attempt| attempt.commit_txid.clone())
-            })?;
-            Some((commit_txid, reveal_txid))
+    let mut best: Option<(u64, Option<&str>, &str)> = None;
+    for (commit, reveal) in candidates {
+        let height =
+            match classify_reveal_height(btc_client.get_block_height_for_txid(reveal).await) {
+                RevealHeight::Mined(height) => height,
+                RevealHeight::Unmined => continue,
+                RevealHeight::Unknown => return None,
+            };
+        if best.is_none_or(|(best_height, _, _)| height < best_height) {
+            best = Some((height, commit, reveal));
         }
     }
+    let (_, commit, reveal) = best?;
+    Some((commit?.to_string(), reveal.to_string()))
 }
 
 /// Notice a reveal that confirmed while nothing was watching.
@@ -740,13 +730,11 @@ async fn confirm_reveal_if_mined(
         return proposal;
     }
     let observed_reveal = proposal.reveal_txid.clone();
-    let Some(winner) = first_mined_pair(&proposal, btc_client).await else {
-        return proposal;
-    };
-    // Name the winner's txids. The write applies only while the row still tracks the reveal this
-    // read observed: a pair registered in between is left for the next reconcile, which sees both
+    // Name the winner's txids, so a pair registered after this read cannot be the one `COALESCE`
+    // leaves in place. The write applies only while the row still tracks the reveal this read
+    // observed: a pair registered in between is left for the next reconcile, which sees both
     // (#605).
-    let Some((commit_txid, reveal_txid)) = winner_txids(&proposal, winner) else {
+    let Some((commit_txid, reveal_txid)) = first_mined_pair(&proposal, btc_client).await else {
         return proposal;
     };
     let updated = repo
@@ -3961,11 +3949,35 @@ mod tests {
         );
 
         register_pair_of_b(&repo, &action_id).await.unwrap();
-        let err = register_pair_of_b(&repo, &action_id).await.unwrap_err();
+        let err = register_additional_pair(
+            &repo,
+            session_of(&sig_b()),
+            "mock://asm-membership",
+            &action_id,
+            COMMIT_C,
+            REVEAL_C,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, AppError::Conflict(ref m) if m == OWN_PAIR_EXISTS),
-            "{err:?}"
+            "a second pair of their own: {err:?}"
         );
+    }
+
+    /// A registration whose response was lost: the same signer sends the same pair again and gets
+    /// the row back, unchanged, so the desktop can go on to broadcast it.
+    #[tokio::test]
+    async fn the_same_pair_registered_again_is_accepted_unchanged() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        let first = register_pair_of_b(&repo, &action_id).await.unwrap();
+
+        let again = register_pair_of_b(&repo, &action_id).await.unwrap();
+
+        assert_eq!(again.reveal_txid.as_deref(), Some(REVEAL_B));
+        assert_eq!(again.broadcast_attempts, first.broadcast_attempts);
+        assert_eq!(again.broadcast_claimed_at, first.broadcast_claimed_at);
     }
 
     /// Nothing on its way means nothing to send beside: `idle` and `failed` go through the claim,

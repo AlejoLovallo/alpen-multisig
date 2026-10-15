@@ -2,7 +2,7 @@
 //
 // A low-fee bundle can sit in the mempool while nobody else can advance it. The offer appears
 // only beside a pair that is on its way, and only to a signer who has not sent one; the
-// orchestrator refuses the same cases (`additional_pair_refusal`).
+// orchestrator refuses the same cases (`decide_additional_pair`).
 
 import assert from 'node:assert/strict'
 import type { BroadcastStatus, ProposalStatus } from '../../api/proposals'

@@ -1,8 +1,8 @@
 //! In-memory proposal repository for POC and testing.
 
 use crate::application::proposals::{
-    additional_pair_refusal, broadcast_claim_allowed, reports_tracked_pair, row_still_has_reveal,
-    BroadcastClaimFacts, AUTHORITY_IN_FLIGHT,
+    broadcast_claim_allowed, decide_additional_pair, reports_tracked_pair, row_still_has_reveal,
+    AdditionalPair, BroadcastClaimFacts, AUTHORITY_IN_FLIGHT,
 };
 use crate::application::traits::ProposalRepository;
 use crate::domain::authority::Authority;
@@ -223,10 +223,10 @@ impl ProposalRepository for InMemoryProposalRepository {
         let Some(proposal) = proposals.get_mut(action_id) else {
             return Err(AppError::NotFound);
         };
-        let broadcaster = attempt.broadcaster_pubkey.as_deref().unwrap_or_default();
-        if let Some(refusal) = additional_pair_refusal(proposal, broadcaster, &attempt.reveal_txid)
-        {
-            return Err(AppError::Conflict(refusal.to_string()));
+        match decide_additional_pair(proposal, &attempt) {
+            Err(refusal) => return Err(AppError::Conflict(refusal.to_string())),
+            Ok(AdditionalPair::AlreadyRegistered) => return Ok(proposal.clone()),
+            Ok(AdditionalPair::Register) => {}
         }
         let now = Utc::now();
         proposal.broadcast_status = BroadcastStatus::CommitBroadcasted;

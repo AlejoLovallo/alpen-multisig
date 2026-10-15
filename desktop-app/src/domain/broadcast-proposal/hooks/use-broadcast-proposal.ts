@@ -5,7 +5,6 @@ import {
 	prepareBroadcast,
 	reportBroadcastProgress,
 	resolveBroadcastStatus,
-	type BroadcastInput,
 	type BroadcastResult,
 	type PrepareBroadcastResult,
 	type Proposal,
@@ -63,15 +62,6 @@ export function mergeBroadcastWithProposal(broadcast: BroadcastResult, proposal:
 		commitTxid: proposal.commitTxid ?? broadcast.commitTxid,
 		revealTxid: proposal.revealTxid ?? broadcast.revealTxid,
 	}
-}
-
-function buildBroadcastInput(
-	baseUrl: string,
-	actionId: string,
-	feeRateSatPerKvb: number,
-	additionalPair = false,
-): BroadcastInput {
-	return { baseUrl, actionId, feeRateSatPerKvb, additionalPair }
 }
 
 /**
@@ -187,7 +177,7 @@ export function useBroadcastProposal(
 		}
 		const run = () => {
 			void Promise.all([
-				prepareBroadcast(buildBroadcastInput(baseUrl, actionId, feeRateSatPerKvb)),
+				prepareBroadcast({ baseUrl, actionId, feeRateSatPerKvb }),
 				getProposalByActionId({ baseUrl, actionId }),
 			]).then(([res, proposalRes]) => {
 				if (!active) return
@@ -249,7 +239,7 @@ export function useBroadcastProposal(
 		setPhase('preparing')
 		setError(null)
 		const [res, proposalRes] = await Promise.all([
-			prepareBroadcast(buildBroadcastInput(baseUrl, actionId, feeRateSatPerKvb)),
+			prepareBroadcast({ baseUrl, actionId, feeRateSatPerKvb }),
 			getProposalByActionId({ baseUrl, actionId }),
 		])
 		if (!res.ok) {
@@ -302,9 +292,12 @@ export function useBroadcastProposal(
 			setPhase('broadcasting')
 		}
 		try {
-			const res = await broadcastProposal(
-				buildBroadcastInput(baseUrl, actionId, feeRateSatPerKvb, sendsAdditionalPair.current),
-			)
+			const res = await broadcastProposal({
+				baseUrl,
+				actionId,
+				feeRateSatPerKvb,
+				additionalPair: sendsAdditionalPair.current,
+			})
 			if (!res.ok) {
 				setError(deriveBroadcastError(res.error))
 				setPhase('error')

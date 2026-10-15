@@ -145,6 +145,7 @@ Request body:
 
 - Same checks as the claim: session authority, `approved`, threshold snapshot, sequence number still open.
 - `409` when there is no pair in flight to send beside, or when the caller already sent a pair for this proposal.
+- The caller registering the same pair again returns `200` and leaves the row as it is, so a registration whose response was lost can be retried.
 - Returns the updated `Proposal` JSON. See "Another signer's commit + reveal".
 
 ## Technical Design
@@ -399,10 +400,12 @@ acts on; the others are refused on the sequence number and cost only their fees.
   txids records the pair with the reporting signer (idempotent), so the claimer's pre-registration
   is the first pair. Pairs registered before #605 are backfilled with no broadcaster.
 - **When.** Only beside a pair on its way: `approved` and `commit_broadcasted` with a txid,
-  `commit_confirmed` or `reveal_broadcasted` (`additional_pair_refusal`). An empty claim is a
+  `commit_confirmed` or `reveal_broadcasted` (`decide_additional_pair`). An empty claim is a
   signer still at the device; `idle`, `failed` and a stale empty claim go through the claim. One
   pair per signer: whoever already sent one bumps its fee (CPFP on the reveal change), and the
-  desktop holds one stored bundle per proposal.
+  desktop holds one stored bundle per proposal. The same signer registering the same pair again
+  succeeds without changing the row: it is the retry of a registration whose response was lost,
+  and the desktop retries it before broadcasting.
 - **The row tracks the latest pair.** Registering sets the row's `commit_txid` / `reveal_txid` to
   the new pair, `commit_broadcasted`, claim time now, error cleared — under a row lock. From there
   the new sender's desktop reports on the row as any claimer would; the per-authority gate is
@@ -427,8 +430,9 @@ acts on; the others are refused on the sequence number and cost only their fees.
   *Mined*, *Not used*). The send screen opens with `?pair=additional`; while a pair is in flight it
   prepares a fresh send instead of resuming, and `proposals_broadcast` runs with
   `additional_pair: true` (`SendMode::AdditionalPair`): no claim, the pair is registered through the
-  endpoint above instead of the pre-registration report — not retried, since a repeat is refused
-  as already sent — and nothing is reported on the row until it is, so a refusal leaves the other
+  endpoint above instead of the pre-registration report — retried (3 attempts) like that report,
+  except on a `409`, which is a decided refusal — and nothing is reported on the row until it is
+  registered, so a refusal leaves the other
   signer's pair untouched. Build, reservation, `PendingReveals`, broadcast and settle are unchanged.
 - **Accepted limits.** A sender whose own pair is rejected after registering reports `failed`; the
   row then offers *Retry send* through the claim, while the earlier pair stays listed and is still

@@ -215,6 +215,43 @@ async fn report_with_retry(
     }
 }
 
+/// Registers this signer's own pair beside the one in flight (#605), retrying up to
+/// [`REPORT_ATTEMPTS`] times like the pre-registration it stands in for. The orchestrator accepts
+/// the same pair from the same signer again, so a registration whose response was lost succeeds on
+/// the retry. A `409` is a decided refusal and is not retried.
+async fn register_with_retry(
+    client: &dyn OrchestratorClient,
+    action_id: &str,
+    commit_txid: &str,
+    reveal_txid: &str,
+) -> Result<(), BroadcastError> {
+    let mut attempt = 1;
+    loop {
+        let registered = client
+            .register_broadcast_attempt(
+                action_id,
+                RegisterBroadcastAttemptRequest {
+                    commit_txid: commit_txid.to_string(),
+                    reveal_txid: reveal_txid.to_string(),
+                },
+            )
+            .await;
+        match registered {
+            Ok(_) => return Ok(()),
+            Err(OrchestratorError::Backend {
+                status: 409,
+                message,
+            }) => return Err(BroadcastError::Setup(claim_conflict_message(&message))),
+            Err(e) if attempt < REPORT_ATTEMPTS => {
+                tracing::warn!(action_id, attempt, error = %e, "pair registration failed; retrying");
+                tokio::time::sleep(REPORT_RETRY_DELAY).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(BroadcastError::Orchestrator(e)),
+        }
+    }
+}
+
 /// A bundle broadcast that did not fully land: the error to return, and whether the proposal
 /// may be reported `failed` — only when the commit is proven not to be live (#516).
 struct BundleFailure {
@@ -308,6 +345,17 @@ pub enum ConfirmOutcome {
     Dropped,
 }
 
+/// How a send takes its place on the proposal (#605).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendMode {
+    /// Take the claim: the first send, or a retry after `failed`.
+    Claim,
+    /// Send this signer's own pair beside the one another signer has in flight. No claim: the
+    /// pair is registered with the orchestrator instead of pre-registered on a claimed row, and
+    /// until it is, the row is not this desktop's to report on.
+    AdditionalPair,
+}
+
 /// Pre-sign commit+reveal, store in PendingReveals, broadcast, and report up to
 /// `reveal_broadcasted`. Returns `(commit_txid, reveal_txid)` **without** waiting for any
 /// confirmation — the caller awaits confirmation separately (see [`await_reveal_confirmation`]).
@@ -326,52 +374,11 @@ pub enum ConfirmOutcome {
 /// already holds both txids and can promote the row on its own. The broadcast NEVER advances the chain:
 /// confirmation is driven by the dev faucet/harness on regtest and by real miners on
 /// testnet/mainnet. `get_raw_transaction` is NEVER called.
+///
+/// `mode` says how the send takes its place on the row (#605); the bundle itself — build, sign,
+/// store, broadcast, settle — is the same either way.
 #[allow(clippy::too_many_arguments)]
 pub async fn submit_commit_then_reveal(
-    client: &dyn OrchestratorClient,
-    broadcasters: &[std::sync::Arc<dyn TxBroadcaster>],
-    asm_rpc_url: &str,
-    magic_bytes: MagicBytes,
-    network: Network,
-    action_id: &str,
-    fee_rate: FeeRate,
-    commit_funding: &dyn CommitFunding,
-    reveal_change_spk: ScriptBuf,
-    pending: &PendingReveals,
-    envelope_cache: &EnvelopeKeyCache,
-) -> Result<(String, String), BroadcastError> {
-    submit_pair(
-        client,
-        broadcasters,
-        asm_rpc_url,
-        magic_bytes,
-        network,
-        action_id,
-        fee_rate,
-        commit_funding,
-        reveal_change_spk,
-        pending,
-        envelope_cache,
-        SendMode::Claim,
-    )
-    .await
-}
-
-/// How a send takes its place on the proposal (#605).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SendMode {
-    /// Take the claim: the first send, or a retry after `failed`.
-    Claim,
-    /// Send this signer's own pair beside the one another signer has in flight. No claim: the
-    /// pair is registered with the orchestrator instead of pre-registered on a claimed row, and
-    /// until it is, the row is not this desktop's to report on.
-    AdditionalPair,
-}
-
-/// [`submit_commit_then_reveal`] in either [`SendMode`]. The bundle itself — build, sign, store,
-/// broadcast, settle — is the same; only how the row is taken differs.
-#[allow(clippy::too_many_arguments)]
-pub async fn submit_pair(
     client: &dyn OrchestratorClient,
     broadcasters: &[std::sync::Arc<dyn TxBroadcaster>],
     asm_rpc_url: &str,
@@ -515,24 +522,9 @@ pub async fn submit_pair(
                 )
                 .await
             }
-            // Not retried: a second registration of the same pair is refused as ours already.
-            SendMode::AdditionalPair => client
-                .register_broadcast_attempt(
-                    action_id,
-                    RegisterBroadcastAttemptRequest {
-                        commit_txid: commit_txid.clone(),
-                        reveal_txid: reveal_txid.clone(),
-                    },
-                )
-                .await
-                .map(|_| ())
-                .map_err(|e| match e {
-                    OrchestratorError::Backend {
-                        status: 409,
-                        message,
-                    } => BroadcastError::Setup(claim_conflict_message(&message)),
-                    other => BroadcastError::Orchestrator(other),
-                }),
+            SendMode::AdditionalPair => {
+                register_with_retry(client, action_id, &commit_txid, &reveal_txid).await
+            }
         };
         if let Err(e) = registered {
             crate::infrastructure::pending_reveals_store::remove_and_persist(pending, action_id);
@@ -960,6 +952,7 @@ pub async fn broadcast_commit_then_reveal(
         reveal_change_spk,
         pending,
         envelope_cache,
+        SendMode::Claim,
     )
     .await?;
 
@@ -2420,6 +2413,9 @@ mod tests {
             Mutex<Vec<crate::application::orchestrator_client::RegisterBroadcastAttemptRequest>>,
         /// `register_broadcast_attempt` answers 409 with this body when set.
         refuse_registration: Option<&'static str>,
+        /// This many registrations are kept and then answered with a transport error, as when
+        /// the orchestrator committed but the response was lost.
+        lost_registrations: Mutex<u32>,
     }
 
     impl MockOrchestratorClientLargeAction {
@@ -2635,6 +2631,15 @@ mod tests {
                 });
             }
             self.registered.lock().unwrap().push(request.clone());
+            let lost = {
+                let mut remaining = self.lost_registrations.lock().unwrap();
+                let lost = *remaining > 0;
+                *remaining = remaining.saturating_sub(1);
+                lost
+            };
+            if lost {
+                return Err(OrchestratorError::Request("connection reset".to_string()));
+            }
             self.get_proposal(action_id).await
         }
         async fn create_cancel_proposal(
@@ -2873,6 +2878,7 @@ mod tests {
             ScriptBuf::new(),
             &pending,
             &crate::infrastructure::admin_wallet::EnvelopeKeyCache::default(),
+            SendMode::Claim,
         )
         .await;
 
@@ -2902,7 +2908,7 @@ mod tests {
         let mock_client = MockOrchestratorClientLargeAction::new();
         let pending = crate::application::pending_reveals::new();
 
-        let (commit_txid, reveal_txid) = submit_pair(
+        let (commit_txid, reveal_txid) = submit_commit_then_reveal(
             &mock_client,
             &ok_broadcasters(),
             "mock://asm-membership",
@@ -2931,6 +2937,52 @@ mod tests {
         assert!(pending.lock().unwrap().get("action-additional").is_some());
     }
 
+    /// #605: a registration the orchestrator kept but whose response was lost is retried with the
+    /// same pair, and the send goes on. Without the retry the row would track a pair nobody sent.
+    #[tokio::test]
+    async fn a_lost_registration_is_retried_with_the_same_pair() {
+        use bitcoin::{Network, ScriptBuf};
+        use strata_l1_txfmt::MagicBytes;
+
+        let spy = SpyCommitFunding::new("ignored");
+        let mock_client = MockOrchestratorClientLargeAction {
+            lost_registrations: Mutex::new(1),
+            ..MockOrchestratorClientLargeAction::default()
+        };
+        let pending = crate::application::pending_reveals::new();
+
+        let (commit_txid, reveal_txid) = submit_commit_then_reveal(
+            &mock_client,
+            &ok_broadcasters(),
+            "mock://asm-membership",
+            MagicBytes::new([0x62, 0x74, 0x00, 0x00]),
+            Network::Regtest,
+            "action-lost",
+            crate::domain::fee_rate::FeeRate::from_raw_clamped(1_000),
+            &spy,
+            ScriptBuf::new(),
+            &pending,
+            &crate::infrastructure::admin_wallet::EnvelopeKeyCache::default(),
+            SendMode::AdditionalPair,
+        )
+        .await
+        .expect("the retried registration lets the pair be sent");
+
+        let registered: Vec<(String, String)> = mock_client
+            .registered
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| (r.commit_txid.clone(), r.reveal_txid.clone()))
+            .collect();
+        assert_eq!(
+            registered,
+            vec![(commit_txid.clone(), reveal_txid.clone()); 2],
+            "the same pair, registered twice"
+        );
+        assert_eq!(mock_client.reported_statuses(), vec!["reveal_broadcasted"]);
+    }
+
     /// #605: a refused registration leaves the row to the signer whose pair it tracks — nothing is
     /// broadcast, nothing stored, and no `failed` overwrites their pair.
     #[tokio::test]
@@ -2947,7 +2999,7 @@ mod tests {
         };
         let pending = crate::application::pending_reveals::new();
 
-        let err = submit_pair(
+        let err = submit_commit_then_reveal(
             &mock_client,
             &ok_broadcasters(),
             "mock://asm-membership",
@@ -3020,6 +3072,7 @@ mod tests {
             ScriptBuf::new(),
             &pending,
             &cache,
+            SendMode::Claim,
         )
         .await
         .expect("broadcast ok");
@@ -3065,6 +3118,7 @@ mod tests {
             ScriptBuf::new(),
             pending,
             &crate::infrastructure::admin_wallet::EnvelopeKeyCache::default(),
+            SendMode::Claim,
         )
         .await
     }
@@ -3260,6 +3314,7 @@ mod tests {
             ScriptBuf::new(),
             &crate::application::pending_reveals::new(),
             &crate::infrastructure::admin_wallet::EnvelopeKeyCache::default(),
+            SendMode::Claim,
         )
         .await
     }
@@ -3354,6 +3409,7 @@ mod tests {
             ScriptBuf::new(),
             pending,
             &crate::infrastructure::admin_wallet::EnvelopeKeyCache::default(),
+            SendMode::Claim,
         )
         .await
     }

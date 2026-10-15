@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use crate::application::proposals::{additional_pair_refusal, AUTHORITY_IN_FLIGHT};
+use crate::application::proposals::{decide_additional_pair, AdditionalPair, AUTHORITY_IN_FLIGHT};
 use crate::application::traits::ProposalRepository;
 use crate::domain::authority::Authority;
 use crate::domain::proposal::{
@@ -458,16 +458,12 @@ impl ProposalRepository for PostgresProposalRepository {
         action_id: &ActionId,
         attempt: BroadcastAttempt,
     ) -> Result<(), AppError> {
-        // Lowercase, and skip a pair already kept under any casing: the primary key is
-        // case-sensitive, so ON CONFLICT alone would store the same reveal twice (#605).
+        // Txids arrive lowercase from the application and the backfill stores them lowercase, so
+        // the case-sensitive primary key alone keeps a pair once (#605).
         sqlx::query(
             r#"
             INSERT INTO broadcast_attempts(action_id, broadcaster_pubkey, commit_txid, reveal_txid, created_at)
-            SELECT $1, $2, LOWER($3), LOWER($4), $5
-            WHERE NOT EXISTS (
-                SELECT 1 FROM broadcast_attempts
-                WHERE action_id = $1 AND LOWER(reveal_txid) = LOWER($4)
-            )
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (action_id, reveal_txid) DO NOTHING
             "#,
         )
@@ -510,10 +506,17 @@ impl ProposalRepository for PostgresProposalRepository {
         let mut current = row_to_proposal_no_sigs(&row, action_id.0.clone())?;
         current.broadcast_attempts = load_broadcast_attempts(&mut *tx, &action_id.0).await?;
 
-        let broadcaster = attempt.broadcaster_pubkey.as_deref().unwrap_or_default();
-        if let Some(refusal) = additional_pair_refusal(&current, broadcaster, &attempt.reveal_txid)
-        {
-            return Err(AppError::Conflict(refusal.to_string()));
+        match decide_additional_pair(&current, &attempt) {
+            Err(refusal) => return Err(AppError::Conflict(refusal.to_string())),
+            // Dropping the transaction releases the lock; the row is left as it is.
+            Ok(AdditionalPair::AlreadyRegistered) => {
+                drop(tx);
+                return self
+                    .find_by_action_id(action_id)
+                    .await?
+                    .ok_or(AppError::NotFound);
+            }
+            Ok(AdditionalPair::Register) => {}
         }
 
         sqlx::query(

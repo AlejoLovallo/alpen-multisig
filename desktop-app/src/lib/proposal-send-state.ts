@@ -211,7 +211,7 @@ export function hasPairInFlight(proposal: Omit<AdditionalPairInput, 'broadcastAt
  * the same signed payload, so whichever reveal is mined first is the one the ASM acts on. Offered
  * only beside a pair that is on its way — an empty claim is a signer still at the device, and
  * `idle` / `failed` already offer Send — and only to a signer who has not sent one: whoever did
- * bumps its fee instead. The orchestrator applies the same rule (`additional_pair_refusal`).
+ * bumps its fee instead. The orchestrator applies the same rule (`decide_additional_pair`).
  */
 export function canSendAdditionalPair(proposal: AdditionalPairInput, signerPubkey: string | null): boolean {
 	if (signerPubkey === null || !hasPairInFlight(proposal)) return false
