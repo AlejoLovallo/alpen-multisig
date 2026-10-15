@@ -409,7 +409,9 @@ acts on; the others are refused on the sequence number and cost only their fees.
   unchanged, since this proposal is already the authority's in-flight one.
 - **Reports about a replaced pair change nothing.** A `PATCH` whose `reveal_txid` differs from the
   row's is ignored and returns the row as it is: the earlier sender's settle loop would otherwise
-  mark the new pair `failed` or move its status. The desktop already reports only to a row that
+  mark the new pair `failed` or move its status. The comparison is made in the write itself
+  (`update_reported_pair_status`, a conditional `UPDATE`), so a pair registered after the report
+  read the row is not overwritten either. The desktop already reports only to a row that
   carries its own reveal txid (`BundleRow::Ours`), and a `failed` report now names its pair.
 - **Reconcile picks the pair mined first.** `confirm_reveal_if_mined` looks up the row's reveal and
   every listed pair's; the lowest block height wins, the row's own pair on a tie (two reveals in one

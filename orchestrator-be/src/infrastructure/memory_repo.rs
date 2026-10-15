@@ -1,7 +1,8 @@
 //! In-memory proposal repository for POC and testing.
 
 use crate::application::proposals::{
-    additional_pair_refusal, broadcast_claim_allowed, BroadcastClaimFacts, AUTHORITY_IN_FLIGHT,
+    additional_pair_refusal, broadcast_claim_allowed, reports_tracked_pair, BroadcastClaimFacts,
+    AUTHORITY_IN_FLIGHT,
 };
 use crate::application::traits::ProposalRepository;
 use crate::domain::authority::Authority;
@@ -63,6 +64,28 @@ impl InMemoryProposalRepository {
             .ok()
             .and_then(|proposals| proposals.get(action_id)?.broadcast_claimed_at)
     }
+}
+
+fn apply_broadcast_status(
+    proposal: &mut Proposal,
+    status: BroadcastStatus,
+    proposal_status: Option<ProposalStatus>,
+    commit_txid: Option<&str>,
+    reveal_txid: Option<&str>,
+    error: Option<&str>,
+) {
+    proposal.broadcast_status = status;
+    proposal.updated_at = Utc::now();
+    if let Some(s) = proposal_status {
+        proposal.status = s;
+    }
+    if let Some(txid) = commit_txid {
+        proposal.commit_txid = Some(txid.to_string());
+    }
+    if let Some(txid) = reveal_txid {
+        proposal.reveal_txid = Some(txid.to_string());
+    }
+    proposal.broadcast_error = error.map(|s| s.to_string());
 }
 
 #[async_trait::async_trait]
@@ -232,18 +255,44 @@ impl ProposalRepository for InMemoryProposalRepository {
         let Some(proposal) = proposals.get_mut(action_id) else {
             return Ok(None);
         };
-        proposal.broadcast_status = status;
-        proposal.updated_at = Utc::now();
-        if let Some(s) = proposal_status {
-            proposal.status = s;
+        apply_broadcast_status(
+            proposal,
+            status,
+            proposal_status,
+            commit_txid,
+            reveal_txid,
+            error,
+        );
+        Ok(Some(proposal.clone()))
+    }
+
+    async fn update_reported_pair_status(
+        &self,
+        action_id: &ActionId,
+        status: BroadcastStatus,
+        proposal_status: Option<ProposalStatus>,
+        commit_txid: Option<&str>,
+        reveal_txid: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<Option<Proposal>, AppError> {
+        // Checked and written under one write lock, like the registration it must not overwrite.
+        let mut proposals = self
+            .proposals
+            .write()
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("repo lock poisoned")))?;
+        let Some(proposal) = proposals.get_mut(action_id) else {
+            return Ok(None);
+        };
+        if reports_tracked_pair(reveal_txid, proposal.reveal_txid.as_deref()) {
+            apply_broadcast_status(
+                proposal,
+                status,
+                proposal_status,
+                commit_txid,
+                reveal_txid,
+                error,
+            );
         }
-        if let Some(txid) = commit_txid {
-            proposal.commit_txid = Some(txid.to_string());
-        }
-        if let Some(txid) = reveal_txid {
-            proposal.reveal_txid = Some(txid.to_string());
-        }
-        proposal.broadcast_error = error.map(|s| s.to_string());
         Ok(Some(proposal.clone()))
     }
 

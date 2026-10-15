@@ -72,6 +72,20 @@ pub(crate) trait ProposalRepository: Send + Sync {
         error: Option<&str>,
     ) -> Result<Option<Proposal>, AppError>;
 
+    /// `update_broadcast_status` for a desktop's report about its own pair (#605): applied only
+    /// while the row still tracks that pair — its reveal is the reported one, or either is unset.
+    /// Decided in the write itself, so a pair registered after the report read the row is never
+    /// overwritten; otherwise the row comes back as it is.
+    async fn update_reported_pair_status(
+        &self,
+        action_id: &ActionId,
+        status: BroadcastStatus,
+        proposal_status: Option<ProposalStatus>,
+        commit_txid: Option<&str>,
+        reveal_txid: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<Option<Proposal>, AppError>;
+
     /// Find the cancel proposal that targets the given action_id, if one exists.
     async fn find_cancel_for_target(&self, target: &ActionId)
         -> Result<Option<Proposal>, AppError>;

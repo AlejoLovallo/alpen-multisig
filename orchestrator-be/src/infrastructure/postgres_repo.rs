@@ -21,6 +21,20 @@ impl PostgresProposalRepository {
     }
 }
 
+/// Broadcast sub-status write shared by `update_broadcast_status` and
+/// `update_reported_pair_status`. Binds: status, proposal status, commit, reveal, error, action id.
+const UPDATE_BROADCAST_STATUS: &str = r#"
+    UPDATE proposals
+    SET
+        broadcast_status  = $1,
+        status            = COALESCE($2, status),
+        commit_txid       = COALESCE($3, commit_txid),
+        reveal_txid       = COALESCE($4, reveal_txid),
+        broadcast_error   = $5,
+        updated_at        = NOW()
+    WHERE action_id = $6
+"#;
+
 fn authority_to_db(authority: Authority) -> &'static str {
     match authority {
         Authority::AlpenAdmin => "alpen_admin",
@@ -554,19 +568,39 @@ impl ProposalRepository for PostgresProposalRepository {
     ) -> Result<Option<Proposal>, AppError> {
         let proposal_status_db = proposal_status.map(status_to_db);
 
-        sqlx::query(
-            r#"
-            UPDATE proposals
-            SET
-                broadcast_status  = $1,
-                status            = COALESCE($2, status),
-                commit_txid       = COALESCE($3, commit_txid),
-                reveal_txid       = COALESCE($4, reveal_txid),
-                broadcast_error   = $5,
-                updated_at        = NOW()
-            WHERE action_id = $6
-            "#,
-        )
+        sqlx::query(UPDATE_BROADCAST_STATUS)
+            .bind(status.to_string())
+            .bind(proposal_status_db)
+            .bind(commit_txid)
+            .bind(reveal_txid)
+            .bind(error)
+            .bind(&action_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                AppError::Internal(anyhow::anyhow!("failed to update broadcast status: {e}"))
+            })?;
+
+        self.find_by_action_id(action_id).await
+    }
+
+    async fn update_reported_pair_status(
+        &self,
+        action_id: &ActionId,
+        status: BroadcastStatus,
+        proposal_status: Option<ProposalStatus>,
+        commit_txid: Option<&str>,
+        reveal_txid: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<Option<Proposal>, AppError> {
+        let proposal_status_db = proposal_status.map(status_to_db);
+
+        // Postgres re-checks the reveal condition on the locked row: a registration that commits
+        // first leaves this UPDATE matching nothing.
+        sqlx::query(&format!(
+            "{UPDATE_BROADCAST_STATUS} \
+             AND ($4::text IS NULL OR reveal_txid IS NULL OR LOWER(reveal_txid) = LOWER($4))"
+        ))
         .bind(status.to_string())
         .bind(proposal_status_db)
         .bind(commit_txid)

@@ -477,6 +477,19 @@ pub(crate) const NO_PAIR_IN_FLIGHT: &str =
 /// Conflict text when the caller already registered a pair for this proposal (#605).
 pub(crate) const OWN_PAIR_EXISTS: &str = "you already sent a commit and reveal for this proposal";
 
+/// Whether a desktop's report is about the pair the row tracks (#605): its reveal is the tracked
+/// one, or either is unset. A report about a pair another signer's pair replaced changes nothing.
+/// Shared by both repositories, which evaluate it in the write itself.
+pub(crate) fn reports_tracked_pair(
+    reported_reveal: Option<&str>,
+    tracked_reveal: Option<&str>,
+) -> bool {
+    match (reported_reveal, tracked_reveal) {
+        (Some(reported), Some(tracked)) => reported.eq_ignore_ascii_case(tracked),
+        _ => true,
+    }
+}
+
 /// Why another commit + reveal pair may not be registered for `proposal`, or `None` (#605).
 ///
 /// Only beside a pair that is on its way: the row is approved and `commit_broadcasted` with a
@@ -1152,18 +1165,10 @@ pub(crate) async fn report_broadcast_progress(
     // A report about a pair the row no longer tracks comes from a bundle another signer's pair
     // replaced (#605): its `failed` or `reveal_broadcasted` would overwrite the pair now in
     // flight. It changes nothing; if that reveal is mined, the reconcile finds it among the pairs.
-    if let (Some(reported), Some(tracked)) =
-        (body.reveal_txid.as_deref(), raw.reveal_txid.as_deref())
-    {
-        if !reported.eq_ignore_ascii_case(tracked) {
-            tracing::info!(
-                action_id = %action_id.0,
-                reported,
-                tracked,
-                "broadcast report for a pair the row no longer tracks; ignored"
-            );
-            return Ok(raw);
-        }
+    // Checked here to skip the work, and again in the write for a pair registered in between.
+    if !reports_tracked_pair(body.reveal_txid.as_deref(), raw.reveal_txid.as_deref()) {
+        log_report_for_replaced_pair(action_id, body.reveal_txid.as_deref(), &raw);
+        return Ok(raw);
     }
 
     let broadcast_status: BroadcastStatus = body.broadcast_status.parse()?;
@@ -1229,7 +1234,7 @@ pub(crate) async fn report_broadcast_progress(
     }
 
     let updated = repo
-        .update_broadcast_status(
+        .update_reported_pair_status(
             action_id,
             broadcast_status,
             proposal_status,
@@ -1239,12 +1244,25 @@ pub(crate) async fn report_broadcast_progress(
         )
         .await?
         .ok_or(AppError::NotFound)?;
+    if !reports_tracked_pair(body.reveal_txid.as_deref(), updated.reveal_txid.as_deref()) {
+        log_report_for_replaced_pair(action_id, body.reveal_txid.as_deref(), &updated);
+        return Ok(updated);
+    }
 
     if updated.broadcast_status == BroadcastStatus::RevealConfirmed && !updated.is_cancel() {
         record_reveal_confirmed_facts(repo, &updated, btc_client, asm_rpc_url).await;
     }
 
     Ok(updated)
+}
+
+fn log_report_for_replaced_pair(action_id: &ActionId, reported: Option<&str>, row: &Proposal) {
+    tracing::info!(
+        action_id = %action_id.0,
+        reported,
+        tracked = row.reveal_txid.as_deref(),
+        "broadcast report for a pair the row no longer tracks; ignored"
+    );
 }
 
 /// The two facts a confirmed reveal makes available: when the update activates, and the id the ASM
@@ -3929,6 +3947,34 @@ mod tests {
         .unwrap();
 
         assert_eq!(after.broadcast_status, BroadcastStatus::CommitBroadcasted);
+        assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_B));
+        assert!(after.broadcast_error.is_none());
+    }
+
+    /// The race the read-time guard cannot close: the report read the row while it still tracked
+    /// the first pair, and the registration commits before the report writes. The write itself
+    /// must leave the new pair alone.
+    #[tokio::test]
+    async fn a_report_written_after_a_registration_it_did_not_see_changes_nothing() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+
+        let after = repo
+            .update_reported_pair_status(
+                &action_id,
+                BroadcastStatus::Failed,
+                None,
+                Some(COMMIT_A),
+                Some(&REVEAL_A.to_uppercase()),
+                Some(DROPPED_FOR_TEST),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(after.broadcast_status, BroadcastStatus::CommitBroadcasted);
+        assert_eq!(after.commit_txid.as_deref(), Some(COMMIT_B));
         assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_B));
         assert!(after.broadcast_error.is_none());
     }
