@@ -397,7 +397,7 @@ acts on; the others are refused on the sequence number and cost only their fees.
 
 - **Pairs.** Every pair is kept in `broadcast_attempts` (`broadcaster_pubkey`, `commit_txid`,
   `reveal_txid`, `created_at`; key `(action_id, reveal_txid)`). A progress report carrying both
-  txids records the pair with the reporting signer (idempotent), so the claimer's pre-registration
+  txids of the pair the row tracks (or of an untagged claim) records the pair with the reporting signer (idempotent), so the claimer's pre-registration
   is the first pair. Pairs registered before #605 are backfilled with no broadcaster.
 - **When.** Only beside a pair on its way: `approved` and `commit_broadcasted` with a txid,
   `commit_confirmed` or `reveal_broadcasted` (`decide_additional_pair`). An empty claim is a
@@ -412,8 +412,10 @@ acts on; the others are refused on the sequence number and cost only their fees.
   unchanged, since this proposal is already the authority's in-flight one.
 - **Reports about a replaced pair do not move the row.** A `PATCH` whose `reveal_txid` differs from the
   row's leaves the status, txids and error as they are: the earlier sender's settle loop would otherwise
-  mark the new pair `failed` or move its status. The pair is still recorded, so the reconcile can select
-  it if that reveal is mined first. A `PATCH` that names no reveal does not change a row that already
+  mark the new pair `failed` or move its status. Its pair is not recorded either: every pair of the
+  proposal was already recorded while the row tracked it, or registered, and the import screen reports
+  any bundle against the open proposal, so an unknown pair may belong to another action and must not be
+  able to confirm this one. A `PATCH` that names no reveal does not change a row that already
   tracks one (an untagged claim still accepts it — that is the pre-registration). The comparison is made
   in the write itself (`update_reported_pair_status`, a conditional `UPDATE`), so a pair registered after
   the report read the row is not overwritten either. Txids are stored lowercase. The desktop already
@@ -425,6 +427,11 @@ acts on; the others are refused on the sequence number and cost only their fees.
   block" is the only miss that is skipped. The winner's txids are written explicitly, and only while the
   row still tracks the reveal observed on that read (`confirm_tracked_reveal`); a pair registered in between
   waits for the next read. The activation height and the queue id come from the winner.
+- **Only the reconcile confirms.** A `reveal_confirmed` `PATCH` on a row not yet confirmed records its
+  pair as `reveal_broadcasted` and then runs the same reconcile, so an earlier pair in a lower block
+  still wins. A node that does not see the reveal yet leaves the row at `reveal_broadcasted` until the
+  next read. Since every confirmation is decided by the lowest mined height, a confirmed row is never
+  re-opened.
 - **Desktop.** The detail screen offers *Send your own commit + reveal* under the in-flight stage
   (`canSendAdditionalPair`) and lists every pair once there is more than one (*Current*, *Sent*,
   *Mined*, *Not used*). The send screen opens with `?pair=additional`; while a pair is in flight it

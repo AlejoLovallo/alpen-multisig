@@ -1223,26 +1223,29 @@ pub(crate) async fn report_broadcast_progress(
         .as_deref()
         .map(|txid| txid.to_ascii_lowercase());
 
-    // A report about a pair the row no longer tracks must not move that row (#605): its `failed`
-    // or `reveal_broadcasted` would overwrite the pair now in flight. The pair itself is kept, so
-    // the reconcile can still select it if it is mined first. A report that names no reveal does
-    // not qualify either, once the row is tagged. Checked here to skip the work, and again in the
-    // write for a pair registered in between.
+    // A report about a pair the row does not track changes nothing (#605): its `failed` or
+    // `reveal_broadcasted` would overwrite the pair now in flight, and its txids are not recorded
+    // either — the import screen reports any bundle against the open proposal, so they may belong
+    // to another action. Every pair of this proposal is already listed: it was reported while the
+    // row tracked it, or registered. A report that names no reveal does not qualify either, once
+    // the row is tagged. Checked here to skip the work, and again in the write for a pair
+    // registered in between.
     if !reports_tracked_pair(reveal_txid.as_deref(), raw.reveal_txid.as_deref()) {
-        keep_reported_pair(
-            repo,
-            session,
-            action_id,
-            commit_txid.as_deref(),
-            reveal_txid.as_deref(),
-        )
-        .await?;
-        let current = repo.find_by_action_id(action_id).await?.unwrap_or(raw);
-        log_report_for_replaced_pair(action_id, reveal_txid.as_deref(), &current);
-        return Ok(current);
+        log_report_for_replaced_pair(action_id, reveal_txid.as_deref(), &raw);
+        return Ok(raw);
     }
 
     let broadcast_status: BroadcastStatus = body.broadcast_status.parse()?;
+    // Which reveal confirmed is the node's call, not the report's (#605): an earlier pair may be
+    // mined in a lower block. The report records its pair as sent, and the reconcile promotes the
+    // pair mined first. A node that does not see it yet leaves the row for the next read.
+    let confirming = broadcast_status == BroadcastStatus::RevealConfirmed
+        && raw.broadcast_status != BroadcastStatus::RevealConfirmed;
+    let broadcast_status = if confirming {
+        BroadcastStatus::RevealBroadcasted
+    } else {
+        broadcast_status
+    };
     let proposal_status = match body.proposal_status.as_deref() {
         None => None,
         Some("pending") => Some(ProposalStatus::Pending),
@@ -1312,6 +1315,9 @@ pub(crate) async fn report_broadcast_progress(
     if !reports_tracked_pair(reveal_txid.as_deref(), updated.reveal_txid.as_deref()) {
         log_report_for_replaced_pair(action_id, reveal_txid.as_deref(), &updated);
         return Ok(updated);
+    }
+    if confirming {
+        return Ok(confirm_reveal_if_mined(repo, updated, btc_client, asm_rpc_url).await);
     }
 
     if updated.broadcast_status == BroadcastStatus::RevealConfirmed && !updated.is_cancel() {
@@ -4184,10 +4190,11 @@ mod tests {
         assert!(stored.activation_height.is_none());
     }
 
-    /// Importing a bundle whose txids differ from the row's used to be dropped entirely. The
-    /// status stays, and the pair is kept so the reconcile can select it if it mines first.
+    /// The import screen reports any bundle against the open proposal, so an untracked pair may
+    /// belong to another action. Recording it would let the reconcile confirm this proposal on a
+    /// reveal mined for that other action.
     #[tokio::test]
-    async fn a_report_about_an_untracked_pair_is_kept_without_moving_the_row() {
+    async fn a_report_about_an_untracked_pair_changes_nothing() {
         let repo = new_repo();
         let action_id = save_with_pair_of_a(&repo).await;
         register_pair_of_b(&repo, &action_id).await.unwrap();
@@ -4198,23 +4205,78 @@ mod tests {
             session_of(&sig_a()),
             &action_id,
             &mock_btc(),
-            report(
-                "reveal_broadcasted",
-                Some(&COMMIT_C.to_uppercase()),
-                Some(&REVEAL_C.to_uppercase()),
-            ),
+            report("reveal_confirmed", Some(COMMIT_C), Some(REVEAL_C)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after.broadcast_status, BroadcastStatus::CommitBroadcasted);
+        assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_B));
+        assert_eq!(
+            after.broadcast_attempts.len(),
+            2,
+            "the pair is not recorded"
+        );
+
+        let btc = MinedTxids([(REVEAL_C, 800_005)].into_iter().collect());
+        let reconciled = confirm_reveal_if_mined(&repo, after, &btc, "mock://asm-membership").await;
+        assert_eq!(
+            reconciled.broadcast_status,
+            BroadcastStatus::CommitBroadcasted
+        );
+    }
+
+    /// The desktop reports `reveal_confirmed` for the pair the row tracks, but an earlier pair
+    /// was mined in a lower block: that one is what the ASM acted on (#605).
+    #[tokio::test]
+    async fn a_confirmed_report_yields_to_a_pair_mined_earlier() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+        let btc = MinedTxids(
+            [(REVEAL_A, 800_010), (REVEAL_B, 800_011)]
+                .into_iter()
+                .collect(),
+        );
+
+        let confirmed = report_broadcast_progress(
+            &repo,
+            "mock://asm-membership",
+            session_of(&sig_b()),
+            &action_id,
+            &btc,
+            report("reveal_confirmed", Some(COMMIT_B), Some(REVEAL_B)),
         )
         .await
         .unwrap();
 
-        assert_eq!(after.broadcast_status, BroadcastStatus::CommitBroadcasted);
-        assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_B));
-        let reveals: Vec<&str> = after
-            .broadcast_attempts
-            .iter()
-            .map(|attempt| attempt.reveal_txid.as_str())
-            .collect();
-        assert_eq!(reveals, [REVEAL_A, REVEAL_B, REVEAL_C]);
+        assert_eq!(confirmed.broadcast_status, BroadcastStatus::RevealConfirmed);
+        assert_eq!(confirmed.commit_txid.as_deref(), Some(COMMIT_A));
+        assert_eq!(confirmed.reveal_txid.as_deref(), Some(REVEAL_A));
+        let stored = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        // the earlier reveal's block + the uniform mock lock period 2016
+        assert_eq!(stored.activation_height, Some(802_026));
+    }
+
+    /// A `reveal_confirmed` the node cannot see yet records the pair as sent; the next read
+    /// confirms it.
+    #[tokio::test]
+    async fn a_confirmed_report_the_node_does_not_see_waits_for_the_reconcile() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+
+        let after = report_broadcast_progress(
+            &repo,
+            "mock://asm-membership",
+            session_of(&sig_a()),
+            &action_id,
+            &MinedTxids(std::collections::HashMap::new()),
+            report("reveal_confirmed", Some(COMMIT_A), Some(REVEAL_A)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(after.broadcast_status, BroadcastStatus::RevealBroadcasted);
+        assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_A));
     }
 
     /// A report that does not name a reveal must not fail, or enact, the pair the row tracks.
