@@ -16,6 +16,7 @@
 | `STRATA_ADMIN_STATE_RPC_URL` | Yes | ASM runner JSON-RPC |
 | `AUTH_SESSION_TTL_MS` | No | Bearer session lifetime from sign-in; default `86400000` (24 h, #582) |
 | `BITCOIN_RPC_*` | Yes | `/ready`, activation heights, and deciding which commit + reveal pair was mined. The node **must run with `-txindex=1`**: the orchestrator confirms a reveal only after reading it from the node and verifying it against the role's signer configuration, so without the index no proposal is confirmed (#605). The orchestrator logs an error at startup when the index is missing, and a warning while it is still syncing. |
+| `BITCOIN_MAGIC_BYTES_HEX` | No | The network's SPS-50 magic bytes (4 bytes hex, default `414c504e`, "ALPN"): the same value as the ASM's params and the desktop's. The orchestrator confirms only a reveal whose first output carries the administration tag under these bytes (#605); a wrong value confirms nothing. |
 
 Broadcast configuration lives in **`desktop-app/.env`** only (see `desktop-app/.env.example`; loaded at Tauri startup via a fixed path, not CWD). As of R1.1, **no env flag gates broadcast** — signing capability is decided per-signer by network (`allowed_on`: mnemonic on regtest/testnet only, hardware on any network). The mnemonic-signing IPC remains dev/E2E-only, exposed in release builds via `ALLOW_DEV_MNEMONIC_SIGNING` and automatically in debug builds (P-040 — see `docs/specs/secret-custody-wave2.md`).
 

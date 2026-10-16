@@ -29,6 +29,13 @@ pub(crate) trait BitcoinRpcClient: Send + Sync {
         })
     }
 
+    /// The SPS-50 magic bytes of the network this node serves: the ASM processes an admin
+    /// transaction only when its first output carries the tag under these bytes (#605). A test
+    /// double answers the default.
+    fn magic_bytes(&self) -> [u8; 4] {
+        DEFAULT_MAGIC_BYTES
+    }
+
     /// Return the current chain tip height (`getblockcount`).
     async fn get_chain_tip(&self) -> Result<u64, AppError>;
 
@@ -64,7 +71,11 @@ pub(crate) struct HttpBitcoinRpcClient {
     user: String,
     pass: String,
     client: reqwest::Client,
+    magic_bytes: [u8; 4],
 }
+
+/// The magic bytes when none are configured: the same default as the desktop (`ALPN`).
+pub(crate) const DEFAULT_MAGIC_BYTES: [u8; 4] = *b"ALPN";
 
 impl HttpBitcoinRpcClient {
     pub(crate) fn new(base_url: &str, user: &str, pass: &str) -> Self {
@@ -73,7 +84,14 @@ impl HttpBitcoinRpcClient {
             user: user.to_string(),
             pass: pass.to_string(),
             client: http_client::shared(),
+            magic_bytes: DEFAULT_MAGIC_BYTES,
         }
+    }
+
+    /// The network's SPS-50 magic bytes, as configured for the ASM and the desktop.
+    pub(crate) fn with_magic_bytes(mut self, magic_bytes: [u8; 4]) -> Self {
+        self.magic_bytes = magic_bytes;
+        self
     }
 
     /// Whether the node keeps a transaction index (#605). Without one, `getrawtransaction` cannot
@@ -247,6 +265,10 @@ impl BitcoinRpcClient for HttpBitcoinRpcClient {
             .ok_or_else(|| {
                 AppError::BadRequest(format!("getblock: tx {txid} is not in block {blockhash}"))
             })
+    }
+
+    fn magic_bytes(&self) -> [u8; 4] {
+        self.magic_bytes
     }
 
     async fn get_chain_tip(&self) -> Result<u64, AppError> {

@@ -448,9 +448,14 @@ acts on; the others are refused on the sequence number and cost only their fees.
   `parse_envelope_payload`, SSZ `SignedPayload`) — to this proposal's sequence number and action,
   and its signatures must pass the ASM's own `verify_threshold_signatures` against the role's live
   signer configuration from the ASM (`threshold_config_for_authority`: keys in index order and
-  threshold). An approval at an index that is not that approver's, too few signatures, or a key
+  threshold), or against the configuration kept when the proposal's latest pair was sent (claim or
+  registration, `broadcast_role_config`) — a rotation of this very role changes the live one in its
+  reveal's own block. An approval at an index that is not that approver's, too few signatures, or a key
   outside the role is what the ASM rejects, and so does the reconcile (`reveal_carries_proposal`). A
-  role configuration the ASM cannot return leaves the row for the next read. A mined transaction that
+  role configuration the ASM cannot return leaves the row for the next read. Its first output must also
+  carry the SPS-50 tag of the administration subprotocol under the network's magic bytes
+  (`BITCOIN_MAGIC_BYTES_HEX`, the same value as the ASM's and the desktop's): the ASM never routes a
+  transaction without it to the subprotocol. A mined transaction that
   does not pass is ignored, however low its block,
   and the row stays in flight. A pair first reported after it was mined (the manual fallback,
   imported later) still counts: what it carries decides, not when it was registered.
@@ -469,6 +474,11 @@ acts on; the others are refused on the sequence number and cost only their fees.
   reveal looks the same, so the answer is not taken. The winner's txids are written explicitly, and only while the
   row still tracks the reveal observed on that read (`confirm_tracked_reveal`); a pair registered in between
   waits for the next read. The activation height and the queue id come from the winner.
+- **The ASM must have taken the sequence number.** A winner is confirmed only once the ASM's
+  `last_seqno` for the role has reached the proposal's (`seqno_consumed_by_asm`). The ASM moves it only
+  when it accepts an action, after the same checks plus the sequence-number window (`max_seqno_gap`):
+  a reveal it rejected — a sequence number too far ahead, say — or a block it has not processed yet is
+  not a confirmation, and the row stays in flight, where any signer can send again.
 - **Only the reconcile confirms.** A `reveal_confirmed` `PATCH` on a row not yet confirmed — a lone
   pair's too — records its pair as `reveal_broadcasted` and then runs the same reconcile: an earlier
   pair in a lower block still wins, and a reveal the ASM would reject is never confirmed on its
@@ -525,9 +535,12 @@ acts on; the others are refused on the sequence number and cost only their fees.
   changing.
 - **Accepted limits.** A pair backfilled with no broadcaster does not lock its sender out. A retry
   after `failed` leaves the earlier attempt listed; the node decides among them like any other pairs.
-  The winner is verified against the role's configuration as it stands when the reconcile reads it: a
-  rotation of the same role between the reveal being mined and that read can leave a valid reveal
-  unverified, and the proposal is then not confirmed by the orchestrator. The pre-check and the
+  The kept configuration is the one of the latest send: if the role rotates through another proposal
+  between that send and the winner being mined, and the live configuration has moved on again before
+  the reconcile, a valid winner can fail both checks; the row then stays in flight until its sequence
+  number is consumed, and the sweep retires it as `superseded`. A pair whose reveal was mined after
+  another action of the same role took the sequence number passes both checks and is confirmed; the
+  enactment check then finds nothing and the sweep retires it the same way. The pre-check and the
   registration are two calls: the row can move between them, and the registration then refuses after
   the device signed. The per-signer limit counts every pair listed, including a pre-registered pair
   whose broadcast the node refused: a signer whose sends failed three times cannot send this proposal

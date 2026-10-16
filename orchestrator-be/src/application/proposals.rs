@@ -10,8 +10,8 @@ use crate::domain::proposal::{
 };
 use crate::error::AppError;
 use crate::infrastructure::asm_role_membership::{
-    last_seqno_for_authority, lock_period_for_action, threshold_config_for_authority,
-    threshold_for_authority, update_id_in_queue_for_action,
+    last_seqno_for_authority, lock_period_for_action, seqno_consumed_by_asm,
+    threshold_config_for_authority, threshold_for_authority, update_id_in_queue_for_action,
 };
 use crate::infrastructure::bitcoin_rpc::BitcoinRpcClient;
 use chrono::{DateTime, Utc};
@@ -467,7 +467,34 @@ pub(crate) async fn claim_broadcast_coordination(
     ensure_threshold_snapshot_current(&proposal, asm_rpc_url).await?;
     ensure_seq_no_still_open(&proposal, asm_rpc_url).await?;
 
-    repo.claim_broadcast(action_id).await
+    let claimed = repo.claim_broadcast(action_id).await?;
+    snapshot_role_config(repo, asm_rpc_url, &claimed).await;
+    Ok(claimed)
+}
+
+/// Keep the role's signer configuration as it stands now that a pair is about to be sent (#605).
+/// A rotation of this same role changes the live configuration in its reveal's own block, so the
+/// reconcile verifies a mined reveal against this one too. Best-effort: without it the reconcile
+/// still verifies against the live configuration.
+async fn snapshot_role_config(
+    repo: &dyn ProposalRepository,
+    asm_rpc_url: &str,
+    proposal: &Proposal,
+) {
+    use ssz::Encode;
+    let recorded = match threshold_config_for_authority(asm_rpc_url, proposal.authority).await {
+        Ok(config) => {
+            repo.record_broadcast_role_config(&proposal.action_id, &config.as_ssz_bytes())
+                .await
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(e) = recorded {
+        tracing::warn!(
+            action_id = %proposal.action_id.0,
+            "could not keep the role's signer configuration for this send: {e}"
+        );
+    }
 }
 
 /// Conflict text when there is no pair in flight to send another one beside (#605).
@@ -717,17 +744,20 @@ pub(crate) async fn register_additional_pair(
 
     let signer = normalize_signer_pubkey_hex(session.signer_pubkey);
     let abandoned = abandoned_pairs_of(&proposal, &signer, btc_client).await;
-    repo.register_additional_pair(
-        action_id,
-        BroadcastAttempt {
-            broadcaster_pubkey: Some(signer),
-            commit_txid: commit_txid.to_ascii_lowercase(),
-            reveal_txid: reveal_txid.to_ascii_lowercase(),
-            created_at: Utc::now(),
-        },
-        &abandoned,
-    )
-    .await
+    let registered = repo
+        .register_additional_pair(
+            action_id,
+            BroadcastAttempt {
+                broadcaster_pubkey: Some(signer),
+                commit_txid: commit_txid.to_ascii_lowercase(),
+                reveal_txid: reveal_txid.to_ascii_lowercase(),
+                created_at: Utc::now(),
+            },
+            &abandoned,
+        )
+        .await?;
+    snapshot_role_config(repo, asm_rpc_url, &registered).await;
+    Ok(registered)
 }
 
 /// Whether this signer may send their own commit + reveal pair now (#605): the checks
@@ -830,7 +860,9 @@ fn node_has_no_txindex(message: &str) -> bool {
 /// and its envelope carries this proposal's sequence number and action, with signatures the ASM
 /// accepts: verified against the role's signer configuration (`role`, keys in index order and
 /// threshold) by the ASM's own `verify_threshold_signatures`. Read the way the ASM reads it
-/// (`strata_asm_txs_admin::parser::parse_tx`).
+/// (`strata_asm_txs_admin::parser::parse_tx`), and only when its first output carries the SPS-50
+/// tag that routes it to the administration subprotocol under the network's `magic` bytes — a
+/// transaction without it the ASM never sees.
 /// Registration takes any txid, so this is what keeps an unrelated mined transaction — or one
 /// carrying this action without the signatures the ASM needs — from becoming the pair the
 /// reconcile confirms.
@@ -839,8 +871,16 @@ fn reveal_carries_proposal(
     commit_txid: &str,
     proposal: &Proposal,
     role: &strata_crypto::threshold_signature::ThresholdConfig,
+    magic: [u8; 4],
 ) -> bool {
     use ssz::{Decode, Encode};
+    let tag = strata_l1_txfmt::ParseConfig::new(strata_l1_txfmt::MagicBytes::new(magic))
+        .try_parse_tx(reveal);
+    if !tag.is_ok_and(|tag| {
+        tag.subproto_id() == strata_asm_txs_admin::constants::ADMINISTRATION_SUBPROTOCOL_ID
+    }) {
+        return false;
+    }
     let Some(input) = reveal.input.first() else {
         return false;
     };
@@ -967,6 +1007,7 @@ async fn first_mined_pair(
     proposal: &Proposal,
     btc_client: &dyn BitcoinRpcClient,
     asm_rpc_url: &str,
+    sent_with: Option<&strata_crypto::threshold_signature::ThresholdConfig>,
 ) -> MinedPair {
     let tracked = proposal.reveal_txid.as_deref();
     // A malformed txid (stored before reports were validated) can never be mined, and its failing
@@ -1024,7 +1065,18 @@ async fn first_mined_pair(
                     }
                 }
                 if let (Some(tx), Some(role)) = (tx.as_ref(), role.as_ref()) {
-                    if reveal_carries_proposal(tx, &commit, proposal, role) {
+                    // The live configuration, or the one the pairs were sent under: a rotation of
+                    // this role has already changed the live one if the winner was that rotation.
+                    let carries = |config| {
+                        reveal_carries_proposal(
+                            tx,
+                            &commit,
+                            proposal,
+                            config,
+                            btc_client.magic_bytes(),
+                        )
+                    };
+                    if carries(role) || sent_with.is_some_and(carries) {
                         mined.push((height, commit, reveal));
                         continue;
                     }
@@ -1111,8 +1163,18 @@ async fn confirm_reveal_if_mined(
     // leaves in place. The write applies only while the row still tracks the reveal this read
     // observed: a pair registered in between is left for the next reconcile, which sees both
     // (#605).
+    let sent_with = match repo.broadcast_role_config(&proposal.action_id).await {
+        Ok(config) => config.and_then(|config| {
+            use ssz::Decode;
+            strata_crypto::threshold_signature::ThresholdConfig::from_ssz_bytes(&config).ok()
+        }),
+        Err(e) => {
+            tracing::warn!(action_id = %proposal.action_id.0, "reconcile: kept role configuration unreadable: {e}");
+            return proposal;
+        }
+    };
     let (commit_txid, reveal_txid) =
-        match first_mined_pair(&proposal, btc_client, asm_rpc_url).await {
+        match first_mined_pair(&proposal, btc_client, asm_rpc_url, sent_with.as_ref()).await {
             MinedPair::First(commit_txid, reveal_txid) => (commit_txid, reveal_txid),
             MinedPair::NotIndexed => {
                 tracing::warn!(
@@ -1124,6 +1186,24 @@ async fn confirm_reveal_if_mined(
             }
             MinedPair::None | MinedPair::Unknown => return proposal,
         };
+    // The ASM must have accepted an action of this role at this sequence number: a reveal it
+    // rejected — beyond the allowed sequence gap, say — or a block it has not processed yet is not a
+    // confirmation (#605).
+    match seqno_consumed_by_asm(asm_rpc_url, proposal.authority, proposal.seq_no).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(
+                action_id = %proposal.action_id.0,
+                reveal = %reveal_txid,
+                "reveal mined but the ASM has not taken this sequence number; not confirmed yet"
+            );
+            return proposal;
+        }
+        Err(e) => {
+            tracing::warn!(action_id = %proposal.action_id.0, "reconcile: ASM sequence number unavailable: {e}");
+            return proposal;
+        }
+    }
     let updated = repo
         .confirm_tracked_reveal(
             &proposal.action_id,
@@ -3455,7 +3535,6 @@ mod tests {
     #[tokio::test]
     async fn reconcile_notices_a_reveal_that_confirmed_unwatched() {
         let repo = new_repo();
-        // Seqno 6 is above the fixture's 5, so nothing supersedes it and the promotion stands alone.
         let action_id = save_approved(&repo, 6).await;
         repo.update_broadcast_status(
             &action_id,
@@ -3468,6 +3547,8 @@ mod tests {
         .await
         .unwrap();
 
+        // The ASM stands at 5: it has not taken seqno 6, whatever the node says about the reveal —
+        // it rejected it (beyond the allowed gap, say) or has not reached its block (#605).
         reconcile_enacted_for_authority(
             &repo,
             crate::infrastructure::asm_enactment::MOCK_SEQNO_AHEAD_URL,
@@ -3476,7 +3557,21 @@ mod tests {
         )
         .await
         .unwrap();
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        assert_eq!(
+            proposal.broadcast_status,
+            BroadcastStatus::RevealBroadcasted
+        );
 
+        // The ASM took it: the mined reveal is confirmed.
+        reconcile_enacted_for_authority(
+            &repo,
+            "mock://asm-membership",
+            &mock_btc(),
+            Authority::StrataAdmin,
+        )
+        .await
+        .unwrap();
         let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
         assert_eq!(proposal.broadcast_status, BroadcastStatus::RevealConfirmed);
         assert_eq!(proposal.status, ProposalStatus::Approved);
@@ -5088,7 +5183,7 @@ mod tests {
             unreadable: "reveal",
         };
 
-        let winner = first_mined_pair(&proposal, &btc, "mock://asm-membership").await;
+        let winner = first_mined_pair(&proposal, &btc, "mock://asm-membership", None).await;
 
         assert_eq!(
             winner,
@@ -5186,11 +5281,13 @@ mod tests {
         strata_asm_txs_admin::parser::SignedPayload::new(seq_no, action, signatures).as_ssz_bytes()
     }
 
-    /// The taproot envelope a commit pays to, built the way the desktop builds it.
+    /// The taproot envelope a commit pays to, built the way the desktop builds it, and the SPS-50
+    /// tag its reveal carries in its first output (`ALPN`, the default magic bytes).
     struct Envelope {
         keypair: bitcoin::key::Keypair,
         script: bitcoin::ScriptBuf,
         spend_info: bitcoin::taproot::TaprootSpendInfo,
+        tag: Option<bitcoin::ScriptBuf>,
     }
 
     impl Envelope {
@@ -5211,11 +5308,27 @@ mod tests {
                 .unwrap()
                 .finalize(&secp, internal_key)
                 .unwrap();
+            use ssz::Decode;
+            let action = strata_asm_txs_admin::parser::SignedPayload::from_ssz_bytes(payload)
+                .map(|signed| signed.action)
+                .ok();
+            let tag = action.map(|action| {
+                strata_l1_txfmt::ParseConfig::new(strata_l1_txfmt::MagicBytes::new(*b"ALPN"))
+                    .encode_script_buf(&action.tag().as_ref())
+                    .unwrap()
+            });
             Self {
                 keypair,
                 script,
                 spend_info,
+                tag,
             }
+        }
+
+        /// The same envelope, its reveal carrying no SPS-50 tag: the ASM never sees it.
+        fn untagged(mut self) -> Self {
+            self.tag = None;
+            self
         }
 
         fn script_pubkey(&self) -> bitcoin::ScriptBuf {
@@ -5244,10 +5357,18 @@ mod tests {
                     sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
                     witness: bitcoin::Witness::new(),
                 }],
-                output: vec![bitcoin::TxOut {
-                    value: prevout.value - bitcoin::Amount::from_sat(fee),
-                    script_pubkey: to,
-                }],
+                output: self
+                    .tag
+                    .iter()
+                    .map(|tag| bitcoin::TxOut {
+                        value: bitcoin::Amount::ZERO,
+                        script_pubkey: tag.clone(),
+                    })
+                    .chain([bitcoin::TxOut {
+                        value: prevout.value - bitcoin::Amount::from_sat(fee),
+                        script_pubkey: to,
+                    }])
+                    .collect(),
             };
             let leaf_hash = bitcoin::TapLeafHash::from_script(&self.script, LeafVersion::TapScript);
             let sighash = SighashCache::new(&tx)
@@ -5333,7 +5454,7 @@ mod tests {
             .await
             .unwrap();
         let carries = |reveal: &bitcoin::Transaction, commit| {
-            reveal_carries_proposal(reveal, commit, &proposal, &role)
+            reveal_carries_proposal(reveal, commit, &proposal, &role, *b"ALPN")
         };
         let reveal = envelope_reveal(COMMIT_B, 1, &test_fixture_action_hex());
         assert!(carries(&reveal, COMMIT_B));
@@ -5349,6 +5470,25 @@ mod tests {
         // The right action without signatures the ASM accepts: unsigned, one signer of two, one
         // key signing twice, keys outside the role — or both approvers' valid signatures at each
         // other's index, which a check that ignores the role's key order would take.
+        // Fully signed, but with no tag in its first output: the ASM never routes it to the
+        // administration subprotocol.
+        let untagged = Envelope::new(&signed_payload(1, &test_fixture_action_hex())).untagged();
+        let reveal = untagged.reveal(
+            bitcoin::OutPoint::new(COMMIT_B.parse().unwrap(), 0),
+            bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(10_000),
+                script_pubkey: untagged.script_pubkey(),
+            },
+            bitcoin::ScriptBuf::new(),
+            1_000,
+        );
+        assert!(!carries(&reveal, COMMIT_B), "untagged");
+        // Tagged, but under other magic bytes than the network's.
+        let tagged = envelope_reveal(COMMIT_B, 1, &test_fixture_action_hex());
+        assert!(
+            !reveal_carries_proposal(&tagged, COMMIT_B, &proposal, &role, *b"TEST"),
+            "wrong magic"
+        );
         for secrets in [&[][..], &[1], &[1, 1], &[3, 4], &[2, 1]] {
             let envelope =
                 Envelope::new(&signed_payload_by(1, &test_fixture_action_hex(), secrets));
@@ -5456,6 +5596,102 @@ mod tests {
         assert_eq!(stored.activation_height, None);
     }
 
+    /// A rotation of this very role changes the live configuration in its reveal's own block. The
+    /// winner is then verified against the configuration kept when the pair was sent.
+    #[tokio::test]
+    async fn a_self_rotation_verifies_against_the_configuration_it_was_sent_under() {
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        use strata_crypto::keys::compressed::CompressedPublicKey;
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        // Signed under keys 3·G, 4·G: the configuration before the rotation, no longer the live one.
+        let envelope = Envelope::new(&signed_payload_by(1, &test_fixture_action_hex(), &[3, 4]));
+        let reveal = envelope.reveal(
+            bitcoin::OutPoint::new(COMMIT_A.parse().unwrap(), 0),
+            bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(10_000),
+                script_pubkey: envelope.script_pubkey(),
+            },
+            bitcoin::ScriptBuf::new(),
+            1_000,
+        );
+        let secp = Secp256k1::new();
+        let keys = [3u8, 4]
+            .map(|scalar| {
+                let mut secret = [0u8; 32];
+                secret[31] = scalar;
+                let key =
+                    PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&secret).unwrap());
+                CompressedPublicKey::from_slice(&key.serialize()).unwrap()
+            })
+            .to_vec();
+        let before_rotation = strata_crypto::threshold_signature::ThresholdConfig::try_new(
+            keys,
+            std::num::NonZero::new(2).unwrap(),
+        )
+        .unwrap();
+        let btc = MinedReveals(vec![(REVEAL_A, 800_010, reveal)]);
+
+        let live_only = first_mined_pair(&proposal, &btc, "mock://asm-membership", None).await;
+        assert_eq!(live_only, MinedPair::None);
+        let with_kept = first_mined_pair(
+            &proposal,
+            &btc,
+            "mock://asm-membership",
+            Some(&before_rotation),
+        )
+        .await;
+        assert_eq!(
+            with_kept,
+            MinedPair::First(COMMIT_A.to_string(), REVEAL_A.to_string())
+        );
+    }
+
+    /// The claim and every registration keep the role's configuration of that moment.
+    #[tokio::test]
+    async fn a_send_keeps_the_roles_configuration() {
+        use ssz::Decode;
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        let kept = repo
+            .broadcast_role_config(&action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let live = threshold_config_for_authority("mock://asm-membership", Authority::StrataAdmin)
+            .await
+            .unwrap();
+        assert_eq!(
+            strata_crypto::threshold_signature::ThresholdConfig::from_ssz_bytes(&kept).unwrap(),
+            live
+        );
+    }
+
+    /// A valid reveal mined, but the ASM has not taken the sequence number: not confirmed.
+    #[tokio::test]
+    async fn a_reveal_the_asm_has_not_taken_is_not_confirmed() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        let unchanged = confirm_reveal_if_mined(
+            &repo,
+            proposal,
+            &MinedReveals(vec![(
+                REVEAL_A,
+                800_010,
+                envelope_reveal(COMMIT_A, 1, &test_fixture_action_hex()),
+            )]),
+            crate::infrastructure::asm_role_membership::MOCK_ASM_NOT_ACCEPTED_URL,
+        )
+        .await;
+        assert_eq!(
+            unchanged.broadcast_status,
+            BroadcastStatus::RevealBroadcasted
+        );
+        assert_eq!(unchanged.activation_height, None);
+    }
+
     /// The role's configuration cannot be read: a mined reveal is not taken on trust.
     #[tokio::test]
     async fn a_mined_reveal_waits_when_the_role_cannot_be_read() {
@@ -5470,6 +5706,7 @@ mod tests {
                 envelope_reveal(COMMIT_A, 1, &test_fixture_action_hex()),
             )]),
             "mock://unreachable-asm",
+            None,
         )
         .await;
         assert_eq!(winner, MinedPair::Unknown);
@@ -5754,6 +5991,7 @@ mod tests {
                 envelope_reveal(COMMIT_A, 1, &test_fixture_action_hex()),
             )]),
             "mock://asm-membership",
+            None,
         )
         .await;
         assert_eq!(

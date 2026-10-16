@@ -27,11 +27,14 @@ async fn main() -> anyhow::Result<()> {
 
     let config = config::Config::from_env().context("failed to load config")?;
 
-    let btc_client = Arc::new(infrastructure::bitcoin_rpc::HttpBitcoinRpcClient::new(
-        &config.bitcoin_rpc_url,
-        &config.bitcoin_rpc_user,
-        &config.bitcoin_rpc_pass,
-    ));
+    let btc_client = Arc::new(
+        infrastructure::bitcoin_rpc::HttpBitcoinRpcClient::new(
+            &config.bitcoin_rpc_url,
+            &config.bitcoin_rpc_user,
+            &config.bitcoin_rpc_pass,
+        )
+        .with_magic_bytes(config.bitcoin_magic_bytes),
+    );
     warn_without_txindex(btc_client.clone());
 
     let state = if let Some(database_url) = &config.database_url {

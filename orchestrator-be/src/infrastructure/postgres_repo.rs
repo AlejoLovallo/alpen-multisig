@@ -785,6 +785,37 @@ impl ProposalRepository for PostgresProposalRepository {
         Ok(())
     }
 
+    async fn record_broadcast_role_config(
+        &self,
+        action_id: &ActionId,
+        config_ssz: &[u8],
+    ) -> Result<(), AppError> {
+        sqlx::query("UPDATE proposals SET broadcast_role_config = $1 WHERE action_id = $2")
+            .bind(config_ssz)
+            .bind(&action_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                AppError::Internal(anyhow::anyhow!("failed to record role config: {e}"))
+            })?;
+        Ok(())
+    }
+
+    async fn broadcast_role_config(
+        &self,
+        action_id: &ActionId,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        let row: Option<(Option<Vec<u8>>,)> =
+            sqlx::query_as("SELECT broadcast_role_config FROM proposals WHERE action_id = $1")
+                .bind(&action_id.0)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| {
+                    AppError::Internal(anyhow::anyhow!("failed to read role config: {e}"))
+                })?;
+        Ok(row.and_then(|(config,)| config))
+    }
+
     async fn update_update_id_in_queue(
         &self,
         action_id: &ActionId,
@@ -1086,6 +1117,19 @@ mod tests {
         let failed = fail(COMMIT_A, REVEAL_A, Vec::new()).await;
         assert_eq!(failed.broadcast_status, BroadcastStatus::Failed);
         assert_eq!(failed.reveal_txid.as_deref(), Some(REVEAL_A));
+
+        // The role's configuration kept for the send: none yet, then the latest one.
+        assert_eq!(repo.broadcast_role_config(&action_id).await.unwrap(), None);
+        repo.record_broadcast_role_config(&action_id, &[1, 2])
+            .await
+            .unwrap();
+        repo.record_broadcast_role_config(&action_id, &[3])
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.broadcast_role_config(&action_id).await.unwrap(),
+            Some(vec![3])
+        );
     }
 
     #[tokio::test]

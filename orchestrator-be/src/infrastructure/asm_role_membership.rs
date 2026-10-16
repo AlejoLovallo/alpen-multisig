@@ -87,6 +87,20 @@ pub(crate) async fn threshold_config_for_authority(
     Ok(authority_config.config().clone())
 }
 
+/// Whether the ASM has accepted an action of this role at `seq_no` or later (#605): its
+/// `last_seqno` only moves when it accepts one, after the same checks a reveal is confirmed on —
+/// so a reveal mined but rejected (a sequence number beyond the allowed gap, say) does not count.
+pub(crate) async fn seqno_consumed_by_asm(
+    rpc_url: &str,
+    authority: Authority,
+    seq_no: u64,
+) -> Result<bool, AppError> {
+    if let Some(consumed) = mock_seqno_consumed(rpc_url) {
+        return Ok(consumed);
+    }
+    Ok(last_seqno_for_authority(rpc_url, authority).await? >= seq_no)
+}
+
 /// Return the confirmation depth (in blocks) before the update in `action_hex` activates.
 ///
 /// Resolved from the action, never from the authority: the Security Council signs both Defcon 1
@@ -397,6 +411,7 @@ fn mock_threshold(rpc_url: &str, authority: Authority) -> Option<u16> {
     // The seqno fixtures answer the same threshold as the membership one: they exist to move
     // `last_seqno`, not to drift the snapshot.
     let known = rpc_url == MOCK_MEMBERSHIP_URL
+        || rpc_url == MOCK_ASM_NOT_ACCEPTED_URL
         || rpc_url == crate::infrastructure::asm_enactment::MOCK_SEQNO_AHEAD_URL
         || rpc_url == crate::infrastructure::asm_enactment::MOCK_ENACTED_AHEAD_URL;
     if !known {
@@ -414,6 +429,29 @@ fn mock_threshold(rpc_url: &str, authority: Authority) -> Option<u16> {
 
 #[cfg(not(any(test, feature = "dev-mocks")))]
 fn mock_threshold(_rpc_url: &str, _authority: Authority) -> Option<u16> {
+    None
+}
+
+/// An ASM that has not accepted the fixture's action: its role sits where the membership fixture
+/// does, but a mined reveal is not yet (or never) taken.
+#[cfg(any(test, feature = "dev-mocks"))]
+pub(crate) const MOCK_ASM_NOT_ACCEPTED_URL: &str = "mock://asm-not-accepted";
+
+/// The membership fixture stands for an ASM that already processed every block the tests mine;
+/// [`MOCK_ASM_NOT_ACCEPTED_URL`] for one that rejected (or has not reached) the reveal.
+#[cfg(any(test, feature = "dev-mocks"))]
+fn mock_seqno_consumed(rpc_url: &str) -> Option<bool> {
+    if rpc_url == MOCK_MEMBERSHIP_URL {
+        return Some(true);
+    }
+    if rpc_url == MOCK_ASM_NOT_ACCEPTED_URL {
+        return Some(false);
+    }
+    None
+}
+
+#[cfg(not(any(test, feature = "dev-mocks")))]
+fn mock_seqno_consumed(_rpc_url: &str) -> Option<bool> {
     None
 }
 
