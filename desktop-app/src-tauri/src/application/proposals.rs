@@ -94,8 +94,8 @@ pub enum BroadcastError {
         reveal_txid: String,
         errors: Vec<(String, String)>,
     },
-    /// A bundle for the same manual proposal is still stored, so its commit may be live (#516):
-    /// a second send would fund a second commit. Nothing was built.
+    /// A bundle for the same proposal is still stored, so its commit may be live (#516, #605): a
+    /// second send would fund a second commit and replace the stored one. Nothing was built.
     #[error("a bundle for this proposal may already be on the network (commit {commit_txid})")]
     BundleInFlight { commit_txid: String },
 }
@@ -415,6 +415,21 @@ pub async fn submit_commit_then_reveal(
     envelope_cache: &EnvelopeKeyCache,
     mode: SendMode,
 ) -> Result<(String, String), BroadcastError> {
+    // This desktop keeps one bundle per proposal, and a stored one may be live (#605): replacing
+    // it would stop the settle loop from resubmitting its reveal or settling its coins. Beside
+    // another signer's pair nothing else stops a second send from this desktop — another signer
+    // on it, or an orchestrator node that no longer sees the stored commit.
+    if mode == SendMode::AdditionalPair {
+        let stored = pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(action_id)
+            .map(|stored| stored.commit_txid.clone());
+        if let Some(commit_txid) = stored {
+            return Err(BroadcastError::BundleInFlight { commit_txid });
+        }
+    }
+
     // Beside another signer's pair, ask before the device signs anything (#605): a refusal then
     // costs no signature. The screen chose the mode from an older row; if nothing is in flight any
     // more, this send is an ordinary claim.
@@ -3176,6 +3191,60 @@ mod tests {
         assert!(mock_client.registered.lock().unwrap().is_empty());
         assert!(mock_client.reported_statuses().is_empty());
         assert!(!*mock_client.claimed.lock().unwrap());
+    }
+
+    /// #605: this desktop still stores a bundle for the proposal. Another pair from it would
+    /// replace that bundle, which may be live, so nothing is asked, built or signed.
+    #[tokio::test]
+    async fn an_additional_pair_never_replaces_a_stored_bundle() {
+        use bitcoin::{Network, ScriptBuf};
+        use strata_l1_txfmt::MagicBytes;
+
+        let spy = SpyCommitFunding::new("ignored");
+        let mock_client = MockOrchestratorClientLargeAction::default();
+        let pending = crate::application::pending_reveals::new();
+        let stored = crate::application::pending_reveals::PendingReveal {
+            reveal_tx_hex: "00".to_string(),
+            reveal_txid: "reveal-live".to_string(),
+            commit_txid: "commit-live".to_string(),
+            commit_tx_hex: None,
+        };
+        pending
+            .lock()
+            .unwrap()
+            .insert("action-stored".to_string(), stored);
+
+        let err = submit_commit_then_reveal(
+            &mock_client,
+            &ok_broadcasters(),
+            "mock://asm-membership",
+            MagicBytes::new([0x62, 0x74, 0x00, 0x00]),
+            Network::Regtest,
+            "action-stored",
+            crate::domain::fee_rate::FeeRate::from_raw_clamped(1_000),
+            &spy,
+            ScriptBuf::new(),
+            &pending,
+            &crate::infrastructure::admin_wallet::EnvelopeKeyCache::default(),
+            SendMode::AdditionalPair,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, BroadcastError::BundleInFlight { commit_txid } if commit_txid == "commit-live"),
+            "{err:?}"
+        );
+        assert!(!*mock_client.checked.lock().unwrap());
+        assert!(spy.released().is_empty(), "no commit was built");
+        assert_eq!(
+            pending
+                .lock()
+                .unwrap()
+                .get("action-stored")
+                .map(|p| p.reveal_txid.clone()),
+            Some("reveal-live".to_string())
+        );
     }
 
     /// #605: the screen offered another pair, but the pair in flight is gone by the time the

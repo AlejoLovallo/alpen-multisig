@@ -431,8 +431,9 @@ acts on; the others are refused on the sequence number and cost only their fees.
 - **Only a reveal that carries the proposal counts.** Registration takes any well-formed txids, so
   the reconcile checks every mined reveal it considers: its first input must spend the pair's commit,
   and its envelope must decode — the way the ASM reads it (`parse_tx`: taproot leaf script,
-  `parse_envelope_payload`, SSZ `SignedPayload`) — to this proposal's sequence number and action
-  (`reveal_carries_proposal`). A mined transaction that does not is ignored, however low its block,
+  `parse_envelope_payload`, SSZ `SignedPayload`) — to this proposal's sequence number and action,
+  signed over its sighash by at least `required_signatures` distinct approvers of the proposal, each
+  checked with the ASM's own verifier (`reveal_carries_proposal`, `signed_by_quorum`). A mined transaction that does not is ignored, however low its block,
   and the row stays in flight. A pair first reported after it was mined (the manual fallback,
   imported later) still counts: what it carries decides, not when it was registered.
 - **A failed pair falls back only to a live one.** A `failed` report for the pair the row tracks,
@@ -476,7 +477,7 @@ acts on; the others are refused on the sequence number and cost only their fees.
   holding back the other pairs.
 - **The import says when it was ignored.** A `PATCH` about a pair the row does not track still answers
   `200`; the detail screen compares the reveal it imported with the one the row tracks and shows a notice
-  when they differ.
+  when they differ — including an import that named no reveal while the row tracks one.
 - **Desktop.** The detail screen offers *Send your own commit + reveal* under the in-flight stage
   (`canSendAdditionalPair`) — to a signer with no pair, or to one whose earlier pair this desktop no
   longer keeps (`proposals_has_stored_bundle`), and never when the orchestrator sends no
@@ -487,7 +488,9 @@ acts on; the others are refused on the sequence number and cost only their fees.
   `GET /proposals/:id/broadcast/attempts/check`, which runs every check of the registration that does not
   need txids (approved, threshold, sequence number, a pair in flight, no live pair of this signer) and
   answers the same `409`s, so a refusal costs no signature. When the answer is that no pair is in flight
-  any more, the send claims the row instead, as an ordinary send. Otherwise no claim: the pair is
+  any more, the send claims the row instead, as an ordinary send. A desktop that still stores a bundle
+  for the proposal refuses before asking (`BundleInFlight`): the stored one may be live, and a second
+  send would replace it. Otherwise no claim: the pair is
   registered through the endpoint above instead of the pre-registration report — retried (3 attempts)
   like that report, except on a `409`, which is a decided refusal — and nothing is reported on the row
   while the answer is a refusal, so the other signer's pair is untouched. A registration whose answer
@@ -500,7 +503,10 @@ acts on; the others are refused on the sequence number and cost only their fees.
   after `failed` leaves the earlier attempt listed, so the new pair is not a lone pair: the node decides
   with `-txindex`, and without it the desktop's report is taken, as above. The pre-check and the
   registration are two calls: the row can move between them, and the registration then refuses after
-  the device signed.
+  the device signed. Without `-txindex` the node cannot answer that a commit is nowhere, so a signer
+  whose pair was dropped cannot send another: when the row tracks a pair whose sender's desktop died
+  before broadcasting it and every other pair was dropped, only a signer who has sent no pair can move
+  the proposal until that desktop returns and reports `failed`.
 
 ### Frontend (`desktop-app/src`)
 

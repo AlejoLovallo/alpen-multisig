@@ -10,6 +10,11 @@ assert.equal(importedPairIgnored(REVEAL, REVEAL), false, 'the row tracks the imp
 assert.equal(importedPairIgnored(REVEAL, REVEAL.toUpperCase()), false, 'txids compare case-insensitively')
 assert.equal(importedPairIgnored(REVEAL, OTHER), true, 'the row tracks another pair')
 assert.equal(importedPairIgnored(REVEAL, undefined), true, 'the row tracks no pair')
-assert.equal(importedPairIgnored(null, OTHER), false, 'an import without a reveal names no pair')
+assert.equal(
+	importedPairIgnored(null, OTHER),
+	true,
+	'an import without a reveal does not move a row that tracks a pair',
+)
+assert.equal(importedPairIgnored(null, undefined), false, 'an import without a reveal on a row with none is applied')
 
 console.log('imported-pair: all assertions passed')

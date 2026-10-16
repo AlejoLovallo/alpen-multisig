@@ -789,9 +789,11 @@ fn node_has_no_txindex(message: &str) -> bool {
 }
 
 /// Whether a mined `reveal` is a commit + reveal of `proposal` (#605): it spends `commit_txid`,
-/// and its envelope carries this proposal's sequence number and action. Read the way the ASM
-/// reads it (`strata_asm_txs_admin::parser::parse_tx`). Registration takes any txid, so this is
-/// what keeps an unrelated mined transaction from becoming the pair the reconcile confirms.
+/// and its envelope carries this proposal's sequence number and action, signed by a quorum of its
+/// approvers. Read the way the ASM reads it (`strata_asm_txs_admin::parser::parse_tx`).
+/// Registration takes any txid, so this is what keeps an unrelated mined transaction — or one
+/// carrying this action without the signatures the ASM needs — from becoming the pair the
+/// reconcile confirms.
 fn reveal_carries_proposal(
     reveal: &bitcoin::Transaction,
     commit_txid: &str,
@@ -822,7 +824,52 @@ fn reveal_carries_proposal(
     let Ok(action) = hex::decode(&proposal.action_hex) else {
         return false;
     };
-    signed.seqno == proposal.seq_no && signed.action.as_ssz_bytes() == action
+    signed.seqno == proposal.seq_no
+        && signed.action.as_ssz_bytes() == action
+        && signed_by_quorum(&signed, proposal)
+}
+
+/// Whether the payload's signatures include at least `required_signatures` distinct approvers of
+/// `proposal`, each a valid signature over the payload's own sighash (#605). Every signature is
+/// checked with the ASM's own verifier against one approver's key at a time, so this needs neither
+/// the role's key order nor an ASM call; the approvers were checked against the role when they
+/// signed.
+fn signed_by_quorum(
+    signed: &strata_asm_txs_admin::parser::SignedPayload,
+    proposal: &Proposal,
+) -> bool {
+    use strata_crypto::keys::compressed::CompressedPublicKey;
+    use strata_crypto::threshold_signature::{
+        verify_threshold_signatures, IndexedSignature, ThresholdConfig,
+    };
+    let sighash = strata_asm_txs_admin::signing_message::SigningMessage::for_action(
+        &signed.action,
+        signed.seqno,
+    )
+    .compute_sighash()
+    .0;
+    let approvers: Vec<ThresholdConfig> = proposal
+        .signatures
+        .iter()
+        .filter_map(|approval| hex::decode(&approval.signer_pubkey).ok())
+        .filter_map(|key| CompressedPublicKey::from_slice(&key).ok())
+        .filter_map(|key| ThresholdConfig::try_new(vec![key], std::num::NonZero::<u8>::MIN).ok())
+        .collect();
+    let mut signed_by = vec![false; approvers.len()];
+    for signature in signed.signatures.signatures() {
+        let mut bytes = [0u8; 65];
+        bytes[0] = signature.recovery_id();
+        bytes[1..33].copy_from_slice(signature.r());
+        bytes[33..].copy_from_slice(signature.s());
+        let alone = [IndexedSignature::new(0, bytes)];
+        if let Some(approver) = approvers
+            .iter()
+            .position(|key| verify_threshold_signatures(key, &alone, &sighash).is_ok())
+        {
+            signed_by[approver] = true;
+        }
+    }
+    signed_by.iter().filter(|signed| **signed).count() >= usize::from(proposal.required_signatures)
 }
 
 /// What a progress report writes. A `failed` report for the pair the row tracks puts the row back
@@ -1780,6 +1827,7 @@ mod tests {
 
     const ACTION_HEX: &str = "deadbeef";
 
+    /// 1·G, so a test can sign as this approver with the secret scalar 1.
     fn sig_a() -> ProposalSignature {
         ProposalSignature {
             signer_pubkey: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
@@ -1788,9 +1836,10 @@ mod tests {
         }
     }
 
+    /// 2·G, so a test can sign as this approver with the secret scalar 2.
     fn sig_b() -> ProposalSignature {
         ProposalSignature {
-            signer_pubkey: "02c6047f9441ed7d6d3045406e95c07cd85a1a3f1f3ff2b4f6f3f5b4f0c709ee5"
+            signer_pubkey: "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
                 .to_string(),
             signature_hex: "sig_b".to_string(),
         }
@@ -2088,7 +2137,7 @@ mod tests {
         assert_eq!(updated.signatures.len(), 2);
         assert_eq!(
             updated.signatures[1].signer_pubkey,
-            "02c6047f9441ed7d6d3045406e95c07cd85a1a3f1f3ff2b4f6f3f5b4f0c709ee5"
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
         );
     }
 
@@ -4985,15 +5034,42 @@ mod tests {
         assert_eq!(registered.broadcast_attempts.len(), 3);
     }
 
-    /// The SSZ payload the desktop puts in the envelope: this sequence number and action, with no
-    /// signatures (the reconcile does not read them).
+    /// The SSZ payload the desktop puts in the envelope: this sequence number and action, signed
+    /// by both fixture approvers (`sig_a` is 1·G, `sig_b` is 2·G).
     fn signed_payload(seq_no: u64, action_hex: &str) -> Vec<u8> {
+        signed_payload_by(seq_no, action_hex, &[1, 2])
+    }
+
+    /// The same payload, signed by the fixture keys with these secret scalars.
+    fn signed_payload_by(seq_no: u64, action_hex: &str, secrets: &[u8]) -> Vec<u8> {
         use ssz::{Decode, Encode};
         let action = strata_asm_txs_admin::actions::MultisigAction::from_ssz_bytes(
             &hex::decode(action_hex).unwrap(),
         )
         .unwrap();
-        let signatures = strata_crypto::threshold_signature::SignatureSet::new(vec![]).unwrap();
+        let sighash =
+            strata_asm_txs_admin::signing_message::SigningMessage::for_action(&action, seq_no)
+                .compute_sighash()
+                .0;
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let message = bitcoin::secp256k1::Message::from_digest(sighash);
+        let signatures = secrets
+            .iter()
+            .enumerate()
+            .map(|(index, secret)| {
+                let mut key = [0u8; 32];
+                key[31] = *secret;
+                let key = bitcoin::secp256k1::SecretKey::from_slice(&key).unwrap();
+                let (recovery, compact) = secp
+                    .sign_ecdsa_recoverable(&message, &key)
+                    .serialize_compact();
+                let mut bytes = [0u8; 65];
+                bytes[0] = recovery.to_i32() as u8;
+                bytes[1..].copy_from_slice(&compact);
+                strata_crypto::threshold_signature::IndexedSignature::new(index as u8, bytes)
+            })
+            .collect();
+        let signatures = strata_crypto::threshold_signature::SignatureSet::new(signatures).unwrap();
         strata_asm_txs_admin::parser::SignedPayload::new(seq_no, action, signatures).as_ssz_bytes()
     }
 
@@ -5154,6 +5230,25 @@ mod tests {
             &crate::infrastructure::action_codec::test_fixture_council_rotation_action_hex(),
         );
         assert!(!reveal_carries_proposal(&other_action, COMMIT_B, &proposal));
+        // The right action without the quorum the ASM needs: unsigned, or one approver of two, or
+        // the approvers' keys signing twice.
+        for secrets in [&[][..], &[1], &[1, 1], &[3, 4]] {
+            let envelope =
+                Envelope::new(&signed_payload_by(1, &test_fixture_action_hex(), secrets));
+            let reveal = envelope.reveal(
+                bitcoin::OutPoint::new(COMMIT_B.parse().unwrap(), 0),
+                bitcoin::TxOut {
+                    value: bitcoin::Amount::from_sat(10_000),
+                    script_pubkey: envelope.script_pubkey(),
+                },
+                bitcoin::ScriptBuf::new(),
+                1_000,
+            );
+            assert!(
+                !reveal_carries_proposal(&reveal, COMMIT_B, &proposal),
+                "signed by {secrets:?}"
+            );
+        }
         let plain = bitcoin::Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::ZERO,
