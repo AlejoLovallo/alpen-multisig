@@ -428,6 +428,18 @@ acts on; the others are refused on the sequence number and cost only their fees.
   reports only to a row that carries its own reveal txid (`BundleRow::Ours`), and a `failed` report now
   names its pair. A pre-registration is a success only when the response still tracks that reveal; a
   200 that tracks another pair aborts the send before anything is broadcast and reports nothing.
+- **A reveal already in a block is not a pair.** Registration is refused (`409`) when the node can
+  see that reveal in a block: the pair is registered before it is broadcast, so a mined reveal is not
+  this proposal's. The reconcile also skips a reveal whose block time is more than two hours before
+  that pair was registered. A miner may stamp a block behind the wall clock, and two hours is the
+  bound Core uses for a timestamp ahead of it; an unrelated transaction mined long before the pair
+  was registered must not win by being the lowest height. A client that did not read a block time
+  does not apply this skip.
+- **A failed second pair puts the row back.** A `failed` report for the pair the row tracks, when
+  another pair is listed, sets the row back to the previous pair at `commit_broadcasted` and clears
+  the error. The failed pair stays listed. The earlier pair may still be in the mempool, and a
+  `failed` row would hide *Send your own commit + reveal*. A proposal with no other pair still
+  becomes `failed`.
 - **Reconcile picks the pair mined first.** `confirm_reveal_if_mined` looks up the row's reveal and
   every listed pair's; the lowest block height wins, and two reveals in one block are ordered by their
   place in it (`getblock`) — the first listed is the one the ASM executed. A tie the node cannot order
@@ -468,9 +480,9 @@ acts on; the others are refused on the sequence number and cost only their fees.
   except on a `409`, which is a decided refusal — and nothing is reported on the row until it is
   registered, so a refusal leaves the other
   signer's pair untouched. Build, reservation, `PendingReveals`, broadcast and settle are unchanged.
-- **Accepted limits.** A sender whose own pair is rejected after registering reports `failed`; the
-  row then offers *Retry send* through the claim, while the earlier pair stays listed and is still
-  promoted if mined. A pair backfilled with no broadcaster does not lock its sender out.
+- **Accepted limits.** A pair backfilled with no broadcaster does not lock its sender out. A retry
+  after `failed` leaves the earlier attempt listed, so the new pair is not a lone pair: confirming
+  it needs `-txindex`, the same as any proposal with more than one pair.
 
 ### Frontend (`desktop-app/src`)
 

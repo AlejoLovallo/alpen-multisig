@@ -17,6 +17,18 @@ pub(crate) trait BitcoinRpcClient: Send + Sync {
     /// Fails if the transaction is not yet in a block.
     async fn get_block_height_for_txid(&self, txid: &str) -> Result<u64, AppError>;
 
+    /// Where a confirmed `txid` sits, including the block's timestamp when this client knows it.
+    ///
+    /// Fails the same way as [`get_block_height_for_txid`] when the transaction is not in a block.
+    /// The default has no timestamp: only a client that read one can tell a reveal mined long
+    /// before it was registered from one mined after (#605).
+    async fn get_mined_reveal(&self, txid: &str) -> Result<MinedReveal, AppError> {
+        Ok(MinedReveal {
+            height: self.get_block_height_for_txid(txid).await?,
+            block_time: None,
+        })
+    }
+
     /// Return the current chain tip height (`getblockcount`).
     async fn get_chain_tip(&self) -> Result<u64, AppError>;
 
@@ -27,6 +39,15 @@ pub(crate) trait BitcoinRpcClient: Send + Sync {
             "this bitcoin client cannot place a transaction in its block".to_string(),
         ))
     }
+}
+
+/// A transaction the node found in a block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MinedReveal {
+    pub height: u64,
+    /// Unix seconds of the block, when the client read one. A miner may stamp a block behind the
+    /// wall clock; callers that compare it with a registration time allow for that.
+    pub block_time: Option<i64>,
 }
 
 pub(crate) struct HttpBitcoinRpcClient {
@@ -134,13 +155,18 @@ impl BitcoinRpcClient for HttpBitcoinRpcClient {
     }
 
     async fn get_block_height_for_txid(&self, txid: &str) -> Result<u64, AppError> {
+        Ok(self.get_mined_reveal(txid).await?.height)
+    }
+
+    async fn get_mined_reveal(&self, txid: &str) -> Result<MinedReveal, AppError> {
         // getrawtransaction works for any tx via txindex, unlike gettransaction which
         // requires the tx to be in the node's wallet.
         let result = self.call("getrawtransaction", json!([txid, true])).await?;
+        let block_time = result.get("blocktime").and_then(|v| v.as_i64());
 
         // Bitcoin Core 23+ includes blockheight directly; fall back to getblockheader.
-        if let Some(h) = result.get("blockheight").and_then(|v| v.as_u64()) {
-            return Ok(h);
+        if let Some(height) = result.get("blockheight").and_then(|v| v.as_u64()) {
+            return Ok(MinedReveal { height, block_time });
         }
 
         let blockhash = result
@@ -156,14 +182,16 @@ impl BitcoinRpcClient for HttpBitcoinRpcClient {
             .call("getblockheader", json!([blockhash, true]))
             .await?;
 
-        header
+        let height = header
             .get("height")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| {
                 AppError::BadRequest(format!(
                     "getblockheader: missing `height` for blockhash {blockhash}"
                 ))
-            })
+            })?;
+        let block_time = block_time.or_else(|| header.get("time").and_then(|v| v.as_i64()));
+        Ok(MinedReveal { height, block_time })
     }
 
     async fn get_tx_position_in_block(&self, txid: &str) -> Result<usize, AppError> {

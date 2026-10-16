@@ -1,7 +1,8 @@
 use std::str::FromStr;
 
 use crate::application::proposals::{
-    decide_additional_pair, reports_tracked_pair, AdditionalPair, AUTHORITY_IN_FLIGHT,
+    broadcast_write_for_report, decide_additional_pair, reports_tracked_pair, AdditionalPair,
+    AUTHORITY_IN_FLIGHT,
 };
 use crate::application::traits::ProposalRepository;
 use crate::domain::authority::Authority;
@@ -631,7 +632,8 @@ impl ProposalRepository for PostgresProposalRepository {
         let Some(row) = row else {
             return Ok(None);
         };
-        let current = row_to_proposal_no_sigs(&row, action_id.0.clone())?;
+        let mut current = row_to_proposal_no_sigs(&row, action_id.0.clone())?;
+        current.broadcast_attempts = load_broadcast_attempts(&mut *tx, &action_id.0).await?;
         if !reports_tracked_pair(reveal_txid, current.reveal_txid.as_deref()) {
             drop(tx);
             return self.find_by_action_id(action_id).await;
@@ -656,14 +658,23 @@ impl ProposalRepository for PostgresProposalRepository {
             .map_err(|e| {
                 AppError::Internal(anyhow::anyhow!("failed to record broadcast attempt: {e}"))
             })?;
+            let kept = current
+                .broadcast_attempts
+                .iter()
+                .any(|kept| kept.reveal_txid.eq_ignore_ascii_case(&attempt.reveal_txid));
+            if !kept {
+                current.broadcast_attempts.push(attempt);
+            }
         }
 
+        // A failed report for the tracked pair puts the row back on the previous one (#605).
+        let write = broadcast_write_for_report(&current, status, commit_txid, reveal_txid, error);
         sqlx::query(UPDATE_BROADCAST_STATUS)
-            .bind(status.to_string())
+            .bind(write.status.to_string())
             .bind(proposal_status_db)
-            .bind(commit_txid)
-            .bind(reveal_txid)
-            .bind(error)
+            .bind(write.commit_txid.as_deref())
+            .bind(write.reveal_txid.as_deref())
+            .bind(write.error.as_deref())
             .bind(&action_id.0)
             .execute(&mut *tx)
             .await

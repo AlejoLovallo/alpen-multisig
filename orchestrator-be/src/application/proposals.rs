@@ -477,6 +477,19 @@ pub(crate) const NO_PAIR_IN_FLIGHT: &str =
 /// Conflict text when the caller already registered a pair for this proposal (#605).
 pub(crate) const OWN_PAIR_EXISTS: &str = "you already sent a commit and reveal for this proposal";
 
+/// Conflict text when the reveal being registered is already in a block (#605).
+///
+/// A pair is registered before it is broadcast, so a reveal the node can already see mined is not
+/// this proposal's. Taking it would let the lowest block height win the reconcile.
+pub(crate) const REVEAL_ALREADY_MINED: &str =
+    "this reveal is already in a block, so it cannot be a commit and reveal for this proposal";
+
+/// How far behind the wall clock a block timestamp may be and still count as mined after the pair
+/// was registered (#605). Bitcoin allows a miner to stamp a block behind the clock; two hours is
+/// the same bound Core uses for a timestamp ahead of it. An unrelated transaction mined long
+/// before the pair was registered falls outside it and must not win by being the lowest height.
+const BLOCK_TIME_SLACK: chrono::Duration = chrono::Duration::hours(2);
+
 /// Whether a desktop's report may change the row (#605).
 ///
 /// An untagged row (no reveal yet) accepts it: that is the claimer's pre-registration. A tagged
@@ -652,6 +665,17 @@ pub(crate) async fn register_additional_pair(
     ensure_threshold_snapshot_current(&proposal, asm_rpc_url).await?;
     ensure_seq_no_still_open(&proposal, asm_rpc_url).await?;
 
+    // A reveal already in a block was not built for this send. Refusing it here is what stops an
+    // unrelated mined transaction from becoming the pair the reconcile confirms (#605). A node
+    // that cannot answer does not block the send; the reconcile still ignores a block from long
+    // before the pair was registered.
+    if matches!(
+        classify_reveal_height(btc_client.get_mined_reveal(reveal_txid).await),
+        RevealHeight::Mined { .. }
+    ) {
+        return Err(AppError::Conflict(REVEAL_ALREADY_MINED.to_string()));
+    }
+
     let signer = normalize_signer_pubkey_hex(session.signer_pubkey);
     let abandoned = abandoned_pairs_of(&proposal, &signer, btc_client).await;
     repo.register_additional_pair(
@@ -690,20 +714,95 @@ async fn ensure_seq_no_still_open(proposal: &Proposal, asm_rpc_url: &str) -> Res
 /// What one reveal lookup told us. "Not in a block" is an answer; a node that could not answer is
 /// not, and must not be read as the reveal losing the race (#605).
 enum RevealHeight {
-    Mined(u64),
+    Mined {
+        height: u64,
+        block_time: Option<i64>,
+    },
     Unmined,
     Unknown,
 }
 
-/// `get_block_height_for_txid` reports both "not in a block" and a failed node call as
-/// `BadRequest`. Only the first is a real answer.
-fn classify_reveal_height(result: Result<u64, AppError>) -> RevealHeight {
+/// `get_mined_reveal` reports both "not in a block" and a failed node call as `BadRequest`. Only
+/// the first is a real answer.
+fn classify_reveal_height(
+    result: Result<crate::infrastructure::bitcoin_rpc::MinedReveal, AppError>,
+) -> RevealHeight {
     match result {
-        Ok(height) => RevealHeight::Mined(height),
+        Ok(mined) => RevealHeight::Mined {
+            height: mined.height,
+            block_time: mined.block_time,
+        },
         Err(AppError::BadRequest(message)) if reveal_not_in_a_block(&message) => {
             RevealHeight::Unmined
         }
         Err(_) => RevealHeight::Unknown,
+    }
+}
+
+/// Whether `block_time` is from before this pair was registered, allowing [`BLOCK_TIME_SLACK`].
+///
+/// `None` is not a yes: a client that did not read a timestamp must not drop a reveal that did win.
+fn mined_before_registration(
+    block_time: Option<i64>,
+    registered_at: chrono::DateTime<Utc>,
+) -> bool {
+    block_time.is_some_and(|block_time| {
+        chrono::DateTime::from_timestamp(block_time, 0)
+            .is_some_and(|block_time| block_time + BLOCK_TIME_SLACK < registered_at)
+    })
+}
+
+/// When the pair that carries `reveal` was registered. The attempt's own time, then the claim,
+/// then the proposal: a backfilled pair has the claim time, which is before its reveal was mined.
+fn pair_registered_at(proposal: &Proposal, reveal: &str) -> chrono::DateTime<Utc> {
+    proposal
+        .broadcast_attempts
+        .iter()
+        .find(|attempt| attempt.reveal_txid.eq_ignore_ascii_case(reveal))
+        .map(|attempt| attempt.created_at)
+        .or(proposal.broadcast_claimed_at)
+        .unwrap_or(proposal.created_at)
+}
+
+/// What a progress report writes. A `failed` report for the pair the row tracks puts the row back
+/// on the previous pair when one is listed (#605): that pair may still be in the mempool, and
+/// marking the proposal `failed` would hide *Send your own commit + reveal*.
+pub(crate) struct BroadcastWrite {
+    pub status: BroadcastStatus,
+    pub commit_txid: Option<String>,
+    pub reveal_txid: Option<String>,
+    pub error: Option<String>,
+}
+
+pub(crate) fn broadcast_write_for_report(
+    proposal: &Proposal,
+    status: BroadcastStatus,
+    commit_txid: Option<&str>,
+    reveal_txid: Option<&str>,
+    error: Option<&str>,
+) -> BroadcastWrite {
+    if status == BroadcastStatus::Failed {
+        if let Some(reported) = reveal_txid {
+            if let Some(previous) = proposal
+                .broadcast_attempts
+                .iter()
+                .filter(|attempt| !attempt.reveal_txid.eq_ignore_ascii_case(reported))
+                .max_by_key(|attempt| attempt.created_at)
+            {
+                return BroadcastWrite {
+                    status: BroadcastStatus::CommitBroadcasted,
+                    commit_txid: Some(previous.commit_txid.clone()),
+                    reveal_txid: Some(previous.reveal_txid.clone()),
+                    error: None,
+                };
+            }
+        }
+    }
+    BroadcastWrite {
+        status,
+        commit_txid: commit_txid.map(str::to_string),
+        reveal_txid: reveal_txid.map(str::to_string),
+        error: error.map(str::to_string),
     }
 }
 
@@ -754,8 +853,15 @@ async fn first_mined_pair(
 
     let mut mined: Vec<(u64, Option<&str>, &str)> = Vec::new();
     for (commit, reveal) in candidates {
-        match classify_reveal_height(btc_client.get_block_height_for_txid(reveal).await) {
-            RevealHeight::Mined(height) => mined.push((height, commit, reveal)),
+        match classify_reveal_height(btc_client.get_mined_reveal(reveal).await) {
+            RevealHeight::Mined { height, block_time } => {
+                // Already in a block when the pair was registered: not this proposal's reveal,
+                // however low its height (#605).
+                if mined_before_registration(block_time, pair_registered_at(proposal, reveal)) {
+                    continue;
+                }
+                mined.push((height, commit, reveal));
+            }
             RevealHeight::Unmined => {}
             RevealHeight::Unknown => return None,
         }
@@ -1496,7 +1602,7 @@ mod tests {
         test_fixture_action_hex, test_fixture_council_rotation_action_hex,
         test_fixture_defcon_1_action_hex, test_fixture_safe_harbor_address_action_hex,
     };
-    use crate::infrastructure::bitcoin_rpc::BitcoinRpcClient;
+    use crate::infrastructure::bitcoin_rpc::{BitcoinRpcClient, MinedReveal};
     use crate::infrastructure::memory_repo::InMemoryProposalRepository;
     use serde_json::json;
 
@@ -3978,7 +4084,8 @@ mod tests {
             repo,
             session_of(&sig_b()),
             "mock://asm-membership",
-            &mock_btc(),
+            // Unmined: `mock_btc` reports every txid in a block, which is a refusal.
+            &NodeView::default(),
             action_id,
             COMMIT_B,
             REVEAL_B,
@@ -4033,12 +4140,18 @@ mod tests {
     async fn a_signer_who_already_sent_a_pair_is_refused() {
         let repo = new_repo();
         let action_id = save_with_pair_of_a(&repo).await;
+        // The earlier pair is still in the mempool, so it is not abandoned. The new reveal is not
+        // in a block: `mock_btc` would refuse it as already mined.
+        let still_live = NodeView {
+            mempool: vec![COMMIT_A, COMMIT_B],
+            ..NodeView::default()
+        };
 
         let err = register_additional_pair(
             &repo,
             session_of(&sig_a()),
             "mock://asm-membership",
-            &mock_btc(),
+            &still_live,
             &action_id,
             COMMIT_B,
             REVEAL_B,
@@ -4055,7 +4168,7 @@ mod tests {
             &repo,
             session_of(&sig_b()),
             "mock://asm-membership",
-            &mock_btc(),
+            &still_live,
             &action_id,
             COMMIT_C,
             REVEAL_C,
@@ -4728,6 +4841,156 @@ mod tests {
         let registered = register_a(NodeView::default()).await.unwrap();
         assert_eq!(registered.reveal_txid.as_deref(), Some(REVEAL_C));
         assert_eq!(registered.broadcast_attempts.len(), 3);
+    }
+
+    /// Reports one reveal in a block at `block_time`, and every other txid as not yet confirmed.
+    struct TimedReveal {
+        reveal: &'static str,
+        height: u64,
+        block_time: i64,
+    }
+
+    #[async_trait::async_trait]
+    impl BitcoinRpcClient for TimedReveal {
+        async fn estimate_fee_rate_sats_per_vb(
+            &self,
+            _target_blocks: u16,
+        ) -> Result<u64, AppError> {
+            Ok(1)
+        }
+
+        async fn get_block_height_for_txid(&self, txid: &str) -> Result<u64, AppError> {
+            self.get_mined_reveal(txid).await.map(|mined| mined.height)
+        }
+
+        async fn get_mined_reveal(&self, txid: &str) -> Result<MinedReveal, AppError> {
+            if txid == self.reveal {
+                return Ok(MinedReveal {
+                    height: self.height,
+                    block_time: Some(self.block_time),
+                });
+            }
+            Err(AppError::BadRequest(format!(
+                "getrawtransaction: tx {txid} has no blockhash — not yet confirmed"
+            )))
+        }
+
+        async fn get_chain_tip(&self) -> Result<u64, AppError> {
+            Ok(800_000)
+        }
+    }
+
+    /// A reveal the node can already see in a block is not a pair this signer is about to send.
+    #[tokio::test]
+    async fn an_already_mined_reveal_is_refused() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        let err = register_additional_pair(
+            &repo,
+            session_of(&sig_b()),
+            "mock://asm-membership",
+            &TimedReveal {
+                reveal: REVEAL_B,
+                height: 100,
+                block_time: 1_000,
+            },
+            &action_id,
+            COMMIT_B,
+            REVEAL_B,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Conflict(ref m) if m == REVEAL_ALREADY_MINED),
+            "{err:?}"
+        );
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        assert_eq!(proposal.reveal_txid.as_deref(), Some(REVEAL_A));
+        assert_eq!(proposal.broadcast_attempts.len(), 1);
+    }
+
+    /// Stored anyway (the node could not answer at registration), a reveal mined long before the
+    /// pair was registered does not win. One mined afterwards does.
+    #[tokio::test]
+    async fn a_reveal_mined_long_before_it_was_registered_does_not_win() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+
+        let ancient = confirm_reveal_if_mined(
+            &repo,
+            proposal.clone(),
+            &TimedReveal {
+                reveal: REVEAL_B,
+                height: 100,
+                block_time: 1_000,
+            },
+            "mock://asm-membership",
+        )
+        .await;
+        assert_eq!(ancient.broadcast_status, BroadcastStatus::CommitBroadcasted);
+        assert_eq!(ancient.reveal_txid.as_deref(), Some(REVEAL_B));
+
+        let fresh = confirm_reveal_if_mined(
+            &repo,
+            proposal,
+            &TimedReveal {
+                reveal: REVEAL_B,
+                height: 800_010,
+                block_time: Utc::now().timestamp(),
+            },
+            "mock://asm-membership",
+        )
+        .await;
+        assert_eq!(fresh.broadcast_status, BroadcastStatus::RevealConfirmed);
+        assert_eq!(fresh.reveal_txid.as_deref(), Some(REVEAL_B));
+    }
+
+    /// The second pair failed before it was broadcast. The first one may still be in the mempool,
+    /// so the row goes back to it instead of `failed`.
+    #[tokio::test]
+    async fn a_failed_second_pair_puts_the_row_back_on_the_first() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+
+        let mut failed = report("failed", Some(COMMIT_B), Some(REVEAL_B));
+        failed.broadcast_error = Some("rejected".to_string());
+        let after = report_broadcast_progress(
+            &repo,
+            "mock://asm-membership",
+            session_of(&sig_b()),
+            &action_id,
+            &NodeView::default(),
+            failed,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(after.broadcast_status, BroadcastStatus::CommitBroadcasted);
+        assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_A));
+        assert_eq!(after.commit_txid.as_deref(), Some(COMMIT_A));
+        assert!(after.broadcast_error.is_none());
+        assert_eq!(after.broadcast_attempts.len(), 2);
+
+        // The only pair: `failed` still means failed.
+        let lone = new_repo();
+        let lone_id = save_with_pair_of_a(&lone).await;
+        let mut failed = report("failed", Some(COMMIT_A), Some(REVEAL_A));
+        failed.broadcast_error = Some("rejected".to_string());
+        let after = report_broadcast_progress(
+            &lone,
+            "mock://asm-membership",
+            session_of(&sig_a()),
+            &lone_id,
+            &mock_btc(),
+            failed,
+        )
+        .await
+        .unwrap();
+        assert_eq!(after.broadcast_status, BroadcastStatus::Failed);
+        assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_A));
     }
 
     // ── #605 against a real regtest bitcoind ───────────────────────────────

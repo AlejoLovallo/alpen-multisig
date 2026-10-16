@@ -1437,12 +1437,15 @@ fn claim_conflict_message(body: &str) -> String {
     // The orchestrator's refusals of another signer's pair (#605).
     const OWN_PAIR: &str = "you already sent a commit and reveal for this proposal";
     const NO_PAIR: &str = "no commit and reveal in flight to send another pair beside";
+    const ALREADY_MINED: &str = "this reveal is already in a block";
     if body.contains(GATE) {
         "A broadcast for this authority is already in flight.".to_string()
     } else if body.contains(OWN_PAIR) {
         "You already sent a commit and reveal for this proposal.".to_string()
     } else if body.contains(NO_PAIR) {
         "This proposal has no commit and reveal in flight to send yours beside.".to_string()
+    } else if body.contains(ALREADY_MINED) {
+        "This reveal is already in a block, so it cannot be sent for this proposal.".to_string()
     } else {
         format!("broadcast already in progress: {body}")
     }
@@ -4230,5 +4233,10 @@ mod tests {
         let other =
             r#"{"error":"conflict: proposal must be in 'approved' state","errorCode":"conflict"}"#;
         assert!(super::claim_conflict_message(other).contains("approved"));
+        let mined = r#"{"error":"conflict: this reveal is already in a block, so it cannot be a commit and reveal for this proposal","errorCode":"conflict"}"#;
+        assert_eq!(
+            super::claim_conflict_message(mined),
+            "This reveal is already in a block, so it cannot be sent for this proposal."
+        );
     }
 }

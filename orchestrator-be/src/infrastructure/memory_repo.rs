@@ -1,8 +1,9 @@
 //! In-memory proposal repository for POC and testing.
 
 use crate::application::proposals::{
-    broadcast_claim_allowed, decide_additional_pair, reports_tracked_pair, row_still_has_reveal,
-    AdditionalPair, BroadcastClaimFacts, AUTHORITY_IN_FLIGHT,
+    broadcast_claim_allowed, broadcast_write_for_report, decide_additional_pair,
+    reports_tracked_pair, row_still_has_reveal, AdditionalPair, BroadcastClaimFacts,
+    AUTHORITY_IN_FLIGHT,
 };
 use crate::application::traits::ProposalRepository;
 use crate::domain::authority::Authority;
@@ -276,13 +277,17 @@ impl ProposalRepository for InMemoryProposalRepository {
                     proposal.broadcast_attempts.push(attempt);
                 }
             }
+            // After the attempt is listed, so a failed second pair puts the row back on the
+            // earlier one (#605).
+            let write =
+                broadcast_write_for_report(proposal, status, commit_txid, reveal_txid, error);
             apply_broadcast_status(
                 proposal,
-                status,
+                write.status,
                 proposal_status,
-                commit_txid,
-                reveal_txid,
-                error,
+                write.commit_txid.as_deref(),
+                write.reveal_txid.as_deref(),
+                write.error.as_deref(),
             );
         }
         Ok(Some(proposal.clone()))
