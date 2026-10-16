@@ -643,6 +643,19 @@ pub async fn submit_commit_then_reveal(
         if let Some(txid) = unbroadcast_commit {
             commit_funding.release(txid);
         }
+        // Beside another signer's pair, the row is ours only while it tracks this pair (#605). The
+        // orchestrator also applies a report to a row with no pair — but that empty claim is
+        // another signer's, so ask first.
+        if report_failed && mode == SendMode::AdditionalPair {
+            let own_reveal = built_pair.as_ref().map(|(_, reveal)| reveal.as_str());
+            report_failed = match (own_reveal, client.get_proposal(action_id).await) {
+                (Some(own), Ok(row)) => row
+                    .reveal_txid
+                    .as_deref()
+                    .is_some_and(|tracked| tracked.eq_ignore_ascii_case(own)),
+                _ => false,
+            };
+        }
         if report_failed {
             let (commit_txid, reveal_txid) = match &built_pair {
                 Some((commit, reveal)) => (Some(commit.as_str()), Some(reveal.as_str())),
@@ -2586,9 +2599,17 @@ mod tests {
             unimplemented!()
         }
         async fn get_proposal(&self, action_id: &str) -> Result<OrcProposal, OrchestratorError> {
-            let (broadcast_status, reveal_txid) = match &self.row {
-                Some((status, reveal_txid)) => (status.to_string(), Some(reveal_txid.clone())),
-                None => ("idle".to_string(), None),
+            let registered = self
+                .registered
+                .lock()
+                .unwrap()
+                .last()
+                .map(|pair| pair.reveal_txid.clone());
+            let (broadcast_status, reveal_txid) = match (&self.row, registered) {
+                (Some((status, reveal_txid)), _) => (status.to_string(), Some(reveal_txid.clone())),
+                // A registration that landed, its answer lost or not, is the row's pair.
+                (None, Some(reveal_txid)) => ("commit_broadcasted".to_string(), Some(reveal_txid)),
+                (None, None) => ("idle".to_string(), None),
             };
             Ok(OrcProposal {
                 action_id: action_id.to_string(),
@@ -3331,6 +3352,42 @@ mod tests {
         );
         assert!(spy.recorded().is_empty(), "nothing was broadcast");
         assert!(pending.lock().unwrap().get("action-unanswered").is_none());
+    }
+
+    /// #605: a registration that got no answer and did not land leaves the row on another pair, or
+    /// on another signer's empty claim. `failed` is not reported: that row is not ours.
+    #[tokio::test]
+    async fn an_unanswered_registration_that_did_not_land_reports_nothing() {
+        use bitcoin::{Network, ScriptBuf};
+        use strata_l1_txfmt::MagicBytes;
+
+        let spy = SpyCommitFunding::new("ignored");
+        let mock_client = MockOrchestratorClientLargeAction {
+            row: Some(("commit_broadcasted", "someone-else".to_string())),
+            lost_registrations: Mutex::new(REPORT_ATTEMPTS),
+            ..MockOrchestratorClientLargeAction::default()
+        };
+        let pending = crate::application::pending_reveals::new();
+
+        let err = submit_commit_then_reveal(
+            &mock_client,
+            &ok_broadcasters(),
+            "mock://asm-membership",
+            MagicBytes::new([0x62, 0x74, 0x00, 0x00]),
+            Network::Regtest,
+            "action-not-landed",
+            crate::domain::fee_rate::FeeRate::from_raw_clamped(1_000),
+            &spy,
+            ScriptBuf::new(),
+            &pending,
+            &crate::infrastructure::admin_wallet::EnvelopeKeyCache::default(),
+            SendMode::AdditionalPair,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, BroadcastError::Orchestrator(_)), "{err:?}");
+        assert!(mock_client.reported_statuses().is_empty());
     }
 
     /// #605: the pre-registration answer is 200 but the row tracks another reveal (an import

@@ -162,7 +162,7 @@ Request body:
 
 - **No** `broadcast_tx` module or signing key in server config.
 - Application: `claim_broadcast_coordination`, `report_broadcast_progress`, `register_additional_pair`, `check_additional_pair` (#605).
-- Repository: `claim_broadcast`, `update_broadcast_status`.
+- Repository: `claim_broadcast`, `update_broadcast_status`, `register_additional_pair`, `update_reported_pair_status`, `confirm_tracked_reveal` (#605).
 - Bitcoin RPC on server: `/ready` health check only.
 
 ### Desktop Tauri (`desktop-app/src-tauri`)
@@ -515,8 +515,9 @@ acts on; the others are refused on the sequence number and cost only their fees.
   registered through the endpoint above instead of the pre-registration report — retried (3 attempts)
   like that report, except on a `409`, which is a decided refusal — and nothing is reported on the row
   while the answer is a refusal, so the other signer's pair is untouched. A registration whose answer
-  never came back may have landed: the send reports `failed` naming its pair, which the orchestrator
-  applies only if the row tracks that pair. The same holds for a claim's lost pre-registration. Build,
+  never came back may have landed: the send reads the row, and reports `failed` naming its pair only
+  when the row tracks that pair — an empty claim at that point is another signer's. A claim's lost
+  pre-registration reports `failed` naming its pair directly: the claimed row is its own. Build,
   reservation, `PendingReveals`, broadcast and settle are unchanged. The detail screen reads again every
   10 s whether this desktop still holds a bundle, since the settle loop can drop one without the row
   changing.
@@ -524,7 +525,9 @@ acts on; the others are refused on the sequence number and cost only their fees.
   after `failed` leaves the earlier attempt listed, so the new pair is not a lone pair: the node decides
   with `-txindex`, and without it the desktop's report is taken, as above. The pre-check and the
   registration are two calls: the row can move between them, and the registration then refuses after
-  the device signed. A bundle import reports with the importer's session: on an empty claim it tags the
+  the device signed. The per-signer limit counts every pair listed, including a pre-registered pair
+  whose broadcast the node refused: a signer whose sends failed three times cannot send this proposal
+  again, and another signer has to. A bundle import reports with the importer's session: on an empty claim it tags the
   row and lists the pair under the importer. Without `-txindex` the node cannot answer that a commit is nowhere, so a signer
   whose pair was dropped cannot send another: when the row tracks a pair whose sender's desktop died
   before broadcasting it and every other pair was dropped, only a signer who has sent no pair can move
