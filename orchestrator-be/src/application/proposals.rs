@@ -937,8 +937,10 @@ enum Payload {
 /// configuration of that moment (keys in index order, threshold). After: the role's `last_seqno`
 /// reached it, and the action left the trace the ASM leaves — an update with a confirmation depth
 /// queued to activate at `height + depth`; a cancel's target, queued before, gone. A reveal the ASM
-/// rejected (out of the window, signatures that fail, a sequence number another action took first)
-/// leaves none of it.
+/// rejected for its window or its signatures leaves none of it. The two states cannot show what
+/// happened *inside* the block: another action of the same role in it — one that took the sequence
+/// number first, or a queued update that matured first — can lend a rejected reveal its effect (the
+/// spec's accepted limits).
 fn asm_executed(
     before: &RoleAtBlock,
     after: &RoleAtBlock,
@@ -1238,14 +1240,18 @@ async fn confirm_reveal_if_mined(
         .proposal
 }
 
-/// Whether the orchestrator's node has seen every block the ASM has processed (#605).
+/// Whether the node had seen every block the ASM has processed (#605): its tip read *before* the
+/// reveal lookups against the ASM's height read now, after them. The ASM only moves forward, so
+/// this covers every block it had when the caller read its sequence number; a node that caught up
+/// during the lookups does not pass for one that answered with those blocks.
 async fn node_caught_up_with_asm(
-    btc_client: &dyn BitcoinRpcClient,
+    tip_before_lookups: Result<u64, AppError>,
     asm_rpc_url: &str,
 ) -> Result<bool, AppError> {
+    let tip = tip_before_lookups?;
     let asm_height =
         crate::infrastructure::asm_role_membership::asm_processed_height(asm_rpc_url).await?;
-    Ok(btc_client.get_chain_tip().await? >= asm_height)
+    Ok(tip >= asm_height)
 }
 
 /// The proposal after [`confirm_reveal_if_mined`], and whether the node and the ASM answered
@@ -1285,6 +1291,10 @@ async fn try_confirm_reveal(
     // leaves in place. The write applies only while the row still tracks the reveal this read
     // observed: a pair registered in between is left for the next reconcile, which sees both
     // (#605).
+    // The node's tip before it is asked about the reveals: "not mined" below is an answer only if
+    // the node already had every block the ASM had processed by the time the caller read its
+    // sequence number.
+    let tip_before_lookups = btc_client.get_chain_tip().await;
     let (commit_txid, reveal_txid) = match first_mined_pair(&proposal, btc_client, asm_rpc_url)
         .await
     {
@@ -1310,7 +1320,7 @@ async fn try_confirm_reveal(
             // "Not mined" is an answer only from a node that has seen every block the ASM has
             // processed: one behind it would read an executed reveal as unmined, and the sweep
             // would retire the proposal it carried.
-            return match node_caught_up_with_asm(btc_client, asm_rpc_url).await {
+            return match node_caught_up_with_asm(tip_before_lookups, asm_rpc_url).await {
                 Ok(true) => decided(proposal),
                 Ok(false) => {
                     tracing::warn!(
