@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
 use crate::application::proposals::{
-    broadcast_write_for_report, decide_additional_pair, exceeds_pair_limit, reports_tracked_pair,
-    AdditionalPair, AUTHORITY_IN_FLIGHT, PAIR_LIMIT_REACHED,
+    broadcast_write_for_report, decide_additional_pair, report_effect, AdditionalPair,
+    AUTHORITY_IN_FLIGHT,
 };
 use crate::application::traits::ProposalRepository;
 use crate::domain::authority::Authority;
@@ -615,8 +615,8 @@ impl ProposalRepository for PostgresProposalRepository {
     ) -> Result<Option<Proposal>, AppError> {
         let proposal_status_db = proposal_status.map(status_to_db);
 
-        // One transaction: the pair is inserted only when this same write applies. A report that
-        // read an empty claim and lost the race must not leave its reveal listed (#605).
+        // One transaction, under the row lock: what the report does is decided against the row as
+        // it stands now (#605).
         let mut tx = self
             .pool
             .begin()
@@ -635,19 +635,20 @@ impl ProposalRepository for PostgresProposalRepository {
         };
         let mut current = row_to_proposal_no_sigs(&row, action_id.0.clone())?;
         current.broadcast_attempts = load_broadcast_attempts(&mut *tx, &action_id.0).await?;
-        if !reports_tracked_pair(reveal_txid, current.reveal_txid.as_deref()) {
-            drop(tx);
-            return self.find_by_action_id(action_id).await;
-        }
-
-        if attempt
-            .as_ref()
-            .is_some_and(|attempt| exceeds_pair_limit(&current, attempt))
-        {
-            drop(tx);
-            return Err(AppError::Conflict(PAIR_LIMIT_REACHED.to_string()));
-        }
-        if let Some(attempt) = attempt {
+        let effect = match report_effect(
+            &current,
+            reveal_txid,
+            status,
+            proposal_status,
+            attempt.as_ref(),
+        ) {
+            Ok(effect) => effect,
+            Err(refusal) => {
+                drop(tx);
+                return Err(AppError::Conflict(refusal.to_string()));
+            }
+        };
+        if let Some(attempt) = attempt.filter(|_| effect.lists_pair) {
             // Txids arrive lowercase. The case-sensitive primary key keeps a pair once.
             sqlx::query(
                 r#"
@@ -673,6 +674,12 @@ impl ProposalRepository for PostgresProposalRepository {
             if !kept {
                 current.broadcast_attempts.push(attempt);
             }
+        }
+        if !effect.moves_row {
+            tx.commit()
+                .await
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to commit tx: {e}")))?;
+            return self.find_by_action_id(action_id).await;
         }
 
         // A failed report for the tracked pair puts the row back on an earlier live one (#605).
@@ -716,6 +723,7 @@ impl ProposalRepository for PostgresProposalRepository {
                 broadcast_error = NULL,
                 updated_at = NOW()
             WHERE action_id = $1
+              AND status = 'approved'
               AND broadcast_status IN (
                     'commit_broadcasted', 'commit_confirmed', 'reveal_broadcasted', 'failed'
                   )
@@ -973,7 +981,7 @@ mod tests {
             "{err:?}"
         );
 
-        // A report about the replaced pair changes nothing, and an unknown pair is not listed.
+        // A report about the replaced pair does not move the row.
         let after = repo
             .update_reported_pair_status(
                 &action_id,
@@ -1005,7 +1013,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(reveals(&after), [REVEAL_A, REVEAL_B]);
+        // The row stays on B; the reported pair is listed beside it.
+        assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_B));
+        assert_eq!(reveals(&after), [REVEAL_A, REVEAL_B, REVEAL_C]);
 
         // The listing carries every pair.
         let listed = repo
@@ -1016,7 +1026,7 @@ mod tests {
             .iter()
             .find(|proposal| proposal.action_id == action_id)
             .expect("listed");
-        assert_eq!(reveals(mine), [REVEAL_A, REVEAL_B]);
+        assert_eq!(reveals(mine), [REVEAL_A, REVEAL_B, REVEAL_C]);
 
         // A confirmation decided against a row that moved on does not apply; one that did, does.
         let stale = repo

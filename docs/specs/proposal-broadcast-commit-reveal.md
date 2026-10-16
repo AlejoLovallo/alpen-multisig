@@ -428,20 +428,19 @@ acts on; the others are refused on the sequence number and cost only their fees.
   the new pair, `commit_broadcasted`, claim time now, error cleared — under a row lock. From there
   the new sender's desktop reports on the row as any claimer would; the per-authority gate is
   unchanged, since this proposal is already the authority's in-flight one.
-- **Reports about a replaced pair do not move the row.** A `PATCH` whose `reveal_txid` differs from the
-  row's leaves the status, txids and error as they are: the earlier sender's settle loop would otherwise
-  mark the new pair `failed` or move its status. Its pair is not recorded either: every pair of the
-  proposal was already recorded while the row tracked it, or registered, and the import screen reports
-  any bundle against the open proposal, so an unknown pair may belong to another action and must not be
-  able to confirm this one. A `PATCH` that names no reveal does not change a row that already
-  tracks one (an untagged claim still accepts it — that is the pre-registration). The comparison is made
-  in the write itself (`update_reported_pair_status`, a conditional `UPDATE`), so a pair registered after
-  the report read the row is not overwritten either. The pair is inserted in that same write, and only
-  when the update applies: a report that read an empty claim and lost the race is not listed. Txids are
-  stored lowercase. The desktop already
-  reports only to a row that carries its own reveal txid (`BundleRow::Ours`), and a `failed` report now
-  names its pair. A pre-registration is a success only when the response still tracks that reveal; a
-  200 that tracks another pair aborts the send before anything is broadcast and reports nothing.
+- **Reports about a replaced pair do not move the row; their pair is listed.** A `PATCH` whose
+  `reveal_txid` differs from the row's leaves the status, txids and error as they are: the earlier
+  sender's settle loop would otherwise mark the new pair `failed` or move its status. Its pair is listed
+  beside the tracked one (within the per-signer limit, and not for a `failed` report): a pair sent by
+  the manual fallback and imported later may be the reveal the ASM executed, and the reconcile counts
+  only a reveal of this proposal that the ASM executed — a pair of another action is listed and never
+  counts. A `PATCH` that names no reveal does not change a row that already tracks one (an untagged
+  claim still accepts it — that is the pre-registration). What a report does is decided in the write
+  itself (`report_effect`, under the row lock), so a pair registered or a confirmation made after the
+  report read the row is not overwritten. Txids are stored lowercase. The desktop already reports only
+  to a row that carries its own reveal txid (`BundleRow::Ours`), and a `failed` report now names its
+  pair. A pre-registration is a success only when the response still tracks that reveal; a 200 that
+  tracks another pair aborts the send before anything is broadcast and reports nothing.
 - **Only a reveal the ASM executed counts.** Registration takes any well-formed txids, so the
   reconcile checks every mined reveal it considers in two steps.
   - *It is this proposal's* (`proposal_payload`): its first output carries the SPS-50 tag of the
@@ -466,9 +465,14 @@ acts on; the others are refused on the sequence number and cost only their fees.
   has not processed the reveal's block yet, or cannot answer — like a node lookup that fails — makes
   the read inconclusive: the row is left for the next read, and that read neither decides enactment
   nor retires the proposal (the reveal it could not judge may be the one that took the sequence
-  number). A
-  pair first reported after it was mined (the manual fallback, imported later) still counts: what
-  the ASM did decides, not when it was registered.
+  number). A reveal the ASM executed decides even when the node or the ASM could not answer about
+  another listed pair: the ASM executes one reveal per sequence number. A reveal that carries this
+  proposal without the administration tag under the configured magic bytes is an open question too —
+  a transaction the ASM never saw, or `BITCOIN_MAGIC_BYTES_HEX` set to another network's — and is
+  logged as an error. A pair first reported after it was mined (the manual fallback, imported later)
+  still counts: what the ASM did decides, not when it was registered. The orchestrator's node and the
+  ASM runner should follow the same chain (the ASM's node, or one at or behind it): a reveal the ASM
+  executed but this node does not yet see reads as not mined.
 - **A failed pair falls back only to a live one.** A `failed` report for the pair the row tracks,
   when another pair is listed, sets the row back to the newest other pair that may still be on its
   way, at `commit_broadcasted`, and clears the error. Only a pair whose commit the node answers is
@@ -500,9 +504,10 @@ acts on; the others are refused on the sequence number and cost only their fees.
   Staging (`staging/entrypoint-bitcoin.sh`, Core 29.0) and `scripts/bitcoind-asm-runner.sh` set it;
   see the runbook for other deployments.
 - **A settled proposal takes no broadcast report.** A report that would move a `reveal_confirmed`
-  row back (a `failed`, an earlier status) is ignored: its pair is the one the ASM executed. So is any
+  row back (a `failed`, an earlier status) leaves it: its pair is the one the ASM executed. So does any
   broadcast report on a proposal that is no longer `approved` (unless it asks for a proposal status),
-  since nothing revisits such a row to repair it.
+  since nothing revisits such a row to repair it. Decided in the write (`report_effect`), and a
+  confirmation applies only to an approved proposal (`confirm_tracked_reveal`).
 - **Watchers stop on a confirmed row, not on a 200.** The desktop's settle loop and the send screen's
   poll report `reveal_confirmed` and stop only once the row they get back says `reveal_confirmed`;
   otherwise the bundle stays tracked and the next check reports again. The send screen watches the
@@ -518,9 +523,11 @@ acts on; the others are refused on the sequence number and cost only their fees.
 - **An import names the pair it updates.** The import modal sends a txid the row already has when
   the bundle also advances the broadcast status: a report that names no reveal does not move a row
   that tracks one.
-- **The import says when it was ignored.** A `PATCH` about a pair the row does not track still answers
-  `200`; the detail screen compares the reveal it imported with the one the row tracks and shows a notice
-  when they differ — including an import that named no reveal while the row tracks one.
+- **The import says what happened.** A `PATCH` about a pair the row does not track still answers
+  `200`; the detail screen compares the reveal it imported with the one the row tracks (`importNotice`)
+  and says the pair was kept beside the tracked one, confirmed only if it is the reveal the ASM
+  executed — or, for an import that named no reveal while the row tracks one, that nothing was
+  recorded.
 - **Desktop.** The detail screen offers *Send your own commit + reveal* under the in-flight stage
   (`canSendAdditionalPair`) — to a signer with no pair, or to one whose earlier pair this desktop no
   longer keeps (`proposals_has_stored_bundle`), and never when the orchestrator sends no

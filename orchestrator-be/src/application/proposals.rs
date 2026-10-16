@@ -533,6 +533,57 @@ pub(crate) fn reports_tracked_pair(
     }
 }
 
+/// What a desktop's report does, decided by both repositories under their lock (#605).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReportEffect {
+    /// The report moves the row: status, txids, error.
+    pub moves_row: bool,
+    /// The report's pair is added to the listed pairs.
+    pub lists_pair: bool,
+}
+
+/// What a report naming `reported_reveal` does to `current` (#605).
+///
+/// It moves the row only when it names the pair the row tracks (or tags an empty claim), the row
+/// is not confirmed already — a confirmed pair is the one the ASM executed, and a `failed` or an
+/// earlier status would put a loser in its place — and the proposal is still approved, unless the
+/// report asks for a proposal status. Its pair is listed whenever the proposal is approved, even
+/// beside the tracked one: a pair sent by the manual fallback and imported later may be the one the
+/// ASM executed, and the reconcile counts only a reveal it did. A pair that would take its signer
+/// past [`MAX_PAIRS_PER_SIGNER`] is refused when the report would move the row (a
+/// pre-registration), and otherwise just not listed.
+pub(crate) fn report_effect(
+    current: &Proposal,
+    reported_reveal: Option<&str>,
+    status: BroadcastStatus,
+    proposal_status: Option<ProposalStatus>,
+    attempt: Option<&BroadcastAttempt>,
+) -> Result<ReportEffect, &'static str> {
+    let approved = current.status == ProposalStatus::Approved;
+    let settled = (current.broadcast_status == BroadcastStatus::RevealConfirmed
+        && status != BroadcastStatus::RevealConfirmed)
+        || (!approved && proposal_status.is_none());
+    let moves_row =
+        reports_tracked_pair(reported_reveal, current.reveal_txid.as_deref()) && !settled;
+    let lists_pair = match attempt {
+        Some(attempt) if approved => {
+            if exceeds_pair_limit(current, attempt) {
+                if moves_row {
+                    return Err(PAIR_LIMIT_REACHED);
+                }
+                false
+            } else {
+                true
+            }
+        }
+        _ => false,
+    };
+    Ok(ReportEffect {
+        moves_row,
+        lists_pair,
+    })
+}
+
 /// Whether the row still carries the reveal a reconcile observed (#605). Either side moving on
 /// means the decision was made against a row that no longer exists, and the next read decides.
 pub(crate) fn row_still_has_reveal(observed: Option<&str>, tracked: Option<&str>) -> bool {
@@ -621,7 +672,8 @@ fn tx_nowhere(result: &Result<u64, AppError>) -> bool {
     match result {
         Err(AppError::BadRequest(message)) => {
             let message = message.to_ascii_lowercase();
-            message.contains("no such mempool or blockchain transaction")
+            (message.contains("no such mempool or blockchain transaction")
+                || message.contains("genesis block coinbase"))
                 && !message.contains("being indexed")
         }
         _ => false,
@@ -837,25 +889,44 @@ fn node_has_no_txindex(message: &str) -> bool {
 /// transaction), and its envelope decodes (`strata_asm_txs_admin::parser::parse_tx`) to this
 /// proposal's sequence number and action. Like the ASM, it does not ask which commit the reveal
 /// spends: the reconcile records the one it does.
-/// `None` otherwise. Whether the ASM *accepted* it is [`asm_executed`]'s call.
-fn proposal_payload(
-    reveal: &bitcoin::Transaction,
-    proposal: &Proposal,
-    magic: [u8; 4],
-) -> Option<strata_asm_txs_admin::parser::SignedPayload> {
+/// Whether the ASM *accepted* it is [`asm_executed`]'s call.
+fn proposal_payload(reveal: &bitcoin::Transaction, proposal: &Proposal, magic: [u8; 4]) -> Payload {
     use ssz::{Decode, Encode};
-    let tag = strata_l1_txfmt::ParseConfig::new(strata_l1_txfmt::MagicBytes::new(magic))
+    let carried = (|| {
+        let leaf = reveal.input.first()?.witness.taproot_leaf_script()?;
+        let payload =
+            strata_l1_envelope_fmt::parser::parse_envelope_payload(&leaf.script.into()).ok()?;
+        let signed = strata_asm_txs_admin::parser::SignedPayload::from_ssz_bytes(&payload).ok()?;
+        let action = hex::decode(&proposal.action_hex).ok()?;
+        (signed.seqno == proposal.seq_no && signed.action.as_ssz_bytes() == action)
+            .then_some(signed)
+    })();
+    let Some(signed) = carried else {
+        return Payload::Foreign;
+    };
+    let tagged = strata_l1_txfmt::ParseConfig::new(strata_l1_txfmt::MagicBytes::new(magic))
         .try_parse_tx(reveal)
-        .ok()?;
-    if tag.subproto_id() != strata_asm_txs_admin::constants::ADMINISTRATION_SUBPROTOCOL_ID {
-        return None;
+        .is_ok_and(|tag| {
+            tag.subproto_id() == strata_asm_txs_admin::constants::ADMINISTRATION_SUBPROTOCOL_ID
+        });
+    if tagged {
+        Payload::Carries(signed)
+    } else {
+        Payload::Untagged
     }
-    let leaf = reveal.input.first()?.witness.taproot_leaf_script()?;
-    let payload =
-        strata_l1_envelope_fmt::parser::parse_envelope_payload(&leaf.script.into()).ok()?;
-    let signed = strata_asm_txs_admin::parser::SignedPayload::from_ssz_bytes(&payload).ok()?;
-    let action = hex::decode(&proposal.action_hex).ok()?;
-    (signed.seqno == proposal.seq_no && signed.action.as_ssz_bytes() == action).then_some(signed)
+}
+
+/// What a mined reveal carries, as [`proposal_payload`] reads it (#605).
+#[derive(Debug)]
+enum Payload {
+    /// This proposal's signed payload, tagged for the ASM.
+    Carries(strata_asm_txs_admin::parser::SignedPayload),
+    /// This proposal's payload without the administration tag under the configured magic bytes:
+    /// either a transaction the ASM never saw, or `BITCOIN_MAGIC_BYTES_HEX` set to another network's.
+    /// The orchestrator cannot tell which, so it does not decide on it.
+    Untagged,
+    /// Not this proposal's payload at all.
+    Foreign,
 }
 
 /// Whether the ASM executed `signed`, carried by a reveal mined at `height`, judged from the role
@@ -974,6 +1045,7 @@ fn reveal_not_in_a_block(message: &str) -> bool {
     message.contains("not yet confirmed")
         || message.contains("no such mempool or blockchain transaction")
         || message.contains("no such transaction")
+        || message.contains("genesis block coinbase")
 }
 
 /// What the node says about every pair of a proposal (#605).
@@ -1026,82 +1098,101 @@ async fn first_mined_pair(
     });
     let answers = futures::future::join_all(lookups).await;
 
-    let mut mined: Vec<(u64, String, &str)> = Vec::new();
+    // Reveals the ASM executed, judged from its own state; and reveals a test double reports mined
+    // without the transaction, which cannot be judged.
+    let mut executed: Vec<(u64, String, &str)> = Vec::new();
+    let mut unjudged: Vec<(u64, String, &str)> = Vec::new();
+    let mut unknown = false;
     let mut not_indexed = false;
     for ((commit, reveal), answer) in candidates.iter().zip(answers) {
-        match answer {
-            RevealHeight::Mined { height, tx, block } => {
-                // The commit is the one the mined reveal spends, whatever was listed with it — a
-                // row tagged with its reveal only (a partial import) included. A test double that
-                // reads no transaction takes the listed one.
-                let commit = match (tx.as_ref().and_then(|tx| tx.input.first()), commit) {
-                    (Some(input), _) => input.previous_output.txid.to_string(),
-                    (None, Some(commit)) => commit.to_string(),
-                    (None, None) => continue,
-                };
-                // `None` only from a test double that reads no transaction.
-                let Some(tx) = tx else {
-                    mined.push((height, commit, reveal));
-                    continue;
-                };
-                let Some(signed) = proposal_payload(&tx, proposal, btc_client.magic_bytes()) else {
-                    tracing::warn!(
-                        action_id = %proposal.action_id.0,
-                        reveal,
-                        "a listed reveal is mined but does not carry this proposal; ignored"
-                    );
-                    continue;
-                };
-                let Some(block) = block else {
-                    return MinedPair::Unknown;
-                };
-                match role_around_block(
-                    asm_rpc_url,
-                    &signed.action,
-                    signed.seqno,
-                    height,
-                    &block.hash,
-                    &block.parent_hash,
-                )
-                .await
-                {
-                    Ok(Some((before, after))) if asm_executed(&before, &after, &signed, height) => {
-                        mined.push((height, commit, reveal));
-                    }
-                    Ok(Some(_)) => {
-                        tracing::warn!(
-                            action_id = %proposal.action_id.0,
-                            reveal,
-                            "a listed reveal is mined but the ASM did not execute it; ignored"
-                        );
-                    }
-                    // The ASM has not processed that block yet.
-                    Ok(None) => return MinedPair::Unknown,
-                    Err(e) => {
-                        tracing::warn!(
-                            action_id = %proposal.action_id.0,
-                            "reconcile: ASM state around the reveal's block unavailable: {e}"
-                        );
-                        return MinedPair::Unknown;
-                    }
-                }
+        let (height, tx, block) = match answer {
+            RevealHeight::Mined { height, tx, block } => (height, tx, block),
+            RevealHeight::Unmined => continue,
+            RevealHeight::NotIndexed => {
+                not_indexed = true;
+                continue;
             }
-            RevealHeight::Unmined => {}
-            RevealHeight::NotIndexed => not_indexed = true,
-            RevealHeight::Unknown => return MinedPair::Unknown,
+            RevealHeight::Unknown => {
+                unknown = true;
+                continue;
+            }
+        };
+        // The commit is the one the mined reveal spends, whatever was listed with it — a row tagged
+        // with its reveal only (a partial import) included. A test double that reads no
+        // transaction takes the listed one.
+        let commit = match (tx.as_ref().and_then(|tx| tx.input.first()), commit) {
+            (Some(input), _) => input.previous_output.txid.to_string(),
+            (None, Some(commit)) => commit.to_string(),
+            (None, None) => continue,
+        };
+        let Some(tx) = tx else {
+            unjudged.push((height, commit, reveal));
+            continue;
+        };
+        let signed = match proposal_payload(&tx, proposal, btc_client.magic_bytes()) {
+            Payload::Carries(signed) => signed,
+            Payload::Foreign => continue,
+            Payload::Untagged => {
+                tracing::error!(
+                    action_id = %proposal.action_id.0,
+                    reveal,
+                    "a listed reveal carries this proposal but not the administration tag under \
+                     the configured magic bytes; check BITCOIN_MAGIC_BYTES_HEX"
+                );
+                unknown = true;
+                continue;
+            }
+        };
+        let Some(block) = block else {
+            unknown = true;
+            continue;
+        };
+        match role_around_block(
+            asm_rpc_url,
+            &signed.action,
+            signed.seqno,
+            height,
+            &block.hash,
+            &block.parent_hash,
+        )
+        .await
+        {
+            Ok(Some((before, after))) if asm_executed(&before, &after, &signed, height) => {
+                executed.push((height, commit, reveal));
+            }
+            Ok(Some(_)) => {
+                tracing::warn!(
+                    action_id = %proposal.action_id.0,
+                    reveal,
+                    "a listed reveal is mined but the ASM did not execute it; ignored"
+                );
+            }
+            // The ASM has not processed that block yet.
+            Ok(None) => unknown = true,
+            Err(e) => {
+                tracing::warn!(
+                    action_id = %proposal.action_id.0,
+                    "reconcile: ASM state around the reveal's block unavailable: {e}"
+                );
+                unknown = true;
+            }
         }
     }
-    let Some(lowest) = mined.iter().map(|(height, _, _)| *height).min() else {
-        return if not_indexed {
-            MinedPair::NotIndexed
-        } else {
-            MinedPair::None
-        };
-    };
-    // A pair the node cannot look up may have been mined lower than the one it found.
-    if not_indexed {
+
+    // The ASM executes one reveal per sequence number: one it did execute decides, whatever the
+    // node or the ASM could not say about the others. Without one, an open question is open.
+    let mined = if !executed.is_empty() {
+        executed
+    } else if unknown {
+        return MinedPair::Unknown;
+    } else if not_indexed {
         return MinedPair::NotIndexed;
-    }
+    } else {
+        unjudged
+    };
+    let Some(lowest) = mined.iter().map(|(height, _, _)| *height).min() else {
+        return MinedPair::None;
+    };
     let mut first: Vec<(String, &str)> = mined
         .into_iter()
         .filter(|(height, _, _)| *height == lowest)
@@ -1713,15 +1804,12 @@ pub(crate) async fn report_broadcast_progress(
         .as_deref()
         .map(|txid| txid.to_ascii_lowercase());
 
-    // A report about a pair the row does not track changes nothing (#605): its `failed` or
-    // `reveal_broadcasted` would overwrite the pair now in flight, and its txids are not recorded
-    // either — the import screen reports any bundle against the open proposal, so they may belong
-    // to another action. Every pair of this proposal is already listed: it was reported while the
-    // row tracked it, or registered. A report that names no reveal does not qualify either, once
-    // the row is tagged. Checked here to skip the work, and again in the write: a pair that lands
-    // after this read, including one that tags an empty claim, is not overwritten and not listed.
-    // A report about the pair the row tracks cannot change its commit: the reconcile checks that
-    // the mined reveal spends it, and a wrong one would leave a winning pair unconfirmed (#605).
+    // A report about a pair the row does not track does not move the row (#605): its `failed` or
+    // `reveal_broadcasted` would overwrite the pair now in flight. Its pair is still listed — a
+    // pair sent by the manual fallback and imported later may be the one the ASM executed, and the
+    // reconcile counts only a reveal it did. What the report does is decided in the write, under
+    // the row lock (`report_effect`). A report about the pair the row tracks keeps the row's commit:
+    // only the reveal identifies the pair.
     let commit_txid = match (&raw.commit_txid, &raw.reveal_txid, reveal_txid.as_deref()) {
         (Some(tracked_commit), Some(tracked), Some(reported))
             if tracked.eq_ignore_ascii_case(reported) =>
@@ -1739,25 +1827,9 @@ pub(crate) async fn report_broadcast_progress(
         ))
     })?;
     let requested_status = requested_proposal_status(body.proposal_status.as_deref())?;
-    if !reports_tracked_pair(reveal_txid.as_deref(), raw.reveal_txid.as_deref()) {
-        log_report_for_replaced_pair(action_id, reveal_txid.as_deref(), &raw);
-        return Ok(raw);
-    }
-    // A confirmed row only moves forward: its pair is the one the ASM executed, and a `failed` or
-    // an earlier status would put a losing pair back in its place (#605). A proposal that is no
-    // longer approved has its broadcast settled; nothing revisits it to repair a late report.
-    let moves_back = raw.broadcast_status == BroadcastStatus::RevealConfirmed
-        && broadcast_status != BroadcastStatus::RevealConfirmed;
-    let closed = raw.status != ProposalStatus::Approved && requested_status.is_none();
-    if moves_back || closed {
-        tracing::info!(
-            action_id = %action_id.0,
-            reported = %broadcast_status,
-            current = %raw.broadcast_status,
-            "broadcast report for a settled proposal; left unchanged"
-        );
-        return Ok(raw);
-    }
+    // A proposal status rides only on a report about the tracked pair.
+    let tracked = reports_tracked_pair(reveal_txid.as_deref(), raw.reveal_txid.as_deref());
+    let requested_status = requested_status.filter(|_| tracked);
 
     // Which reveal confirmed, and whether the ASM can accept it, is the node's and the role's call,
     // never the report's (#605): a member can get a reveal mined that carries this action with
@@ -1811,8 +1883,7 @@ pub(crate) async fn report_broadcast_progress(
         Some(RequestedProposalStatus::Expired) => Some(ProposalStatus::Expired),
     };
 
-    // Listed in the same write as the status, and only when that write applies (#605). A `failed`
-    // report lists nothing: a pair that reached the orchestrator is listed already, and one whose
+    // Listed in the same write as the status (#605). A `failed` report lists nothing: a pair that reached the orchestrator is listed already, and one whose
     // pre-registration never landed was never broadcast.
     let attempt = if broadcast_status == BroadcastStatus::Failed {
         None
@@ -1839,12 +1910,13 @@ pub(crate) async fn report_broadcast_progress(
         )
         .await?
         .ok_or(AppError::NotFound)?;
+    // A pair reported mined — the tracked one, or one just listed beside it — is judged now.
+    if confirming {
+        return Ok(confirm_reveal_if_mined(repo, updated, btc_client, asm_rpc_url).await);
+    }
     if !reports_tracked_pair(reveal_txid.as_deref(), updated.reveal_txid.as_deref()) {
         log_report_for_replaced_pair(action_id, reveal_txid.as_deref(), &updated);
         return Ok(updated);
-    }
-    if confirming {
-        return Ok(confirm_reveal_if_mined(repo, updated, btc_client, asm_rpc_url).await);
     }
 
     if updated.broadcast_status == BroadcastStatus::RevealConfirmed && !updated.is_cancel() {
@@ -4675,10 +4747,10 @@ mod tests {
     }
 
     /// The import read an empty claim, then the claimer's pre-registration tagged the row before
-    /// the import wrote. The write must not list the imported reveal: it may belong to another
-    /// action, and the reconcile would confirm this proposal on it (#605).
+    /// the import wrote. The write leaves the row on the tracked pair, and only lists the imported
+    /// one: the reconcile counts it only if the ASM executed it (#605).
     #[tokio::test]
-    async fn a_report_the_write_rejects_is_not_recorded() {
+    async fn a_report_the_write_does_not_apply_only_lists_its_pair() {
         let repo = new_repo();
         let action_id = save_with_pair_of_a(&repo).await;
         register_pair_of_b(&repo, &action_id).await.unwrap();
@@ -4710,7 +4782,7 @@ mod tests {
             .iter()
             .map(|attempt| attempt.reveal_txid.as_str())
             .collect();
-        assert_eq!(reveals, [REVEAL_A, REVEAL_B]);
+        assert_eq!(reveals, [REVEAL_A, REVEAL_B, REVEAL_C]);
     }
 
     const DROPPED_FOR_TEST: &str = "dropped";
@@ -4804,11 +4876,11 @@ mod tests {
         assert!(stored.activation_height.is_none());
     }
 
-    /// The import screen reports any bundle against the open proposal, so an untracked pair may
-    /// belong to another action. Recording it would let the reconcile confirm this proposal on a
-    /// reveal mined for that other action.
+    /// A report about a pair the row does not track leaves the row where it is, and lists the pair:
+    /// it may have been sent by the manual fallback. One that belongs to another action is listed
+    /// too, and never counts — the reconcile takes only a reveal of this proposal the ASM executed.
     #[tokio::test]
-    async fn a_report_about_an_untracked_pair_changes_nothing() {
+    async fn a_report_about_an_untracked_pair_only_lists_it() {
         let repo = new_repo();
         let action_id = save_with_pair_of_a(&repo).await;
         register_pair_of_b(&repo, &action_id).await.unwrap();
@@ -4818,20 +4890,25 @@ mod tests {
             "mock://asm-membership",
             session_of(&sig_a()),
             &action_id,
-            &mock_btc(),
+            &NodeView::default(),
             report("reveal_confirmed", Some(COMMIT_C), Some(REVEAL_C)),
         )
         .await
         .unwrap();
         assert_eq!(after.broadcast_status, BroadcastStatus::CommitBroadcasted);
         assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_B));
-        assert_eq!(
-            after.broadcast_attempts.len(),
-            2,
-            "the pair is not recorded"
-        );
+        assert_eq!(after.broadcast_attempts.len(), 3, "the pair is listed");
 
-        let btc = MinedTxids([(REVEAL_C, 800_005)].into_iter().collect());
+        // Mined, but a reveal of another action: it never counts.
+        let btc = MinedReveals(vec![(
+            REVEAL_C,
+            800_005,
+            envelope_reveal(
+                COMMIT_C,
+                1,
+                &crate::infrastructure::action_codec::test_fixture_council_rotation_action_hex(),
+            ),
+        )]);
         let reconciled = confirm_reveal_if_mined(&repo, after, &btc, "mock://asm-membership").await;
         assert_eq!(
             reconciled.broadcast_status,
@@ -5469,8 +5546,14 @@ mod tests {
         let action_id = save_with_pair_of_a(&repo).await;
         let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
         assert_eq!(proposal.seq_no, 1);
-        let carries =
-            |reveal: &bitcoin::Transaction| proposal_payload(reveal, &proposal, *b"ALPN").is_some();
+        let read = |reveal: &bitcoin::Transaction, magic: &[u8; 4]| match proposal_payload(
+            reveal, &proposal, *magic,
+        ) {
+            Payload::Carries(_) => "carries",
+            Payload::Untagged => "untagged",
+            Payload::Foreign => "foreign",
+        };
+        let carries = |reveal: &bitcoin::Transaction| read(reveal, b"ALPN") == "carries";
         let reveal = envelope_reveal(COMMIT_B, 1, &test_fixture_action_hex());
         assert!(carries(&reveal));
         let other_seq_no = envelope_reveal(COMMIT_B, 2, &test_fixture_action_hex());
@@ -5493,13 +5576,11 @@ mod tests {
             bitcoin::ScriptBuf::new(),
             1_000,
         );
-        assert!(!carries(&reveal), "untagged");
+        assert_eq!(read(&reveal, b"ALPN"), "untagged");
         // Tagged, but under other magic bytes than the network's.
         let tagged = envelope_reveal(COMMIT_B, 1, &test_fixture_action_hex());
-        assert!(
-            proposal_payload(&tagged, &proposal, *b"TEST").is_none(),
-            "wrong magic"
-        );
+        assert_eq!(read(&tagged, b"TEST"), "untagged", "wrong magic");
+        assert_eq!(read(&other_action, b"ALPN"), "foreign");
         let plain = bitcoin::Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::ZERO,
@@ -6027,6 +6108,103 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(closed.status, ProposalStatus::Superseded);
+    }
+
+    /// The manual fallback: a pair sent while the orchestrator was down, mined and executed, and
+    /// imported afterwards onto a row that tracks another pair. It is listed and confirmed, so the
+    /// proposal is not retired as if its sequence number had gone to another action.
+    #[tokio::test]
+    async fn a_manual_pair_imported_after_it_was_executed_confirms() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        let confirmed = report_broadcast_progress(
+            &repo,
+            "mock://asm-membership",
+            session_of(&sig_b()),
+            &action_id,
+            &MinedReveals(vec![(
+                REVEAL_B,
+                800_010,
+                envelope_reveal(COMMIT_B, 1, &test_fixture_action_hex()),
+            )]),
+            report("reveal_confirmed", Some(COMMIT_B), Some(REVEAL_B)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(confirmed.broadcast_status, BroadcastStatus::RevealConfirmed);
+        assert_eq!(confirmed.reveal_txid.as_deref(), Some(REVEAL_B));
+    }
+
+    /// A listed txid whose lookup the node can never answer does not hold back a reveal the ASM
+    /// executed: one executed reveal decides. The genesis coinbase, which Bitcoin Core refuses to
+    /// look up, counts as not mined.
+    #[tokio::test]
+    async fn an_unanswerable_listed_txid_does_not_veto_an_executed_reveal() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        let mut proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        proposal.broadcast_attempts.push(BroadcastAttempt {
+            broadcaster_pubkey: Some(sig_b().signer_pubkey),
+            commit_txid: COMMIT_B.to_string(),
+            reveal_txid: REVEAL_B.to_string(),
+            created_at: Utc::now(),
+        });
+
+        /// Mines A's reveal, and fails every other lookup.
+        struct OneAnswer;
+
+        #[async_trait::async_trait]
+        impl BitcoinRpcClient for OneAnswer {
+            async fn estimate_fee_rate_sats_per_vb(
+                &self,
+                _target_blocks: u16,
+            ) -> Result<u64, AppError> {
+                Ok(1)
+            }
+
+            async fn get_block_height_for_txid(&self, _txid: &str) -> Result<u64, AppError> {
+                Err(AppError::BadRequest(
+                    "Bitcoin RPC request timed out".to_string(),
+                ))
+            }
+
+            async fn get_mined_reveal(&self, txid: &str) -> Result<MinedReveal, AppError> {
+                if txid == REVEAL_A {
+                    return Ok(MinedReveal {
+                        height: 800_010,
+                        tx: Some(envelope_reveal(COMMIT_A, 1, &test_fixture_action_hex())),
+                        block: Some(crate::infrastructure::bitcoin_rpc::MinedBlock {
+                            hash: "block".to_string(),
+                            parent_hash: "parent".to_string(),
+                        }),
+                    });
+                }
+                Err(AppError::BadRequest(
+                    "Bitcoin RPC request timed out".to_string(),
+                ))
+            }
+
+            async fn get_chain_tip(&self) -> Result<u64, AppError> {
+                Ok(800_000)
+            }
+        }
+
+        let winner = first_mined_pair(&proposal, &OneAnswer, "mock://asm-membership").await;
+        assert_eq!(
+            winner,
+            MinedPair::First(COMMIT_A.to_string(), REVEAL_A.to_string())
+        );
+        // With nothing executed, the open question stays open.
+        let nothing = first_mined_pair(&proposal, &NodeDown, "mock://asm-membership").await;
+        assert_eq!(nothing, MinedPair::Unknown);
+        assert!(matches!(
+            classify_reveal_height(Err(AppError::BadRequest(
+                "The genesis block coinbase is not considered an ordinary transaction and cannot \
+                 be retrieved"
+                    .to_string()
+            ))),
+            RevealHeight::Unmined
+        ));
     }
 
     /// A pair already listed under another signer is refused as such, not as the caller's own.

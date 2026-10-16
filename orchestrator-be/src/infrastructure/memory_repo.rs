@@ -1,9 +1,8 @@
 //! In-memory proposal repository for POC and testing.
 
 use crate::application::proposals::{
-    broadcast_claim_allowed, broadcast_write_for_report, decide_additional_pair,
-    exceeds_pair_limit, reports_tracked_pair, row_still_has_reveal, AdditionalPair,
-    BroadcastClaimFacts, AUTHORITY_IN_FLIGHT, PAIR_LIMIT_REACHED,
+    broadcast_claim_allowed, broadcast_write_for_report, decide_additional_pair, report_effect,
+    row_still_has_reveal, AdditionalPair, BroadcastClaimFacts, AUTHORITY_IN_FLIGHT,
 };
 use crate::application::traits::ProposalRepository;
 use crate::domain::authority::Authority;
@@ -258,9 +257,8 @@ impl ProposalRepository for InMemoryProposalRepository {
         attempt: Option<BroadcastAttempt>,
         live: &[String],
     ) -> Result<Option<Proposal>, AppError> {
-        // Checked and written under one write lock, like the registration it must not overwrite.
-        // The pair is listed only when this same write applies, so a report that lost the race
-        // cannot leave a foreign reveal for the reconcile to confirm (#605).
+        // Decided and written under one write lock, like the registration it must not overwrite
+        // (#605).
         let mut proposals = self
             .proposals
             .write()
@@ -268,22 +266,24 @@ impl ProposalRepository for InMemoryProposalRepository {
         let Some(proposal) = proposals.get_mut(action_id) else {
             return Ok(None);
         };
-        if reports_tracked_pair(reveal_txid, proposal.reveal_txid.as_deref()) {
-            if attempt
-                .as_ref()
-                .is_some_and(|attempt| exceeds_pair_limit(proposal, attempt))
-            {
-                return Err(AppError::Conflict(PAIR_LIMIT_REACHED.to_string()));
+        let effect = report_effect(
+            proposal,
+            reveal_txid,
+            status,
+            proposal_status,
+            attempt.as_ref(),
+        )
+        .map_err(|refusal| AppError::Conflict(refusal.to_string()))?;
+        if let Some(attempt) = attempt.filter(|_| effect.lists_pair) {
+            let kept = proposal
+                .broadcast_attempts
+                .iter()
+                .any(|kept| kept.reveal_txid.eq_ignore_ascii_case(&attempt.reveal_txid));
+            if !kept {
+                proposal.broadcast_attempts.push(attempt);
             }
-            if let Some(attempt) = attempt {
-                let kept = proposal
-                    .broadcast_attempts
-                    .iter()
-                    .any(|kept| kept.reveal_txid.eq_ignore_ascii_case(&attempt.reveal_txid));
-                if !kept {
-                    proposal.broadcast_attempts.push(attempt);
-                }
-            }
+        }
+        if effect.moves_row {
             // After the attempt is listed, so a failed second pair puts the row back on an
             // earlier one the node still has (#605).
             let write =
@@ -314,13 +314,14 @@ impl ProposalRepository for InMemoryProposalRepository {
         let Some(proposal) = proposals.get_mut(action_id) else {
             return Ok(None);
         };
-        let confirmable = matches!(
-            proposal.broadcast_status,
-            BroadcastStatus::CommitBroadcasted
-                | BroadcastStatus::CommitConfirmed
-                | BroadcastStatus::RevealBroadcasted
-                | BroadcastStatus::Failed
-        );
+        let confirmable = proposal.status == ProposalStatus::Approved
+            && matches!(
+                proposal.broadcast_status,
+                BroadcastStatus::CommitBroadcasted
+                    | BroadcastStatus::CommitConfirmed
+                    | BroadcastStatus::RevealBroadcasted
+                    | BroadcastStatus::Failed
+            );
         if !confirmable || !row_still_has_reveal(observed_reveal, proposal.reveal_txid.as_deref()) {
             return Ok(None);
         }
