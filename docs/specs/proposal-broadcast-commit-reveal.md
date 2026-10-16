@@ -446,10 +446,11 @@ acts on; the others are refused on the sequence number and cost only their fees.
   reconcile checks every mined reveal it considers in two steps.
   - *It is this proposal's* (`proposal_payload`): its first output carries the SPS-50 tag of the
     administration subprotocol under the network's magic bytes (`BITCOIN_MAGIC_BYTES_HEX`, the same
-    value as the ASM's and the desktop's — the ASM's tx filter drops a transaction without it), its
-    first input spends the pair's commit, and its envelope decodes the way the ASM reads it
+    value as the ASM's and the desktop's — the ASM's tx filter drops a transaction without it), and
+    its envelope decodes the way the ASM reads it
     (`parse_tx`: taproot leaf script, `parse_envelope_payload`, SSZ `SignedPayload`) to this
-    proposal's sequence number and action.
+    proposal's sequence number and action. Like the ASM, it does not ask which commit the reveal
+    spends; the row records the one it does, whatever was listed with the pair.
   - *The ASM executed it* (`asm_executed`), judged from the ASM's own state of the role that signs
     the action (`strata_asm_getAsmState`, `role_around_block`) just before the reveal's block and
     just after it. Before: the ASM's `verify_action_signature` passes — the sequence number above
@@ -462,7 +463,10 @@ acts on; the others are refused on the sequence number and cost only their fees.
   A reveal the ASM rejected — an approval at an index that is not that approver's, too few
   signatures, a sequence number out of the window or already taken — passes neither, is ignored
   however low its block, and the row stays in flight, where any signer can send again. An ASM that
-  has not processed the reveal's block yet, or cannot answer, leaves the row for the next read. A
+  has not processed the reveal's block yet, or cannot answer — like a node lookup that fails — makes
+  the read inconclusive: the row is left for the next read, and that read neither decides enactment
+  nor retires the proposal (the reveal it could not judge may be the one that took the sequence
+  number). A
   pair first reported after it was mined (the manual fallback, imported later) still counts: what
   the ASM did decides, not when it was registered.
 - **A failed pair falls back only to a live one.** A `failed` report for the pair the row tracks,
@@ -487,13 +491,18 @@ acts on; the others are refused on the sequence number and cost only their fees.
   leaves the row at `reveal_broadcasted` until the next read. A report about a pair the row no longer
   tracks is ignored.
 - **Node requirement.** Verifying a mined reveal needs `getrawtransaction` to read it, so the
-  orchestrator's Bitcoin node must run with `-txindex=1`. Without it the orchestrator confirms no
-  reveal at all: the row stays at `reveal_broadcasted` (and the desktop keeps reporting), the
-  enactment check never runs, and an action that applied immediately is retired by the sweep once its
-  sequence number is consumed. The orchestrator checks `getindexinfo` at startup and logs an error
-  when the index is missing, a warning while it is not yet synced, and a warning on each reconcile
-  that cannot read a reveal. Staging (`staging/entrypoint-bitcoin.sh`) and
-  `scripts/bitcoind-asm-runner.sh` set it; see the runbook for other deployments.
+  orchestrator's Bitcoin node must run with `-txindex=1`, and the network Bitcoin Core 29 or later
+  (the ASM runner's `strata_asm_getAsmState` fails on 28). Without the index every read is
+  inconclusive: no reveal is confirmed, and no proposal with a pair on record is retired either — the
+  row stays `approved` at `reveal_broadcasted` (the desktop keeps reporting) until the node can read
+  it. The orchestrator checks `getindexinfo` at startup and logs an error when the index is missing,
+  a warning while it is not yet synced, and a warning on each reconcile that cannot read a reveal.
+  Staging (`staging/entrypoint-bitcoin.sh`, Core 29.0) and `scripts/bitcoind-asm-runner.sh` set it;
+  see the runbook for other deployments.
+- **A settled proposal takes no broadcast report.** A report that would move a `reveal_confirmed`
+  row back (a `failed`, an earlier status) is ignored: its pair is the one the ASM executed. So is any
+  broadcast report on a proposal that is no longer `approved` (unless it asks for a proposal status),
+  since nothing revisits such a row to repair it.
 - **Watchers stop on a confirmed row, not on a 200.** The desktop's settle loop and the send screen's
   poll report `reveal_confirmed` and stop only once the row they get back says `reveal_confirmed`;
   otherwise the bundle stays tracked and the next check reports again. The send screen watches the
@@ -536,11 +545,13 @@ acts on; the others are refused on the sequence number and cost only their fees.
   changing.
 - **Accepted limits.** A pair backfilled with no broadcaster does not lock its sender out. A retry
   after `failed` leaves the earlier attempt listed; the node decides among them like any other pairs.
-  The ASM's state just after the reveal's block cannot show which transaction of the block moved
-  `last_seqno`: if another action of the same role, earlier in the same block, took this sequence
-  number (or a higher one) and this proposal's action is immediate, the reveal is taken as
-  executed. The ASM runner must answer `strata_asm_getAsmState` for the blocks a reconcile reads,
-  which needs Bitcoin Core 29 or later (staging runs 29.0). The pre-check and the
+  The ASM checks a payload after it has matured the block's queued updates and after the block's
+  earlier transactions; the orchestrator compares only the states just before and just after the
+  block. When two actions of the same role land in one block — which the claim gate prevents in the
+  app, but a manual broadcast can do — a rejected reveal can be credited with the other's effect: an
+  immediate action whose sequence number the other took; a queued update identical to one queued by
+  the other; a cancel whose target matured in that same block. The ASM runner must answer
+  `strata_asm_getAsmState` for the blocks a reconcile reads. The pre-check and the
   registration are two calls: the row can move between them, and the registration then refuses after
   the device signed. The per-signer limit counts every pair listed, including a pre-registered pair
   whose broadcast the node refused: a signer whose sends failed three times cannot send this proposal
