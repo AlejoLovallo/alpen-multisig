@@ -55,6 +55,15 @@ pub(crate) trait ProposalRepository: Send + Sync {
         abandoned: &[String],
     ) -> Result<Proposal, AppError>;
 
+    /// Mark `approved` as `superseded`, but only while `broadcast_status` is still `observed`.
+    ///
+    /// A confirmation that landed after this read started does not match, and is left in place.
+    async fn supersede_if_unchanged(
+        &self,
+        action_id: &ActionId,
+        observed: BroadcastStatus,
+    ) -> Result<bool, AppError>;
+
     /// Update broadcast sub-status and related txids/error for an approved proposal.
     async fn update_broadcast_status(
         &self,

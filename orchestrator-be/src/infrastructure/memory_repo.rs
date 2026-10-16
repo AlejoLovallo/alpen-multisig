@@ -218,6 +218,26 @@ impl ProposalRepository for InMemoryProposalRepository {
         Ok(proposal.clone())
     }
 
+    async fn supersede_if_unchanged(
+        &self,
+        action_id: &ActionId,
+        observed: BroadcastStatus,
+    ) -> Result<bool, AppError> {
+        let mut proposals = self
+            .proposals
+            .write()
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("repo lock poisoned")))?;
+        let Some(proposal) = proposals.get_mut(action_id) else {
+            return Ok(false);
+        };
+        if proposal.status != ProposalStatus::Approved || proposal.broadcast_status != observed {
+            return Ok(false);
+        }
+        proposal.status = ProposalStatus::Superseded;
+        proposal.updated_at = Utc::now();
+        Ok(true)
+    }
+
     async fn update_broadcast_status(
         &self,
         action_id: &ActionId,
@@ -314,17 +334,21 @@ impl ProposalRepository for InMemoryProposalRepository {
         let Some(proposal) = proposals.get_mut(action_id) else {
             return Ok(None);
         };
-        let confirmable = proposal.status == ProposalStatus::Approved
-            && matches!(
+        let confirmable = match proposal.status {
+            ProposalStatus::Superseded => true,
+            ProposalStatus::Approved => matches!(
                 proposal.broadcast_status,
                 BroadcastStatus::CommitBroadcasted
                     | BroadcastStatus::CommitConfirmed
                     | BroadcastStatus::RevealBroadcasted
                     | BroadcastStatus::Failed
-            );
+            ),
+            _ => false,
+        };
         if !confirmable || !row_still_has_reveal(observed_reveal, proposal.reveal_txid.as_deref()) {
             return Ok(None);
         }
+        proposal.status = ProposalStatus::Approved;
         proposal.broadcast_status = BroadcastStatus::RevealConfirmed;
         proposal.commit_txid = Some(commit_txid.to_ascii_lowercase());
         proposal.reveal_txid = Some(reveal_txid.to_ascii_lowercase());

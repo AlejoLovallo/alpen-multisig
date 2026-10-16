@@ -574,6 +574,28 @@ impl ProposalRepository for PostgresProposalRepository {
             .ok_or(AppError::NotFound)
     }
 
+    async fn supersede_if_unchanged(
+        &self,
+        action_id: &ActionId,
+        observed: BroadcastStatus,
+    ) -> Result<bool, AppError> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE proposals
+            SET status = 'superseded', updated_at = NOW()
+            WHERE action_id = $1
+              AND status = 'approved'
+              AND broadcast_status = $2
+            "#,
+        )
+        .bind(&action_id.0)
+        .bind(observed.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to supersede proposal: {e}")))?;
+        Ok(updated.rows_affected() > 0)
+    }
+
     async fn update_broadcast_status(
         &self,
         action_id: &ActionId,
@@ -718,14 +740,18 @@ impl ProposalRepository for PostgresProposalRepository {
             r#"
             UPDATE proposals
             SET broadcast_status = 'reveal_confirmed',
+                status = 'approved',
                 commit_txid = LOWER($2),
                 reveal_txid = LOWER($3),
                 broadcast_error = NULL,
                 updated_at = NOW()
             WHERE action_id = $1
-              AND status = 'approved'
-              AND broadcast_status IN (
-                    'commit_broadcasted', 'commit_confirmed', 'reveal_broadcasted', 'failed'
+              AND status IN ('approved', 'superseded')
+              AND (
+                    status = 'superseded'
+                    OR broadcast_status IN (
+                        'commit_broadcasted', 'commit_confirmed', 'reveal_broadcasted', 'failed'
+                    )
                   )
               AND (
                     ($4::text IS NULL AND reveal_txid IS NULL)

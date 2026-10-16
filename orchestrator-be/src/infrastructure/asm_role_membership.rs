@@ -135,7 +135,7 @@ pub(crate) async fn role_around_block(
     block_hash: &str,
     parent_hash: &str,
 ) -> Result<Option<(RoleAtBlock, RoleAtBlock)>, AppError> {
-    if let Some(views) = mock_role_around_block(rpc_url, action, seq_no, block_height) {
+    if let Some(views) = mock_role_around_block(rpc_url, action, seq_no, block_height, block_hash) {
         return Ok(views);
     }
     let before = asm_rpc::fetch_admin_state_at(rpc_url, parent_hash)
@@ -499,7 +499,12 @@ fn mock_role_around_block(
     action: &MultisigAction,
     seq_no: u64,
     block_height: u64,
+    block_hash: &str,
 ) -> Option<Option<(RoleAtBlock, RoleAtBlock)>> {
+    // The block is known, but this read could not judge it. Callers use the hash `unjudged`.
+    if block_hash == "unjudged" {
+        return Some(None);
+    }
     let accepted = match rpc_url {
         MOCK_MEMBERSHIP_URL | crate::infrastructure::asm_enactment::MOCK_SEQNO_AHEAD_URL => true,
         MOCK_ASM_NOT_ACCEPTED_URL => false,
@@ -550,6 +555,7 @@ fn mock_role_around_block(
     _action: &MultisigAction,
     _seq_no: u64,
     _block_height: u64,
+    _block_hash: &str,
 ) -> Option<Option<(RoleAtBlock, RoleAtBlock)>> {
     None
 }

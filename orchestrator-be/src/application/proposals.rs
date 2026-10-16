@@ -547,9 +547,10 @@ pub(crate) struct ReportEffect {
 /// It moves the row only when it names the pair the row tracks (or tags an empty claim), the row
 /// is not confirmed already — a confirmed pair is the one the ASM executed, and a `failed` or an
 /// earlier status would put a loser in its place — and the proposal is still approved, unless the
-/// report asks for a proposal status. Its pair is listed whenever the proposal is approved, even
-/// beside the tracked one: a pair sent by the manual fallback and imported later may be the one the
-/// ASM executed, and the reconcile counts only a reveal it did. A pair that would take its signer
+/// report asks for a proposal status. Its pair is listed whenever the proposal is approved or
+/// superseded, even beside the tracked one: a pair sent by the manual fallback and imported later
+/// may be the one the ASM executed, and the reconcile counts only a reveal it did. A pair that
+/// would take its signer
 /// past [`MAX_PAIRS_PER_SIGNER`] is refused when the report would move the row (a
 /// pre-registration), and otherwise just not listed.
 pub(crate) fn report_effect(
@@ -565,8 +566,10 @@ pub(crate) fn report_effect(
         || (!approved && proposal_status.is_none());
     let moves_row =
         reports_tracked_pair(reported_reveal, current.reveal_txid.as_deref()) && !settled;
+    // A superseded row still lists a pair. An immediate action can be retired before its
+    // executed reveal is imported; the import is what brings that reveal back.
     let lists_pair = match attempt {
-        Some(attempt) if approved => {
+        Some(attempt) if approved || current.status == ProposalStatus::Superseded => {
             if exceeds_pair_limit(current, attempt) {
                 if moves_row {
                     return Err(PAIR_LIMIT_REACHED);
@@ -1104,6 +1107,10 @@ async fn first_mined_pair(
     // without the transaction, which cannot be judged.
     let mut executed: Vec<(u64, String, &str)> = Vec::new();
     let mut unjudged: Vec<(u64, String, &str)> = Vec::new();
+    // Mined reveals whose block we know but whose ASM judgment failed. One of them may be the
+    // transaction the ASM actually ran: before and after the block are the same for every reveal
+    // in it, so a later one would also look executed.
+    let mut unjudged_heights: Vec<u64> = Vec::new();
     let mut unknown = false;
     let mut not_indexed = false;
     for ((commit, reveal), answer) in candidates.iter().zip(answers) {
@@ -1169,14 +1176,19 @@ async fn first_mined_pair(
                     "a listed reveal is mined but the ASM did not execute it; ignored"
                 );
             }
-            // The ASM has not processed that block yet.
-            Ok(None) => unknown = true,
+            // The ASM has not processed that block yet, or could not be asked. The height is
+            // known, so a reveal already judged in that same block must not win on this read.
+            Ok(None) => {
+                unknown = true;
+                unjudged_heights.push(height);
+            }
             Err(e) => {
                 tracing::warn!(
                     action_id = %proposal.action_id.0,
                     "reconcile: ASM state around the reveal's block unavailable: {e}"
                 );
                 unknown = true;
+                unjudged_heights.push(height);
             }
         }
     }
@@ -1195,6 +1207,9 @@ async fn first_mined_pair(
     let Some(lowest) = mined.iter().map(|(height, _, _)| *height).min() else {
         return MinedPair::None;
     };
+    if unjudged_heights.contains(&lowest) {
+        return MinedPair::Unknown;
+    }
     let mut first: Vec<(String, &str)> = mined
         .into_iter()
         .filter(|(height, _, _)| *height == lowest)
@@ -1277,13 +1292,17 @@ async fn try_confirm_reveal(
     // so a row whose later reports never landed still carries the reveal txid to check. A `failed`
     // row keeps its txids too: if that reveal was mined, the `failed` was a mistake, and leaving it
     // would let the sweep below retire as Superseded a proposal whose own reveal used the seqno.
-    if !matches!(
+    // A superseded row is judged too, whatever its broadcast status. An immediate action can be
+    // retired while it is still idle, and the import of the reveal that executed it is what
+    // brings the row back.
+    let in_flight = matches!(
         proposal.broadcast_status,
         BroadcastStatus::CommitBroadcasted
             | BroadcastStatus::CommitConfirmed
             | BroadcastStatus::RevealBroadcasted
             | BroadcastStatus::Failed
-    ) {
+    );
+    if !in_flight && proposal.status != ProposalStatus::Superseded {
         return decided(proposal);
     }
     let observed_reveal = proposal.reveal_txid.clone();
@@ -1435,15 +1454,10 @@ async fn supersede_if_seq_no_consumed(
         seq_no = proposal.seq_no,
         "superseding proposal: the role's sequence number has passed it"
     );
-    repo.update_broadcast_status(
-        &proposal.action_id,
-        proposal.broadcast_status,
-        Some(ProposalStatus::Superseded),
-        None,
-        None,
-        None,
-    )
-    .await?;
+    // Only while the row is still the one this read judged. A confirmation that landed in
+    // between keeps its pair; the next read decides.
+    repo.supersede_if_unchanged(&proposal.action_id, proposal.broadcast_status)
+        .await?;
     Ok(())
 }
 
@@ -1511,6 +1525,90 @@ async fn cancel_of_target(
     }
 }
 
+/// Enact a cancel whose reveal is already confirmed, when the ASM says it executed.
+///
+/// Called from the target's read: that read may be the only one that sees the cancel. A cancel the
+/// ASM does not show as executed is left for its own reconcile. `Ok(false)` from `enact_cancel`
+/// means the target was no longer approved — expire the cancel only while it is still approved, so
+/// a second pass over a cancel this read just enacted does not mark it expired.
+async fn enact_confirmed_cancel(
+    repo: &dyn ProposalRepository,
+    asm_rpc_url: &str,
+    btc_client: &dyn BitcoinRpcClient,
+    cancel: &Proposal,
+) -> Result<(), AppError> {
+    if cancel.status != ProposalStatus::Approved
+        || cancel.broadcast_status != BroadcastStatus::RevealConfirmed
+    {
+        return Ok(());
+    }
+    let bitcoin_tip = match bitcoin_tip_for_enactment(&cancel.action_hex, btc_client).await {
+        Ok(tip) => tip,
+        Err(e) => {
+            tracing::warn!(
+                action_id = %cancel.action_id.0,
+                "reconcile: bitcoin tip lookup failed for cancel: {e}"
+            );
+            return Ok(());
+        }
+    };
+    let enacted = match crate::infrastructure::asm_enactment::is_proposal_enacted_on_asm(
+        asm_rpc_url,
+        cancel.authority,
+        cancel.seq_no,
+        &cancel.action_hex,
+        cancel.activation_height,
+        bitcoin_tip,
+    )
+    .await
+    {
+        Ok(enacted) => enacted,
+        Err(e) => {
+            tracing::warn!(
+                action_id = %cancel.action_id.0,
+                "reconcile: ASM enactment check failed for cancel: {e}"
+            );
+            return Ok(());
+        }
+    };
+    if !enacted {
+        return Ok(());
+    }
+    let Some(target_action_id) = &cancel.target_action_id else {
+        return Ok(());
+    };
+    if !repo
+        .enact_cancel(&cancel.action_id, target_action_id)
+        .await?
+    {
+        expire_cancel_if_still_approved(repo, &cancel.action_id).await?;
+    }
+    Ok(())
+}
+
+/// The target enacted first, so the cancel is moot — unless a concurrent read already enacted it.
+async fn expire_cancel_if_still_approved(
+    repo: &dyn ProposalRepository,
+    cancel_action_id: &ActionId,
+) -> Result<(), AppError> {
+    let Some(cancel) = repo.find_by_action_id(cancel_action_id).await? else {
+        return Ok(());
+    };
+    if cancel.status != ProposalStatus::Approved {
+        return Ok(());
+    }
+    repo.update_broadcast_status(
+        cancel_action_id,
+        BroadcastStatus::RevealConfirmed,
+        Some(ProposalStatus::Expired),
+        None,
+        None,
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
 /// Advance one approved proposal: notice a reveal that confirmed, decide enactment, or retire it.
 ///
 /// `last_seqno` is the role's live sequence number, or `None` when the ASM could not answer —
@@ -1558,6 +1656,13 @@ async fn reconcile_one(
                     action_id = %proposal.action_id.0,
                     "reconcile: activation height still unavailable while its cancel is unjudged: {e}"
                 );
+            }
+        }
+        // This read may be the only one that looks at the target. The cancel's own row is what
+        // writes Canceled, so a cancel whose reveal is already confirmed is enacted here.
+        if cancel == CancelOfTarget::OnChain {
+            if let Some(cancel_proposal) = repo.find_cancel_for_target(&proposal.action_id).await? {
+                enact_confirmed_cancel(repo, asm_rpc_url, btc_client, &cancel_proposal).await?;
             }
         }
         return Ok(());
@@ -1610,15 +1715,7 @@ async fn reconcile_one(
             .enact_cancel(&proposal.action_id, target_action_id)
             .await?;
         if !applied {
-            repo.update_broadcast_status(
-                &proposal.action_id,
-                BroadcastStatus::RevealConfirmed,
-                Some(ProposalStatus::Expired),
-                None,
-                None,
-                None,
-            )
-            .await?;
+            expire_cancel_if_still_approved(repo, &proposal.action_id).await?;
         }
         return Ok(());
     }
@@ -5641,6 +5738,70 @@ mod tests {
         }
     }
 
+    /// Two reveals of this proposal in one block. The earlier one's ASM read fails. The later one
+    /// must not be confirmed: before and after the block are the same for both.
+    #[tokio::test]
+    async fn a_same_block_reveal_whose_judgment_failed_holds_the_read() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        let action = test_fixture_action_hex();
+        let btc = SameBlock {
+            judged: (REVEAL_B, envelope_reveal(COMMIT_B, 1, &action)),
+            unjudged: (REVEAL_A, envelope_reveal(COMMIT_A, 1, &action)),
+        };
+
+        let winner = first_mined_pair(&proposal, &btc, "mock://asm-membership").await;
+
+        assert_eq!(winner, MinedPair::Unknown);
+    }
+
+    /// `judged` is a reveal the ASM can be asked about. `unjudged` shares its block, and the ASM
+    /// read for that hash does not answer.
+    struct SameBlock {
+        judged: (&'static str, bitcoin::Transaction),
+        unjudged: (&'static str, bitcoin::Transaction),
+    }
+
+    #[async_trait::async_trait]
+    impl BitcoinRpcClient for SameBlock {
+        async fn estimate_fee_rate_sats_per_vb(
+            &self,
+            _target_blocks: u16,
+        ) -> Result<u64, AppError> {
+            Ok(1)
+        }
+
+        async fn get_block_height_for_txid(&self, txid: &str) -> Result<u64, AppError> {
+            self.get_mined_reveal(txid).await.map(|mined| mined.height)
+        }
+
+        async fn get_mined_reveal(&self, txid: &str) -> Result<MinedReveal, AppError> {
+            let (tx, hash) = if txid == self.judged.0 {
+                (&self.judged.1, "block")
+            } else if txid == self.unjudged.0 {
+                (&self.unjudged.1, "unjudged")
+            } else {
+                return Err(AppError::BadRequest(format!(
+                    "getrawtransaction: tx {txid} has no blockhash — not yet confirmed"
+                )));
+            };
+            Ok(MinedReveal {
+                height: 800_010,
+                tx: Some(tx.clone()),
+                block: Some(crate::infrastructure::bitcoin_rpc::MinedBlock {
+                    hash: hash.to_string(),
+                    parent_hash: "parent".to_string(),
+                }),
+            })
+        }
+
+        async fn get_chain_tip(&self) -> Result<u64, AppError> {
+            Ok(800_000)
+        }
+    }
+
     #[tokio::test]
     async fn a_reveal_carries_the_proposal_only_with_its_tag_seq_no_and_action() {
         let repo = new_repo();
@@ -6536,6 +6697,143 @@ mod tests {
         let target = repo.find_by_action_id(&target_id).await.unwrap().unwrap();
         assert_eq!(target.status, ProposalStatus::Approved);
         assert_eq!(target.activation_height, Some(800_010 + 2016));
+    }
+
+    /// Opening the target is enough. The cancel's reveal is already confirmed and the ASM shows
+    /// it executed, so this read cancels the target instead of leaving it approved.
+    #[tokio::test]
+    async fn a_confirmed_cancel_cancels_its_target_on_the_targets_read() {
+        let repo = new_repo();
+        let (target_id, cancel_id) = target_with_cancel_in_flight(&repo).await;
+        repo.update_broadcast_status(
+            &cancel_id,
+            BroadcastStatus::RevealConfirmed,
+            None,
+            Some(COMMIT_C),
+            Some(REVEAL_C),
+            None,
+        )
+        .await
+        .unwrap();
+
+        reconcile_enacted_for_action(
+            &repo,
+            "mock://asm-enacted",
+            &mock_btc(),
+            Authority::StrataAdmin,
+            &target_id,
+        )
+        .await
+        .unwrap();
+
+        let target = repo.find_by_action_id(&target_id).await.unwrap().unwrap();
+        assert_eq!(target.status, ProposalStatus::Canceled);
+        let cancel = repo.find_by_action_id(&cancel_id).await.unwrap().unwrap();
+        assert_eq!(cancel.status, ProposalStatus::Enacted);
+    }
+
+    /// A supersede applies only to the row this read judged. Once a reveal is confirmed, a stale
+    /// supersede does not put it back, and a superseded row can be confirmed again.
+    #[tokio::test]
+    async fn a_stale_supersede_does_not_overwrite_a_confirmation() {
+        let repo = new_repo();
+        let proposal = save_approved_proposal(&repo, Authority::StrataAdmin, 1).await;
+        repo.update_broadcast_status(
+            &proposal.action_id,
+            BroadcastStatus::RevealBroadcasted,
+            None,
+            Some(COMMIT_A),
+            Some(REVEAL_A),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(repo
+            .supersede_if_unchanged(&proposal.action_id, BroadcastStatus::RevealBroadcasted)
+            .await
+            .unwrap());
+        let superseded = repo
+            .find_by_action_id(&proposal.action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(superseded.status, ProposalStatus::Superseded);
+        let effect = report_effect(
+            &superseded,
+            Some(REVEAL_B),
+            BroadcastStatus::RevealBroadcasted,
+            None,
+            Some(&BroadcastAttempt {
+                broadcaster_pubkey: None,
+                commit_txid: COMMIT_B.to_string(),
+                reveal_txid: REVEAL_B.to_string(),
+                created_at: chrono::Utc::now(),
+            }),
+        )
+        .unwrap();
+        assert!(effect.lists_pair);
+        assert!(!effect.moves_row);
+
+        let restored = repo
+            .confirm_tracked_reveal(&proposal.action_id, Some(REVEAL_A), COMMIT_A, REVEAL_A)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.status, ProposalStatus::Approved);
+        assert_eq!(restored.broadcast_status, BroadcastStatus::RevealConfirmed);
+        assert!(!repo
+            .supersede_if_unchanged(&proposal.action_id, BroadcastStatus::RevealBroadcasted)
+            .await
+            .unwrap());
+        let kept = repo
+            .find_by_action_id(&proposal.action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.status, ProposalStatus::Approved);
+        assert_eq!(kept.broadcast_status, BroadcastStatus::RevealConfirmed);
+    }
+
+    /// An immediate action retired while still idle comes back when its executed reveal is
+    /// imported. Listing the pair is not enough: this read has to confirm it.
+    #[tokio::test]
+    async fn an_imported_reveal_restores_a_superseded_idle_proposal() {
+        let repo = new_repo();
+        let proposal = save_approved_proposal(&repo, Authority::StrataAdmin, 1).await;
+        repo.update_broadcast_status(
+            &proposal.action_id,
+            BroadcastStatus::Idle,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(repo
+            .supersede_if_unchanged(&proposal.action_id, BroadcastStatus::Idle)
+            .await
+            .unwrap());
+
+        let restored = report_broadcast_progress(
+            &repo,
+            "mock://asm-membership",
+            session_of(&sig_b()),
+            &proposal.action_id,
+            &MinedReveals(vec![(
+                REVEAL_B,
+                800_010,
+                envelope_reveal(COMMIT_B, 1, &test_fixture_action_hex()),
+            )]),
+            report("reveal_confirmed", Some(COMMIT_B), Some(REVEAL_B)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(restored.status, ProposalStatus::Approved);
+        assert_eq!(restored.broadcast_status, BroadcastStatus::RevealConfirmed);
+        assert_eq!(restored.reveal_txid.as_deref(), Some(REVEAL_B));
     }
 
     /// A pair already listed under another signer is refused as such, not as the caller's own.

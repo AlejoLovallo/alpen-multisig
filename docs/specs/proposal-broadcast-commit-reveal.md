@@ -466,7 +466,10 @@ acts on; the others are refused on the sequence number and cost only their fees.
   the read inconclusive: the row is left for the next read, and that read neither decides enactment
   nor retires the proposal (the reveal it could not judge may be the one that took the sequence
   number). A reveal the ASM executed decides even when the node or the ASM could not answer about
-  another listed pair: the ASM executes one reveal per sequence number. A reveal that carries this
+  another listed pair: the ASM executes one reveal per sequence number. That does not hold for
+  another reveal mined in the same block whose judgment failed: before and after the block are
+  the same for every reveal in it, so this read waits. A lookup that failed before any height was
+  known still does not hold the winner, or a txid that can never be read would wedge the proposal. A reveal that carries this
   proposal without the administration tag under the configured magic bytes is an open question too —
   a transaction the ASM never saw, or `BITCOIN_MAGIC_BYTES_HEX` set to another network's — and is
   logged as an error. A pair first reported after it was mined (the manual fallback, imported later)
@@ -475,7 +478,9 @@ acts on; the others are refused on the sequence number and cost only their fees.
   `cur_block` against the node's tip): a node behind the ASM would read an executed reveal as unmined,
   so that read is left open too. A cancel still in flight is judged before its target is decided
   (`cancel_of_target`): only the reconcile confirms it, and read first the target would look dead
-  — its seqno consumed, gone from the queue. A read that cannot judge that cancel holds the
+  — its seqno consumed, gone from the queue. When that read confirms the cancel and the ASM shows
+  the cancel executed, the target is canceled in the same read (`enact_confirmed_cancel`); opening
+  the target is enough. A read that cannot judge that cancel holds the
   target the same way: it is not marked superseded, and it is not marked enacted. The enacted
   write is terminal, and a cancel leaves the same ASM shape as enactment for a queued update
   whose trace is only that its sequence number was consumed and it left the queue (an `EeStfVk`),
@@ -515,8 +520,12 @@ acts on; the others are refused on the sequence number and cost only their fees.
 - **A settled proposal takes no broadcast report.** A report that would move a `reveal_confirmed`
   row back (a `failed`, an earlier status) leaves it: its pair is the one the ASM executed. So does any
   broadcast report on a proposal that is no longer `approved` (unless it asks for a proposal status),
-  since nothing revisits such a row to repair it. Decided in the write (`report_effect`), and a
-  confirmation applies only to an approved proposal (`confirm_tracked_reveal`).
+  since nothing revisits such a row to repair it — except a `superseded` row, which still lists a
+  pair. An immediate action can be retired while the reveal that executed it is not listed yet; the
+  import lists it, and if the ASM executed it the row returns to `approved` at `reveal_confirmed`
+  (`confirm_tracked_reveal`). A supersede applies only while the row is still `approved` at the
+  broadcast status that read observed (`supersede_if_unchanged`), so a confirmation that landed
+  during the read is not overwritten. Decided in the write (`report_effect`).
 - **Watchers stop on a confirmed row, not on a 200.** The desktop's settle loop and the send screen's
   poll report `reveal_confirmed` and stop only once the row they get back says `reveal_confirmed`;
   otherwise the bundle stays tracked and the next check reports again. The send screen watches the
