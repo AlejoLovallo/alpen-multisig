@@ -144,6 +144,14 @@ pub(crate) trait ProposalRepository: Send + Sync {
     /// Returns `Ok(true)` when the target was one of those and both transitions were applied.
     /// Returns `Ok(false)` without mutating anything when the target was already `Enacted`,
     /// `Canceled`, or gone — the cancel did not take the target, and the caller expires it.
+    ///
+    /// [`Self::enact_executed_cancel`] is the same write plus a target already marked `Enacted`.
+    /// Only the confirm path calls it, after the cancel's own reveal passed `asm_executed`.
+    async fn enact_executed_cancel(
+        &self,
+        cancel_action_id: &ActionId,
+        target_action_id: &ActionId,
+    ) -> Result<bool, AppError>;
     async fn enact_cancel(
         &self,
         cancel_action_id: &ActionId,

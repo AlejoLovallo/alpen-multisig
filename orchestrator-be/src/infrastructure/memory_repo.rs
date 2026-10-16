@@ -455,6 +455,41 @@ impl ProposalRepository for InMemoryProposalRepository {
         }
         Ok(true)
     }
+
+    async fn enact_executed_cancel(
+        &self,
+        cancel_action_id: &ActionId,
+        target_action_id: &ActionId,
+    ) -> Result<bool, AppError> {
+        let mut proposals = self
+            .proposals
+            .write()
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("repo lock poisoned")))?;
+
+        let target_open = proposals
+            .get(target_action_id)
+            .map(|p| {
+                matches!(
+                    p.status,
+                    ProposalStatus::Approved | ProposalStatus::Superseded | ProposalStatus::Enacted
+                )
+            })
+            .unwrap_or(false);
+
+        if !target_open {
+            return Ok(false);
+        }
+
+        if let Some(target) = proposals.get_mut(target_action_id) {
+            target.status = ProposalStatus::Canceled;
+            target.updated_at = Utc::now();
+        }
+        if let Some(proposal) = proposals.get_mut(cancel_action_id) {
+            proposal.status = ProposalStatus::Enacted;
+            proposal.updated_at = Utc::now();
+        }
+        Ok(true)
+    }
 }
 
 #[cfg(test)]

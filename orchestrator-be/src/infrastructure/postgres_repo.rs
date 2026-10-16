@@ -900,6 +900,54 @@ impl ProposalRepository for PostgresProposalRepository {
 
         Ok(true)
     }
+
+    async fn enact_executed_cancel(
+        &self,
+        cancel_action_id: &ActionId,
+        target_action_id: &ActionId,
+    ) -> Result<bool, AppError> {
+        let mut tx =
+            self.pool.begin().await.map_err(|e| {
+                AppError::Internal(anyhow::anyhow!("failed to begin transaction: {e}"))
+            })?;
+
+        let result = sqlx::query(
+            "UPDATE proposals SET status = $1, updated_at = NOW() \
+             WHERE action_id = $2 AND status IN ($3, $4, $5)",
+        )
+        .bind(status_to_db(ProposalStatus::Canceled))
+        .bind(&target_action_id.0)
+        .bind(status_to_db(ProposalStatus::Approved))
+        .bind(status_to_db(ProposalStatus::Superseded))
+        .bind(status_to_db(ProposalStatus::Enacted))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            AppError::Internal(anyhow::anyhow!("failed to mark target as canceled: {e}"))
+        })?;
+
+        if result.rows_affected() == 0 {
+            tx.commit().await.map_err(|e| {
+                AppError::Internal(anyhow::anyhow!("failed to commit transaction: {e}"))
+            })?;
+            return Ok(false);
+        }
+
+        sqlx::query("UPDATE proposals SET status = $1, updated_at = NOW() WHERE action_id = $2")
+            .bind(status_to_db(ProposalStatus::Enacted))
+            .bind(&cancel_action_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                AppError::Internal(anyhow::anyhow!("failed to mark cancel as enacted: {e}"))
+            })?;
+
+        tx.commit().await.map_err(|e| {
+            AppError::Internal(anyhow::anyhow!("failed to commit transaction: {e}"))
+        })?;
+
+        Ok(true)
+    }
 }
 
 /// #605 against a real Postgres: run with

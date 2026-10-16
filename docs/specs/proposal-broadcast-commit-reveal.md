@@ -528,9 +528,20 @@ acts on; the others are refused on the sequence number and cost only their fees.
   pair. An immediate action can be retired while the reveal that executed it is not listed yet; the
   import lists it, and if the ASM executed it the row returns to `approved` at `reveal_confirmed`
   (`confirm_tracked_reveal`). A cancel confirmed that way repairs a target already marked
-  `superseded`: that is the row written when the cancel's pair was not listed yet and the queue was
-  already empty. `enact_cancel` applies to `approved` or `superseded`; a target already `enacted`
-  still expires the cancel. A supersede applies only while the row is still `approved` at the
+  `superseded` or `enacted`: that `enacted` row is what an EeStfVk, or a Defcon 3 whose harbor is
+  already on, looks like once a cancel has removed it and the cancel's pair was not listed yet.
+  The confirm path applies that repair (`enact_executed_cancel`), and so does the sweep when
+  this read is the one that confirmed the reveal. A report cannot mark the target `enacted` while
+  its cancel is idle or already on chain. Enacting the target does not expire a cancel that is
+  still in flight: the reveal that executed may not be the pair on the row, and an expired row
+  takes no import. A superseded cancel that still has a pair is judged before the target is
+  enacted. A cancel reported `enacted`
+  after it is already `reveal_confirmed` cancels a target still `approved` or `superseded`
+  (`enact_cancel`).   An idle cancel — no pair on the row — holds its target, including after the sweep would
+  otherwise have marked the cancel `superseded`: a cancel is never in the queue, so a consumed
+  sequence number is also what that cancel executing looks like. Enacting the
+  target does not expire that idle cancel. A supersede applies only while the row is still
+  `approved` at the
   broadcast status that read observed (`supersede_if_unchanged`), so a confirmation that landed
   during the read is not overwritten. Decided in the write (`report_effect`).
 - **Watchers stop on a confirmed row, not on a 200.** The desktop's settle loop and the send screen's

@@ -506,7 +506,9 @@ fn mock_role_around_block(
         return Some(None);
     }
     let accepted = match rpc_url {
-        MOCK_MEMBERSHIP_URL | crate::infrastructure::asm_enactment::MOCK_SEQNO_AHEAD_URL => true,
+        MOCK_MEMBERSHIP_URL
+        | crate::infrastructure::asm_enactment::MOCK_SEQNO_AHEAD_URL
+        | crate::infrastructure::asm_enactment::MOCK_ENACTED_ACCEPTED_URL => true,
         MOCK_ASM_NOT_ACCEPTED_URL => false,
         _ => return None,
     };
