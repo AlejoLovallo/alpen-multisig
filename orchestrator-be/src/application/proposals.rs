@@ -10,8 +10,8 @@ use crate::domain::proposal::{
 };
 use crate::error::AppError;
 use crate::infrastructure::asm_role_membership::{
-    last_seqno_for_authority, lock_period_for_action, threshold_for_authority,
-    update_id_in_queue_for_action,
+    last_seqno_for_authority, lock_period_for_action, threshold_config_for_authority,
+    threshold_for_authority, update_id_in_queue_for_action,
 };
 use crate::infrastructure::bitcoin_rpc::BitcoinRpcClient;
 use chrono::{DateTime, Utc};
@@ -827,8 +827,10 @@ fn node_has_no_txindex(message: &str) -> bool {
 }
 
 /// Whether a mined `reveal` is a commit + reveal of `proposal` (#605): it spends `commit_txid`,
-/// and its envelope carries this proposal's sequence number and action, signed by a quorum of its
-/// approvers. Read the way the ASM reads it (`strata_asm_txs_admin::parser::parse_tx`).
+/// and its envelope carries this proposal's sequence number and action, with signatures the ASM
+/// accepts: verified against the role's signer configuration (`role`, keys in index order and
+/// threshold) by the ASM's own `verify_threshold_signatures`. Read the way the ASM reads it
+/// (`strata_asm_txs_admin::parser::parse_tx`).
 /// Registration takes any txid, so this is what keeps an unrelated mined transaction — or one
 /// carrying this action without the signatures the ASM needs — from becoming the pair the
 /// reconcile confirms.
@@ -836,6 +838,7 @@ fn reveal_carries_proposal(
     reveal: &bitcoin::Transaction,
     commit_txid: &str,
     proposal: &Proposal,
+    role: &strata_crypto::threshold_signature::ThresholdConfig,
 ) -> bool {
     use ssz::{Decode, Encode};
     let Some(input) = reveal.input.first() else {
@@ -862,52 +865,21 @@ fn reveal_carries_proposal(
     let Ok(action) = hex::decode(&proposal.action_hex) else {
         return false;
     };
-    signed.seqno == proposal.seq_no
-        && signed.action.as_ssz_bytes() == action
-        && signed_by_quorum(&signed, proposal)
-}
-
-/// Whether the payload's signatures include at least `required_signatures` distinct approvers of
-/// `proposal`, each a valid signature over the payload's own sighash (#605). Every signature is
-/// checked with the ASM's own verifier against one approver's key at a time, so this needs neither
-/// the role's key order nor an ASM call; the approvers were checked against the role when they
-/// signed.
-fn signed_by_quorum(
-    signed: &strata_asm_txs_admin::parser::SignedPayload,
-    proposal: &Proposal,
-) -> bool {
-    use strata_crypto::keys::compressed::CompressedPublicKey;
-    use strata_crypto::threshold_signature::{
-        verify_threshold_signatures, IndexedSignature, ThresholdConfig,
-    };
+    if signed.seqno != proposal.seq_no || signed.action.as_ssz_bytes() != action {
+        return false;
+    }
     let sighash = strata_asm_txs_admin::signing_message::SigningMessage::for_action(
         &signed.action,
         signed.seqno,
     )
     .compute_sighash()
     .0;
-    let approvers: Vec<ThresholdConfig> = proposal
-        .signatures
-        .iter()
-        .filter_map(|approval| hex::decode(&approval.signer_pubkey).ok())
-        .filter_map(|key| CompressedPublicKey::from_slice(&key).ok())
-        .filter_map(|key| ThresholdConfig::try_new(vec![key], std::num::NonZero::<u8>::MIN).ok())
-        .collect();
-    let mut signed_by = vec![false; approvers.len()];
-    for signature in signed.signatures.signatures() {
-        let mut bytes = [0u8; 65];
-        bytes[0] = signature.recovery_id();
-        bytes[1..33].copy_from_slice(signature.r());
-        bytes[33..].copy_from_slice(signature.s());
-        let alone = [IndexedSignature::new(0, bytes)];
-        if let Some(approver) = approvers
-            .iter()
-            .position(|key| verify_threshold_signatures(key, &alone, &sighash).is_ok())
-        {
-            signed_by[approver] = true;
-        }
-    }
-    signed_by.iter().filter(|signed| **signed).count() >= usize::from(proposal.required_signatures)
+    strata_crypto::threshold_signature::verify_threshold_signatures(
+        role,
+        signed.signatures.signatures(),
+        &sighash,
+    )
+    .is_ok()
 }
 
 /// What a progress report writes. A `failed` report for the pair the row tracks puts the row back
@@ -991,7 +963,11 @@ enum MinedPair {
 /// the proposal (#605): the lowest block height, and within one block the reveal the block lists
 /// first — the one the ASM executed. A mined reveal that is not a commit + reveal of this proposal
 /// does not count, however low its block. The lookups run side by side.
-async fn first_mined_pair(proposal: &Proposal, btc_client: &dyn BitcoinRpcClient) -> MinedPair {
+async fn first_mined_pair(
+    proposal: &Proposal,
+    btc_client: &dyn BitcoinRpcClient,
+    asm_rpc_url: &str,
+) -> MinedPair {
     let tracked = proposal.reveal_txid.as_deref();
     // A malformed txid (stored before reports were validated) can never be mined, and its failing
     // lookup would hold back every other pair; this includes one on the row itself.
@@ -1022,6 +998,8 @@ async fn first_mined_pair(proposal: &Proposal, btc_client: &dyn BitcoinRpcClient
 
     let mut mined: Vec<(u64, String, &str)> = Vec::new();
     let mut not_indexed = false;
+    // The role's signer configuration, read from the ASM once and only when a reveal is mined.
+    let mut role = None;
     for ((commit, reveal), answer) in candidates.iter().zip(answers) {
         match answer {
             RevealHeight::Mined { height, tx } => {
@@ -1033,10 +1011,23 @@ async fn first_mined_pair(proposal: &Proposal, btc_client: &dyn BitcoinRpcClient
                     (None, None) => continue,
                 };
                 // `None` only from a test double that reads no transaction.
-                if tx
-                    .as_ref()
-                    .is_some_and(|tx| !reveal_carries_proposal(tx, &commit, proposal))
-                {
+                if tx.is_some() && role.is_none() {
+                    match threshold_config_for_authority(asm_rpc_url, proposal.authority).await {
+                        Ok(config) => role = Some(config),
+                        Err(e) => {
+                            tracing::warn!(
+                                action_id = %proposal.action_id.0,
+                                "reconcile: role signer configuration unavailable: {e}"
+                            );
+                            return MinedPair::Unknown;
+                        }
+                    }
+                }
+                if let (Some(tx), Some(role)) = (tx.as_ref(), role.as_ref()) {
+                    if reveal_carries_proposal(tx, &commit, proposal, role) {
+                        mined.push((height, commit, reveal));
+                        continue;
+                    }
                     tracing::warn!(
                         action_id = %proposal.action_id.0,
                         reveal,
@@ -1120,10 +1111,19 @@ async fn confirm_reveal_if_mined(
     // leaves in place. The write applies only while the row still tracks the reveal this read
     // observed: a pair registered in between is left for the next reconcile, which sees both
     // (#605).
-    let MinedPair::First(commit_txid, reveal_txid) = first_mined_pair(&proposal, btc_client).await
-    else {
-        return proposal;
-    };
+    let (commit_txid, reveal_txid) =
+        match first_mined_pair(&proposal, btc_client, asm_rpc_url).await {
+            MinedPair::First(commit_txid, reveal_txid) => (commit_txid, reveal_txid),
+            MinedPair::NotIndexed => {
+                tracing::warn!(
+                    action_id = %proposal.action_id.0,
+                    "the node keeps no transaction index, so no mined reveal can be verified; \
+                     restart bitcoind with -txindex=1"
+                );
+                return proposal;
+            }
+            MinedPair::None | MinedPair::Unknown => return proposal,
+        };
     let updated = repo
         .confirm_tracked_reveal(
             &proposal.action_id,
@@ -1649,34 +1649,19 @@ pub(crate) async fn report_broadcast_progress(
         return Ok(raw);
     }
 
-    // With other pairs listed, which reveal confirmed is the node's call, not the report's (#605):
-    // an earlier pair may be mined in a lower block. The report records its pair as sent, and the
-    // reconcile promotes the pair mined first. A node that does not see it yet leaves the row for
-    // the next read. A lone pair has nothing to race, so its report is taken as before. So is any
-    // report a node without `-txindex` cannot check: it can never find a mined reveal, and the
-    // proposal would otherwise never confirm — the operator is told at startup.
+    // Which reveal confirmed, and whether the ASM can accept it, is the node's and the role's call,
+    // never the report's (#605): a member can get a reveal mined that carries this action with
+    // signatures the ASM rejects. The report records its pair as sent, and the reconcile confirms
+    // only the pair mined first whose reveal passes the ASM's own checks against the role's signer
+    // configuration — for a lone pair too. A node that does not see it yet, or that keeps no
+    // transaction index and so cannot read it, leaves the row for the next read.
     let competing_pairs = raw.broadcast_attempts.iter().any(|attempt| {
         !reveal_txid
             .as_deref()
             .is_some_and(|reported| attempt.reveal_txid.eq_ignore_ascii_case(reported))
     });
-    let mut confirming = broadcast_status == BroadcastStatus::RevealConfirmed
-        && raw.broadcast_status != BroadcastStatus::RevealConfirmed
-        && competing_pairs;
-    if let (true, Some(reveal)) = (confirming, reveal_txid.as_deref()) {
-        if matches!(
-            classify_reveal_height(btc_client.get_mined_reveal(reveal).await),
-            RevealHeight::NotIndexed
-        ) {
-            tracing::warn!(
-                action_id = %action_id.0,
-                reveal,
-                "the node keeps no transaction index; taking the desktop's reveal_confirmed for \
-                 a proposal with several pairs without checking which one was mined first"
-            );
-            confirming = false;
-        }
-    }
+    let confirming = broadcast_status == BroadcastStatus::RevealConfirmed
+        && raw.broadcast_status != BroadcastStatus::RevealConfirmed;
     let broadcast_status = if confirming {
         BroadcastStatus::RevealBroadcasted
     } else {
@@ -4799,10 +4784,10 @@ mod tests {
         assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_B));
     }
 
-    /// A lone pair has nothing to race: its `reveal_confirmed` is taken even when the node cannot
-    /// find the reveal, as on a node without `-txindex` once the reveal left the mempool.
+    /// A lone pair's `reveal_confirmed` is not taken on the desktop's word either: the node must
+    /// find the reveal mined, and it must pass the ASM's checks against the role (#605).
     #[tokio::test]
-    async fn a_lone_pairs_confirmed_report_is_taken_without_the_node() {
+    async fn a_lone_pairs_confirmed_report_waits_for_the_node() {
         let repo = new_repo();
         let action_id = save_with_pair_of_a(&repo).await;
 
@@ -4816,9 +4801,56 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(after.broadcast_status, BroadcastStatus::RevealBroadcasted);
 
-        assert_eq!(after.broadcast_status, BroadcastStatus::RevealConfirmed);
-        assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_A));
+        let confirmed = report_broadcast_progress(
+            &repo,
+            "mock://asm-membership",
+            session_of(&sig_a()),
+            &action_id,
+            &MinedReveals(vec![(
+                REVEAL_A,
+                800_010,
+                envelope_reveal(COMMIT_A, 1, &test_fixture_action_hex()),
+            )]),
+            report("reveal_confirmed", Some(COMMIT_A), Some(REVEAL_A)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(confirmed.broadcast_status, BroadcastStatus::RevealConfirmed);
+        assert_eq!(confirmed.reveal_txid.as_deref(), Some(REVEAL_A));
+    }
+
+    /// The claimer's own lone pair, mined with the approvals at indices that are not the role's,
+    /// is rejected by the ASM — and is not confirmed on its sender's report, nor given an
+    /// activation height.
+    #[tokio::test]
+    async fn a_lone_pair_the_asm_rejects_is_not_confirmed_on_its_report() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        let envelope = Envelope::new(&signed_payload_by(1, &test_fixture_action_hex(), &[2, 1]));
+        let swapped = envelope.reveal(
+            bitcoin::OutPoint::new(COMMIT_A.parse().unwrap(), 0),
+            bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(10_000),
+                script_pubkey: envelope.script_pubkey(),
+            },
+            bitcoin::ScriptBuf::new(),
+            1_000,
+        );
+
+        let after = report_broadcast_progress(
+            &repo,
+            "mock://asm-membership",
+            session_of(&sig_a()),
+            &action_id,
+            &MinedReveals(vec![(REVEAL_A, 800_010, swapped)]),
+            report("reveal_confirmed", Some(COMMIT_A), Some(REVEAL_A)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after.broadcast_status, BroadcastStatus::RevealBroadcasted);
+        assert_eq!(after.activation_height, None);
     }
 
     /// A report must name real txids: a malformed one would be listed and fail every lookup.
@@ -5056,7 +5088,7 @@ mod tests {
             unreadable: "reveal",
         };
 
-        let winner = first_mined_pair(&proposal, &btc).await;
+        let winner = first_mined_pair(&proposal, &btc, "mock://asm-membership").await;
 
         assert_eq!(
             winner,
@@ -5297,23 +5329,27 @@ mod tests {
         let action_id = save_with_pair_of_a(&repo).await;
         let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
         assert_eq!(proposal.seq_no, 1);
+        let role = threshold_config_for_authority("mock://asm-membership", proposal.authority)
+            .await
+            .unwrap();
+        let carries = |reveal: &bitcoin::Transaction, commit| {
+            reveal_carries_proposal(reveal, commit, &proposal, &role)
+        };
         let reveal = envelope_reveal(COMMIT_B, 1, &test_fixture_action_hex());
-        assert!(reveal_carries_proposal(&reveal, COMMIT_B, &proposal));
-        assert!(
-            !reveal_carries_proposal(&reveal, COMMIT_A, &proposal),
-            "spends another commit"
-        );
+        assert!(carries(&reveal, COMMIT_B));
+        assert!(!carries(&reveal, COMMIT_A), "spends another commit");
         let other_seq_no = envelope_reveal(COMMIT_B, 2, &test_fixture_action_hex());
-        assert!(!reveal_carries_proposal(&other_seq_no, COMMIT_B, &proposal));
+        assert!(!carries(&other_seq_no, COMMIT_B));
         let other_action = envelope_reveal(
             COMMIT_B,
             1,
             &crate::infrastructure::action_codec::test_fixture_council_rotation_action_hex(),
         );
-        assert!(!reveal_carries_proposal(&other_action, COMMIT_B, &proposal));
-        // The right action without the quorum the ASM needs: unsigned, or one approver of two, or
-        // the approvers' keys signing twice.
-        for secrets in [&[][..], &[1], &[1, 1], &[3, 4]] {
+        assert!(!carries(&other_action, COMMIT_B));
+        // The right action without signatures the ASM accepts: unsigned, one signer of two, one
+        // key signing twice, keys outside the role — or both approvers' valid signatures at each
+        // other's index, which a check that ignores the role's key order would take.
+        for secrets in [&[][..], &[1], &[1, 1], &[3, 4], &[2, 1]] {
             let envelope =
                 Envelope::new(&signed_payload_by(1, &test_fixture_action_hex(), secrets));
             let reveal = envelope.reveal(
@@ -5325,10 +5361,7 @@ mod tests {
                 bitcoin::ScriptBuf::new(),
                 1_000,
             );
-            assert!(
-                !reveal_carries_proposal(&reveal, COMMIT_B, &proposal),
-                "signed by {secrets:?}"
-            );
+            assert!(!carries(&reveal, COMMIT_B), "signed by {secrets:?}");
         }
         let plain = bitcoin::Transaction {
             version: bitcoin::transaction::Version::TWO,
@@ -5339,7 +5372,7 @@ mod tests {
             }],
             output: vec![],
         };
-        assert!(!reveal_carries_proposal(&plain, COMMIT_B, &proposal));
+        assert!(!carries(&plain, COMMIT_B));
     }
 
     /// Any txid can be registered. One mined after the registration that is not a commit + reveal
@@ -5387,6 +5420,59 @@ mod tests {
         .await;
         assert_eq!(confirmed.broadcast_status, BroadcastStatus::RevealConfirmed);
         assert_eq!(confirmed.reveal_txid.as_deref(), Some(REVEAL_A));
+    }
+
+    /// A member's reveal carries both approvals but at indices that are not the role's: the ASM
+    /// rejects it, so it does not win and the row stays in flight.
+    #[tokio::test]
+    async fn a_reveal_with_signatures_at_the_wrong_indices_does_not_win() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        let envelope = Envelope::new(&signed_payload_by(1, &test_fixture_action_hex(), &[2, 1]));
+        let swapped = envelope.reveal(
+            bitcoin::OutPoint::new(COMMIT_B.parse().unwrap(), 0),
+            bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(10_000),
+                script_pubkey: envelope.script_pubkey(),
+            },
+            bitcoin::ScriptBuf::new(),
+            1_000,
+        );
+
+        let unchanged = confirm_reveal_if_mined(
+            &repo,
+            proposal,
+            &MinedReveals(vec![(REVEAL_B, 800_005, swapped)]),
+            "mock://asm-membership",
+        )
+        .await;
+        assert_eq!(
+            unchanged.broadcast_status,
+            BroadcastStatus::CommitBroadcasted
+        );
+        let stored = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        assert_eq!(stored.activation_height, None);
+    }
+
+    /// The role's configuration cannot be read: a mined reveal is not taken on trust.
+    #[tokio::test]
+    async fn a_mined_reveal_waits_when_the_role_cannot_be_read() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        let winner = first_mined_pair(
+            &proposal,
+            &MinedReveals(vec![(
+                REVEAL_A,
+                800_010,
+                envelope_reveal(COMMIT_A, 1, &test_fixture_action_hex()),
+            )]),
+            "mock://unreachable-asm",
+        )
+        .await;
+        assert_eq!(winner, MinedPair::Unknown);
     }
 
     /// A pair first reported after it was mined (the manual fallback, imported later) still wins:
@@ -5496,11 +5582,10 @@ mod tests {
         assert_eq!(claimed.broadcast_status, BroadcastStatus::CommitBroadcasted);
     }
 
-    /// A node without `-txindex` cannot find any mined reveal, so a `reveal_confirmed` report
-    /// beside other pairs is taken as reported rather than leaving the proposal in flight for
-    /// good — as after a retry that follows a failed send.
+    /// A node without `-txindex` cannot read any mined reveal, so nothing can be verified and a
+    /// `reveal_confirmed` report is not taken: the row waits at `reveal_broadcasted`.
     #[tokio::test]
-    async fn a_node_without_txindex_takes_the_report_beside_other_pairs() {
+    async fn a_node_without_txindex_confirms_nothing() {
         let repo = new_repo();
         let action_id = save_with_pair_of_a(&repo).await;
         register_pair_of_b(&repo, &action_id).await.unwrap();
@@ -5518,7 +5603,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(confirmed.broadcast_status, BroadcastStatus::RevealConfirmed);
+        assert_eq!(
+            confirmed.broadcast_status,
+            BroadcastStatus::RevealBroadcasted
+        );
         assert_eq!(confirmed.reveal_txid.as_deref(), Some(REVEAL_B));
     }
 
@@ -5665,6 +5753,7 @@ mod tests {
                 800_010,
                 envelope_reveal(COMMIT_A, 1, &test_fixture_action_hex()),
             )]),
+            "mock://asm-membership",
         )
         .await;
         assert_eq!(
@@ -5845,8 +5934,18 @@ mod tests {
 
         /// A commit + reveal pair of the fixture action at `seq_no`, both left in the mempool.
         async fn send_pair(&self, seq_no: u64) -> (String, String) {
+            self.send_pair_signed_by(seq_no, &[1, 2]).await
+        }
+
+        /// The same pair, its payload signed by the fixture keys with these secret scalars at
+        /// indices 0, 1, ….
+        async fn send_pair_signed_by(&self, seq_no: u64, secrets: &[u8]) -> (String, String) {
             use std::str::FromStr;
-            let envelope = Envelope::new(&signed_payload(seq_no, &test_fixture_action_hex()));
+            let envelope = Envelope::new(&signed_payload_by(
+                seq_no,
+                &test_fixture_action_hex(),
+                secrets,
+            ));
             let address =
                 bitcoin::Address::from_script(&envelope.script_pubkey(), bitcoin::Network::Regtest)
                     .unwrap();
@@ -6000,6 +6099,55 @@ mod tests {
         assert_eq!(stored.activation_height, Some(height + 2016));
     }
 
+    /// A member's pair carries both approvals at indices that are not the role's: mined first, it
+    /// is rejected by the ASM, and neither its sender's report nor the reconcile confirms it.
+    /// A's valid reveal, mined later, does.
+    #[tokio::test]
+    #[ignore = "needs bitcoind on PATH"]
+    async fn regtest_a_reveal_the_asm_rejects_does_not_win() {
+        let chain = Regtest::start(true).await;
+        let (commit_a, reveal_a) = chain.send_pair(1).await;
+        let (commit_m, reveal_m) = chain.send_pair_signed_by(1, &[2, 1]).await;
+        let repo = new_repo();
+        let action_id = save_with_pair(&repo, 1, &commit_a, &reveal_a).await;
+        register_additional_pair(
+            &repo,
+            session_of(&sig_b()),
+            "mock://asm-membership",
+            &chain.node,
+            &action_id,
+            &commit_m,
+            &reveal_m,
+        )
+        .await
+        .unwrap();
+
+        chain.mine(&[&commit_m, &reveal_m]).await;
+        let reported = report_broadcast_progress(
+            &repo,
+            "mock://asm-membership",
+            session_of(&sig_b()),
+            &action_id,
+            &chain.node,
+            report("reveal_confirmed", Some(&commit_m), Some(&reveal_m)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reported.broadcast_status,
+            BroadcastStatus::RevealBroadcasted
+        );
+        assert_eq!(reported.activation_height, None);
+
+        let height = chain.mine(&[&commit_a, &reveal_a]).await;
+        let confirmed =
+            confirm_reveal_if_mined(&repo, reported, &chain.node, "mock://asm-membership").await;
+        assert_eq!(confirmed.broadcast_status, BroadcastStatus::RevealConfirmed);
+        assert_eq!(confirmed.reveal_txid.as_deref(), Some(reveal_a.as_str()));
+        let stored = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        assert_eq!(stored.activation_height, Some(height + 2016));
+    }
+
     /// Both reveals in one block: the one the block lists first is the one the ASM executed.
     #[tokio::test]
     #[ignore = "needs bitcoind on PATH"]
@@ -6037,11 +6185,11 @@ mod tests {
     }
 
     /// Without `-txindex` the node cannot find B's mined reveal once it left the mempool. The row
-    /// stays in flight instead of confirming A's unmined pair or skipping B's; a lone pair's
-    /// report is still taken.
+    /// stays in flight instead of confirming A's unmined pair or skipping B's, and a lone pair's
+    /// report is not taken either: nothing can be verified.
     #[tokio::test]
     #[ignore = "needs bitcoind on PATH"]
-    async fn regtest_a_node_without_txindex_leaves_several_pairs_in_flight() {
+    async fn regtest_a_node_without_txindex_confirms_nothing() {
         let chain = Regtest::start(false).await;
         let (commit_a, reveal_a) = chain.send_pair(1).await;
         let (commit_b, reveal_b) = chain.send_pair(1).await;
@@ -6069,7 +6217,7 @@ mod tests {
         );
         assert_eq!(chain.node.txindex().await.unwrap(), TxIndex::Missing);
 
-        // A lone pair on the same node: its desktop's report confirms it.
+        // A lone pair on the same node: its desktop's report cannot be verified, so it waits.
         let (commit_c, reveal_c) = chain.send_pair(2).await;
         // Its own repository: one broadcast in flight per authority.
         let lone_repo = new_repo();
@@ -6085,7 +6233,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(confirmed.broadcast_status, BroadcastStatus::RevealConfirmed);
+        assert_eq!(
+            confirmed.broadcast_status,
+            BroadcastStatus::RevealBroadcasted
+        );
     }
 
     /// A registration whose session died before broadcasting leaves a commit the node finds

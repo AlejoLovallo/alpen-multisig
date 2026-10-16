@@ -67,6 +67,26 @@ pub(crate) async fn threshold_for_authority(
     Ok(u16::from(authority_config.config().threshold()))
 }
 
+/// The role's live signer configuration — its keys in index order and its threshold — exactly as
+/// the ASM verifies a payload's signatures against it (#605).
+pub(crate) async fn threshold_config_for_authority(
+    rpc_url: &str,
+    authority: Authority,
+) -> Result<strata_crypto::threshold_signature::ThresholdConfig, AppError> {
+    if let Some(config) = mock_threshold_config(rpc_url, authority) {
+        return Ok(config);
+    }
+
+    let admin = asm_rpc::fetch_admin_state(rpc_url)
+        .await
+        .map_err(AppError::BadRequest)?;
+    let role = authority_to_role(authority).map_err(AppError::BadRequest)?;
+    let authority_config = admin
+        .authority(role)
+        .ok_or_else(|| asm_rpc::missing_authority(role))?;
+    Ok(authority_config.config().clone())
+}
+
 /// Return the confirmation depth (in blocks) before the update in `action_hex` activates.
 ///
 /// Resolved from the action, never from the authority: the Security Council signs both Defcon 1
@@ -394,6 +414,41 @@ fn mock_threshold(rpc_url: &str, authority: Authority) -> Option<u16> {
 
 #[cfg(not(any(test, feature = "dev-mocks")))]
 fn mock_threshold(_rpc_url: &str, _authority: Authority) -> Option<u16> {
+    None
+}
+
+/// The membership fixture's signers — 1·G at index 0 and 2·G at index 1 — at the fixture threshold
+/// of 2, for every URL `mock_threshold` answers.
+#[cfg(any(test, feature = "dev-mocks"))]
+fn mock_threshold_config(
+    rpc_url: &str,
+    authority: Authority,
+) -> Option<strata_crypto::threshold_signature::ThresholdConfig> {
+    use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+    use strata_crypto::keys::compressed::CompressedPublicKey;
+    let threshold = mock_threshold(rpc_url, authority)?;
+    let secp = Secp256k1::new();
+    let keys = [1u8, 2]
+        .into_iter()
+        .map(|scalar| {
+            let mut secret = [0u8; 32];
+            secret[31] = scalar;
+            let key = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&secret).ok()?);
+            CompressedPublicKey::from_slice(&key.serialize()).ok()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    strata_crypto::threshold_signature::ThresholdConfig::try_new(
+        keys,
+        std::num::NonZero::new(u8::try_from(threshold).ok()?)?,
+    )
+    .ok()
+}
+
+#[cfg(not(any(test, feature = "dev-mocks")))]
+fn mock_threshold_config(
+    _rpc_url: &str,
+    _authority: Authority,
+) -> Option<strata_crypto::threshold_signature::ThresholdConfig> {
     None
 }
 

@@ -446,8 +446,12 @@ acts on; the others are refused on the sequence number and cost only their fees.
   the reconcile checks every mined reveal it considers: its first input must spend the pair's commit,
   and its envelope must decode — the way the ASM reads it (`parse_tx`: taproot leaf script,
   `parse_envelope_payload`, SSZ `SignedPayload`) — to this proposal's sequence number and action,
-  signed over its sighash by at least `required_signatures` distinct approvers of the proposal, each
-  checked with the ASM's own verifier (`reveal_carries_proposal`, `signed_by_quorum`). A mined transaction that does not is ignored, however low its block,
+  and its signatures must pass the ASM's own `verify_threshold_signatures` against the role's live
+  signer configuration from the ASM (`threshold_config_for_authority`: keys in index order and
+  threshold). An approval at an index that is not that approver's, too few signatures, or a key
+  outside the role is what the ASM rejects, and so does the reconcile (`reveal_carries_proposal`). A
+  role configuration the ASM cannot return leaves the row for the next read. A mined transaction that
+  does not pass is ignored, however low its block,
   and the row stays in flight. A pair first reported after it was mined (the manual fallback,
   imported later) still counts: what it carries decides, not when it was registered.
 - **A failed pair falls back only to a live one.** A `failed` report for the pair the row tracks,
@@ -465,21 +469,19 @@ acts on; the others are refused on the sequence number and cost only their fees.
   reveal looks the same, so the answer is not taken. The winner's txids are written explicitly, and only while the
   row still tracks the reveal observed on that read (`confirm_tracked_reveal`); a pair registered in between
   waits for the next read. The activation height and the queue id come from the winner.
-- **With other pairs, only the reconcile confirms.** When another pair is listed, a `reveal_confirmed`
-  `PATCH` on a row not yet confirmed records its pair as `reveal_broadcasted` and then runs the same
-  reconcile, so an earlier pair in a lower block still wins. A node that does not see the reveal yet
-  leaves the row at `reveal_broadcasted` until the next read. A lone pair has nothing to race, so its
-  `reveal_confirmed` is taken as before. So is a report about the tracked pair that the node cannot
-  check because it runs without `-txindex` (its answer about the reported reveal says so): it could
-  never find a mined reveal, and the proposal would otherwise never confirm. A report about a pair
-  the row no longer tracks is still ignored. Which pair won and its activation height are then the
-  desktop's word, as before #605; the orchestrator logs a warning for each such report.
-- **Node requirement.** Choosing between several pairs needs `getrawtransaction` to find mined
-  transactions, so the orchestrator's Bitcoin node must run with `-txindex=1` for the orchestrator to
-  decide which of several pairs won; without it the reconcile cannot confirm them, and only the
-  tracked pair's own report confirms the row, unchecked. If a replaced pair is the one mined and the
-  tracked pair then fails, nothing confirms the proposal. The orchestrator checks `getindexinfo` at startup and logs an error when
-  the index is missing, and a warning while it is not yet synced. Staging (`staging/entrypoint-bitcoin.sh`) and
+- **Only the reconcile confirms.** A `reveal_confirmed` `PATCH` on a row not yet confirmed — a lone
+  pair's too — records its pair as `reveal_broadcasted` and then runs the same reconcile: an earlier
+  pair in a lower block still wins, and a reveal the ASM would reject is never confirmed on its
+  sender's word, nor gives the row an activation height. A node that does not see the reveal yet
+  leaves the row at `reveal_broadcasted` until the next read. A report about a pair the row no longer
+  tracks is ignored.
+- **Node requirement.** Verifying a mined reveal needs `getrawtransaction` to read it, so the
+  orchestrator's Bitcoin node must run with `-txindex=1`. Without it the orchestrator confirms no
+  reveal at all: the row stays at `reveal_broadcasted` (and the desktop keeps reporting), the
+  enactment check never runs, and an action that applied immediately is retired by the sweep once its
+  sequence number is consumed. The orchestrator checks `getindexinfo` at startup and logs an error
+  when the index is missing, a warning while it is not yet synced, and a warning on each reconcile
+  that cannot read a reveal. Staging (`staging/entrypoint-bitcoin.sh`) and
   `scripts/bitcoind-asm-runner.sh` set it; see the runbook for other deployments.
 - **Watchers stop on a confirmed row, not on a 200.** The desktop's settle loop and the send screen's
   poll report `reveal_confirmed` and stop only once the row they get back says `reveal_confirmed`;
@@ -522,8 +524,10 @@ acts on; the others are refused on the sequence number and cost only their fees.
   10 s whether this desktop still holds a bundle, since the settle loop can drop one without the row
   changing.
 - **Accepted limits.** A pair backfilled with no broadcaster does not lock its sender out. A retry
-  after `failed` leaves the earlier attempt listed, so the new pair is not a lone pair: the node decides
-  with `-txindex`, and without it the desktop's report is taken, as above. The pre-check and the
+  after `failed` leaves the earlier attempt listed; the node decides among them like any other pairs.
+  The winner is verified against the role's configuration as it stands when the reconcile reads it: a
+  rotation of the same role between the reveal being mined and that read can leave a valid reveal
+  unverified, and the proposal is then not confirmed by the orchestrator. The pre-check and the
   registration are two calls: the row can move between them, and the registration then refuses after
   the device signed. The per-signer limit counts every pair listed, including a pre-registered pair
   whose broadcast the node refused: a signer whose sends failed three times cannot send this proposal
