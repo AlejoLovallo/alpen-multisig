@@ -1457,9 +1457,20 @@ async fn bitcoin_tip_for_enactment(
     btc_client.get_chain_tip().await.map(Some)
 }
 
-/// Whether a cancel of this proposal already reached the chain, so the sweep must not decide the
-/// target's lifecycle this cycle.
-///
+/// What a cancel of this target means for the target's reconcile this cycle.
+#[derive(Debug, PartialEq, Eq)]
+enum CancelOfTarget {
+    /// No cancel, or one that has not reached the chain. The target is decided on its own.
+    None,
+    /// Its reveal is confirmed. It owns the target: neither activation nor retirement.
+    OnChain,
+    /// Still in flight, and this read could not judge its reveal. Neither retirement nor the
+    /// enacted write runs: a cancel leaves the same shape as enactment for a queued update whose
+    /// only trace is "sequence number consumed, gone from the queue". The activation height is
+    /// still stored, so the countdown is not what this hold stops.
+    Open,
+}
+
 /// A cancel that confirms takes its target out of the admin queue while the target's seqno is
 /// already consumed — the exact shape `supersede_if_seq_no_consumed` reads as "dead". Left alone,
 /// a cancelled Defcon 3 would land on `Superseded` instead of `Canceled`, and `enact_cancel` would
@@ -1470,28 +1481,34 @@ async fn bitcoin_tip_for_enactment(
 /// An `Expired` cancel is the case where the target enacted first, so it holds nothing up.
 ///
 /// A cancel still in flight may already have executed: only the reconcile confirms it (#605), and
-/// the target can be read first. Its reveal is judged here, before the target's fate; a read that
-/// cannot judge it holds the target too.
-async fn cancel_reached_chain(
+/// the target can be read first. Its reveal is judged here. A read that cannot judge it (`Open`)
+/// holds the target the same way: the enacted write would be terminal, and the next read could
+/// not undo it.
+async fn cancel_of_target(
     repo: &dyn ProposalRepository,
     asm_rpc_url: &str,
     btc_client: &dyn BitcoinRpcClient,
     target_action_id: &ActionId,
-) -> Result<bool, AppError> {
+) -> Result<CancelOfTarget, AppError> {
     let Some(cancel) = repo.find_cancel_for_target(target_action_id).await? else {
-        return Ok(false);
+        return Ok(CancelOfTarget::None);
     };
     let cancel = if cancel.status == ProposalStatus::Approved {
         let checked = try_confirm_reveal(repo, cancel, btc_client, asm_rpc_url).await;
         if checked.inconclusive {
-            return Ok(true);
+            return Ok(CancelOfTarget::Open);
         }
         checked.proposal
     } else {
         cancel
     };
-    Ok(cancel.broadcast_status == BroadcastStatus::RevealConfirmed
-        && cancel.status != ProposalStatus::Expired)
+    if cancel.broadcast_status == BroadcastStatus::RevealConfirmed
+        && cancel.status != ProposalStatus::Expired
+    {
+        Ok(CancelOfTarget::OnChain)
+    } else {
+        Ok(CancelOfTarget::None)
+    }
 }
 
 /// Advance one approved proposal: notice a reveal that confirmed, decide enactment, or retire it.
@@ -1520,10 +1537,29 @@ async fn reconcile_one(
     }
     let proposal = checked.proposal;
 
-    // A cancel that is already on chain owns this proposal's outcome — see `cancel_reached_chain`.
-    if !proposal.is_cancel()
-        && cancel_reached_chain(repo, asm_rpc_url, btc_client, &proposal.action_id).await?
-    {
+    // A cancel on chain owns this proposal. One whose reveal this read could not judge holds it
+    // too — see `cancel_of_target`. Neither case may mark the target enacted or superseded.
+    let cancel = if proposal.is_cancel() {
+        CancelOfTarget::None
+    } else {
+        cancel_of_target(repo, asm_rpc_url, btc_client, &proposal.action_id).await?
+    };
+    if matches!(cancel, CancelOfTarget::OnChain | CancelOfTarget::Open) {
+        // The countdown is stored at reveal confirmation. Retry it here when that lookup failed,
+        // so an open cancel does not leave the height blank until a later read of this row.
+        if cancel == CancelOfTarget::Open
+            && proposal.broadcast_status == BroadcastStatus::RevealConfirmed
+            && proposal.activation_height.is_none()
+        {
+            if let Err(e) =
+                compute_and_store_activation_height(&proposal, repo, btc_client, asm_rpc_url).await
+            {
+                tracing::warn!(
+                    action_id = %proposal.action_id.0,
+                    "reconcile: activation height still unavailable while its cancel is unjudged: {e}"
+                );
+            }
+        }
         return Ok(());
     }
 
@@ -6375,6 +6411,131 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cancel.broadcast_status, BroadcastStatus::RevealConfirmed);
+    }
+
+    /// An approved target whose reveal already confirmed, and a cancel of it still in flight.
+    async fn target_with_cancel_in_flight(
+        repo: &InMemoryProposalRepository,
+    ) -> (ActionId, ActionId) {
+        let target = save_approved_proposal(repo, Authority::StrataAdmin, 1).await;
+        repo.update_broadcast_status(
+            &target.action_id,
+            BroadcastStatus::RevealConfirmed,
+            None,
+            Some(COMMIT_A),
+            Some(REVEAL_A),
+            None,
+        )
+        .await
+        .unwrap();
+        let cancel = create_cancel_proposal(
+            repo,
+            "mock://asm-membership",
+            session_of(&sig_a()),
+            target.action_id.clone(),
+            2,
+            "cafebabe",
+            "cancel_sig",
+        )
+        .await
+        .unwrap();
+        approve_action(repo, session_of(&sig_b()), &cancel.action_id, &sig_b())
+            .await
+            .unwrap();
+        transition_to_approved(
+            repo,
+            session_of(&sig_b()),
+            "mock://asm-membership",
+            &cancel.action_id,
+        )
+        .await
+        .unwrap();
+        repo.update_broadcast_status(
+            &cancel.action_id,
+            BroadcastStatus::RevealBroadcasted,
+            None,
+            Some(COMMIT_C),
+            Some(REVEAL_C),
+            None,
+        )
+        .await
+        .unwrap();
+        (target.action_id, cancel.action_id)
+    }
+
+    /// The cancel's reveal cannot be read. The node answers for the target's reveal.
+    fn cancel_reveal_unreadable() -> RevealLookup {
+        RevealLookup {
+            heights: [(REVEAL_A, 800_010)].into_iter().collect(),
+            unreadable: REVEAL_C,
+        }
+    }
+
+    /// An open read of the cancel must not mark the target enacted. The predicate can already be
+    /// true for a cancel that did execute (sequence number consumed, update gone from the queue),
+    /// and both writes would be terminal.
+    #[tokio::test]
+    async fn an_unjudged_cancel_does_not_enact_its_target() {
+        let repo = new_repo();
+        let (target_id, cancel_id) = target_with_cancel_in_flight(&repo).await;
+
+        reconcile_enacted_for_action(
+            &repo,
+            "mock://asm-enacted",
+            &cancel_reveal_unreadable(),
+            Authority::StrataAdmin,
+            &target_id,
+        )
+        .await
+        .unwrap();
+
+        let target = repo.find_by_action_id(&target_id).await.unwrap().unwrap();
+        assert_eq!(target.status, ProposalStatus::Approved);
+        let cancel = repo.find_by_action_id(&cancel_id).await.unwrap().unwrap();
+        assert_eq!(cancel.status, ProposalStatus::Approved);
+    }
+
+    /// The same open read still holds retirement: the target looks dead (seqno passed, and the
+    /// cancel may have taken it out of the queue) and must not be marked superseded.
+    #[tokio::test]
+    async fn an_unjudged_cancel_still_holds_its_target() {
+        let repo = new_repo();
+        let (target_id, _) = target_with_cancel_in_flight(&repo).await;
+
+        reconcile_enacted_for_action(
+            &repo,
+            crate::infrastructure::asm_enactment::MOCK_SEQNO_AHEAD_URL,
+            &cancel_reveal_unreadable(),
+            Authority::StrataAdmin,
+            &target_id,
+        )
+        .await
+        .unwrap();
+
+        let target = repo.find_by_action_id(&target_id).await.unwrap().unwrap();
+        assert_eq!(target.status, ProposalStatus::Approved);
+    }
+
+    /// What the hold does not stop is the countdown. A reveal confirmation whose height lookup
+    /// failed is retried while the cancel stays unjudged.
+    #[tokio::test]
+    async fn an_unjudged_cancel_still_records_the_activation_height() {
+        let repo = new_repo();
+        let (target_id, _) = target_with_cancel_in_flight(&repo).await;
+
+        reconcile_enacted_for_action(
+            &repo,
+            "mock://asm-membership",
+            &cancel_reveal_unreadable(),
+            Authority::StrataAdmin,
+            &target_id,
+        )
+        .await
+        .unwrap();
+
+        let target = repo.find_by_action_id(&target_id).await.unwrap().unwrap();
+        assert_eq!(target.status, ProposalStatus::Approved);
+        assert_eq!(target.activation_height, Some(800_010 + 2016));
     }
 
     /// A pair already listed under another signer is refused as such, not as the caller's own.

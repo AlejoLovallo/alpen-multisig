@@ -474,8 +474,14 @@ acts on; the others are refused on the sequence number and cost only their fees.
   node that has seen every block the ASM has processed (`node_caught_up_with_asm`, the ASM's
   `cur_block` against the node's tip): a node behind the ASM would read an executed reveal as unmined,
   so that read is left open too. A cancel still in flight is judged before its target is decided
-  (`cancel_reached_chain`): only the reconcile confirms it, and read first the target would look dead
-  — its seqno consumed, gone from the queue.
+  (`cancel_of_target`): only the reconcile confirms it, and read first the target would look dead
+  — its seqno consumed, gone from the queue. A read that cannot judge that cancel holds the
+  target the same way: it is not marked superseded, and it is not marked enacted. The enacted
+  write is terminal, and a cancel leaves the same ASM shape as enactment for a queued update
+  whose trace is only that its sequence number was consumed and it left the queue (an `EeStfVk`),
+  or for a Defcon 3 whose harbor was already on once the tip passes its activation height. The
+  next read judges the cancel. The activation height is stored when the reveal confirms, and
+  retried on this hold if that lookup failed, so the countdown is not what the hold stops.
 - **A failed pair falls back only to a live one.** A `failed` report for the pair the row tracks,
   when another pair is listed, sets the row back to the newest other pair that may still be on its
   way, at `commit_broadcasted`, and clears the error. Only a pair whose commit the node answers is
