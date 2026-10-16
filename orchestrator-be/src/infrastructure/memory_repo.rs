@@ -218,6 +218,24 @@ impl ProposalRepository for InMemoryProposalRepository {
         Ok(proposal.clone())
     }
 
+    async fn enact_if_approved(&self, action_id: &ActionId) -> Result<bool, AppError> {
+        let mut proposals = self
+            .proposals
+            .write()
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("repo lock poisoned")))?;
+        let Some(proposal) = proposals.get_mut(action_id) else {
+            return Ok(false);
+        };
+        if proposal.status != ProposalStatus::Approved
+            || proposal.broadcast_status != BroadcastStatus::RevealConfirmed
+        {
+            return Ok(false);
+        }
+        proposal.status = ProposalStatus::Enacted;
+        proposal.updated_at = Utc::now();
+        Ok(true)
+    }
+
     async fn supersede_if_unchanged(
         &self,
         action_id: &ActionId,

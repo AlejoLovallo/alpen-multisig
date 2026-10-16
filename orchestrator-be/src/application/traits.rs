@@ -55,6 +55,10 @@ pub(crate) trait ProposalRepository: Send + Sync {
         abandoned: &[String],
     ) -> Result<Proposal, AppError>;
 
+    /// Mark `approved` + `reveal_confirmed` as `enacted`. A row that is no longer `approved`
+    /// — a cancel wrote `canceled` during this read — is left as it is.
+    async fn enact_if_approved(&self, action_id: &ActionId) -> Result<bool, AppError>;
+
     /// Mark `approved` as `superseded`, but only while `broadcast_status` is still `observed`.
     ///
     /// A confirmation that landed after this read started does not match, and is left in place.

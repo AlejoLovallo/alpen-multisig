@@ -574,6 +574,23 @@ impl ProposalRepository for PostgresProposalRepository {
             .ok_or(AppError::NotFound)
     }
 
+    async fn enact_if_approved(&self, action_id: &ActionId) -> Result<bool, AppError> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE proposals
+            SET status = 'enacted', updated_at = NOW()
+            WHERE action_id = $1
+              AND status = 'approved'
+              AND broadcast_status = 'reveal_confirmed'
+            "#,
+        )
+        .bind(&action_id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to enact proposal: {e}")))?;
+        Ok(updated.rows_affected() > 0)
+    }
+
     async fn supersede_if_unchanged(
         &self,
         action_id: &ActionId,

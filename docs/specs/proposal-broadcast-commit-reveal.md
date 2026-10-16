@@ -480,7 +480,11 @@ acts on; the others are refused on the sequence number and cost only their fees.
   (`cancel_of_target`): only the reconcile confirms it, and read first the target would look dead
   — its seqno consumed, gone from the queue. When that read confirms the cancel and the ASM shows
   the cancel executed, the target is canceled in the same read (`enact_confirmed_cancel`); opening
-  the target is enough. A read that cannot judge that cancel holds the
+  the target is enough. The cancel is judged again immediately before the target is enacted or
+  superseded (`cancel_blocks_target`), and the supersede write judges it once more after the
+  admin-queue read: a reveal that lands during those lookups is not written over. The enacted
+  write itself applies only while the row is still `approved`
+  (`enact_if_approved`). A read that cannot judge that cancel holds the
   target the same way: it is not marked superseded, and it is not marked enacted. The enacted
   write is terminal, and a cancel leaves the same ASM shape as enactment for a queued update
   whose trace is only that its sequence number was consumed and it left the queue (an `EeStfVk`),
@@ -575,7 +579,11 @@ acts on; the others are refused on the sequence number and cost only their fees.
   block. When two actions of the same role land in one block — which the claim gate prevents in the
   app, but a manual broadcast can do — a rejected reveal can be credited with the other's effect: an
   immediate action whose sequence number the other took; a queued update identical to one queued by
-  the other; a cancel whose target matured in that same block. A signer who mines a transaction that
+  the other; a cancel whose target matured in that same block. The other face of that limit: a
+  target reveal and a cancel of it in one block, the cancel after the target. Before the block the
+  update is not queued, and after it the cancel has already removed it, so neither reveal passes
+  `asm_executed`. Both rows can be retired, and a later import sees the same before and after. A
+  signer who mines a transaction that
   carries the proposal's payload without the administration tag, and reports it, leaves every read of
   that proposal open until some reveal is executed: the proposal is not retired, and while it is in
   flight its authority's claim gate stays shut (bounded by the per-signer pair limit, and no worse than

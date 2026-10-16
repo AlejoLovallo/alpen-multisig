@@ -1432,6 +1432,7 @@ async fn live_last_seqno(asm_rpc_url: &str, authority: Authority) -> Option<u64>
 async fn supersede_if_seq_no_consumed(
     repo: &dyn ProposalRepository,
     asm_rpc_url: &str,
+    btc_client: &dyn BitcoinRpcClient,
     proposal: &Proposal,
     last_seqno: Option<u64>,
 ) -> Result<(), AppError> {
@@ -1448,6 +1449,11 @@ async fn supersede_if_seq_no_consumed(
             );
             return Ok(());
         }
+    }
+    // The queue read is another RPC, and a cancel mined during it leaves this same empty queue.
+    // Judged again here, with no lookup left between this and the write.
+    if cancel_blocks_target(repo, asm_rpc_url, btc_client, proposal).await? {
+        return Ok(());
     }
     tracing::info!(
         action_id = %proposal.action_id.0,
@@ -1609,6 +1615,42 @@ async fn expire_cancel_if_still_approved(
     Ok(())
 }
 
+/// `true` when a cancel owns this target, or its reveal could not be judged, so this read must not
+/// enact or supersede it.
+///
+/// Called again immediately before either write. A cancel whose reveal lands during the enactment
+/// lookups is caught there; the write itself still requires the row to be `approved`.
+async fn cancel_blocks_target(
+    repo: &dyn ProposalRepository,
+    asm_rpc_url: &str,
+    btc_client: &dyn BitcoinRpcClient,
+    proposal: &Proposal,
+) -> Result<bool, AppError> {
+    if proposal.is_cancel() {
+        return Ok(false);
+    }
+    let cancel = cancel_of_target(repo, asm_rpc_url, btc_client, &proposal.action_id).await?;
+    if cancel == CancelOfTarget::Open
+        && proposal.broadcast_status == BroadcastStatus::RevealConfirmed
+        && proposal.activation_height.is_none()
+    {
+        if let Err(e) =
+            compute_and_store_activation_height(proposal, repo, btc_client, asm_rpc_url).await
+        {
+            tracing::warn!(
+                action_id = %proposal.action_id.0,
+                "reconcile: activation height still unavailable while its cancel is unjudged: {e}"
+            );
+        }
+    }
+    if cancel == CancelOfTarget::OnChain {
+        if let Some(cancel_proposal) = repo.find_cancel_for_target(&proposal.action_id).await? {
+            enact_confirmed_cancel(repo, asm_rpc_url, btc_client, &cancel_proposal).await?;
+        }
+    }
+    Ok(cancel != CancelOfTarget::None)
+}
+
 /// Advance one approved proposal: notice a reveal that confirmed, decide enactment, or retire it.
 ///
 /// `last_seqno` is the role's live sequence number, or `None` when the ASM could not answer —
@@ -1636,35 +1678,8 @@ async fn reconcile_one(
     let proposal = checked.proposal;
 
     // A cancel on chain owns this proposal. One whose reveal this read could not judge holds it
-    // too — see `cancel_of_target`. Neither case may mark the target enacted or superseded.
-    let cancel = if proposal.is_cancel() {
-        CancelOfTarget::None
-    } else {
-        cancel_of_target(repo, asm_rpc_url, btc_client, &proposal.action_id).await?
-    };
-    if matches!(cancel, CancelOfTarget::OnChain | CancelOfTarget::Open) {
-        // The countdown is stored at reveal confirmation. Retry it here when that lookup failed,
-        // so an open cancel does not leave the height blank until a later read of this row.
-        if cancel == CancelOfTarget::Open
-            && proposal.broadcast_status == BroadcastStatus::RevealConfirmed
-            && proposal.activation_height.is_none()
-        {
-            if let Err(e) =
-                compute_and_store_activation_height(&proposal, repo, btc_client, asm_rpc_url).await
-            {
-                tracing::warn!(
-                    action_id = %proposal.action_id.0,
-                    "reconcile: activation height still unavailable while its cancel is unjudged: {e}"
-                );
-            }
-        }
-        // This read may be the only one that looks at the target. The cancel's own row is what
-        // writes Canceled, so a cancel whose reveal is already confirmed is enacted here.
-        if cancel == CancelOfTarget::OnChain {
-            if let Some(cancel_proposal) = repo.find_cancel_for_target(&proposal.action_id).await? {
-                enact_confirmed_cancel(repo, asm_rpc_url, btc_client, &cancel_proposal).await?;
-            }
-        }
+    // too. Judged again before the write below.
+    if cancel_blocks_target(repo, asm_rpc_url, btc_client, &proposal).await? {
         return Ok(());
     }
 
@@ -1707,7 +1722,11 @@ async fn reconcile_one(
     };
 
     if !enacted {
-        return supersede_if_seq_no_consumed(repo, asm_rpc_url, &proposal, last_seqno).await;
+        if cancel_blocks_target(repo, asm_rpc_url, btc_client, &proposal).await? {
+            return Ok(());
+        }
+        return supersede_if_seq_no_consumed(repo, asm_rpc_url, btc_client, &proposal, last_seqno)
+            .await;
     }
 
     if let Some(target_action_id) = &proposal.target_action_id {
@@ -1720,16 +1739,13 @@ async fn reconcile_one(
         return Ok(());
     }
 
-    repo.update_broadcast_status(
-        &proposal.action_id,
-        BroadcastStatus::RevealConfirmed,
-        Some(ProposalStatus::Enacted),
-        None,
-        None,
-        None,
-    )
-    .await?;
-    cascade_enact_associated_cancel(repo, &proposal.action_id).await
+    if cancel_blocks_target(repo, asm_rpc_url, btc_client, &proposal).await? {
+        return Ok(());
+    }
+    if repo.enact_if_approved(&proposal.action_id).await? {
+        cascade_enact_associated_cancel(repo, &proposal.action_id).await?;
+    }
+    Ok(())
 }
 
 /// Promote `approved` + `reveal_confirmed` proposals when ASM shows enactment post-conditions,
@@ -6574,6 +6590,131 @@ mod tests {
         assert_eq!(cancel.broadcast_status, BroadcastStatus::RevealConfirmed);
     }
 
+    /// The cancel stays unmined through the checks before the admin-queue read, and is mined by
+    /// the look that sits after that read. That look owns the target, so it is not superseded.
+    #[tokio::test]
+    async fn a_cancel_that_lands_during_the_read_holds_its_target() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct LandsLater {
+            calls: Arc<AtomicUsize>,
+            tx: bitcoin::Transaction,
+        }
+
+        #[async_trait::async_trait]
+        impl BitcoinRpcClient for LandsLater {
+            async fn estimate_fee_rate_sats_per_vb(
+                &self,
+                _target_blocks: u16,
+            ) -> Result<u64, AppError> {
+                Ok(1)
+            }
+
+            async fn get_block_height_for_txid(&self, txid: &str) -> Result<u64, AppError> {
+                self.get_mined_reveal(txid).await.map(|mined| mined.height)
+            }
+
+            async fn get_mined_reveal(&self, txid: &str) -> Result<MinedReveal, AppError> {
+                // Two looks run before the queue read. The third is the one after it.
+                if txid != REVEAL_C || self.calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                    return Err(AppError::BadRequest(format!(
+                        "getrawtransaction: tx {txid} has no blockhash — not yet confirmed"
+                    )));
+                }
+                Ok(MinedReveal {
+                    height: 800_010,
+                    tx: Some(self.tx.clone()),
+                    block: Some(crate::infrastructure::bitcoin_rpc::MinedBlock {
+                        hash: "block-800010".to_string(),
+                        parent_hash: "parent-800010".to_string(),
+                    }),
+                })
+            }
+
+            async fn get_chain_tip(&self) -> Result<u64, AppError> {
+                Ok(800_000)
+            }
+        }
+
+        use ssz::Encode;
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        let target = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        repo.update_broadcast_status(
+            &target.action_id,
+            BroadcastStatus::RevealConfirmed,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let cancel_hex = hex::encode(
+            strata_asm_txs_admin::actions::MultisigAction::Cancel(
+                strata_asm_txs_admin::actions::CancelAction::new(0, fixture_update()),
+            )
+            .as_ssz_bytes(),
+        );
+        let cancel = create_cancel_proposal(
+            &repo,
+            "mock://asm-membership",
+            session_of(&sig_a()),
+            target.action_id.clone(),
+            2,
+            &cancel_hex,
+            "cancel_sig",
+        )
+        .await
+        .unwrap();
+        approve_action(&repo, session_of(&sig_b()), &cancel.action_id, &sig_b())
+            .await
+            .unwrap();
+        transition_to_approved(
+            &repo,
+            session_of(&sig_b()),
+            "mock://asm-membership",
+            &cancel.action_id,
+        )
+        .await
+        .unwrap();
+        repo.update_broadcast_status(
+            &cancel.action_id,
+            BroadcastStatus::RevealBroadcasted,
+            None,
+            Some(COMMIT_C),
+            Some(REVEAL_C),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        reconcile_enacted_for_action(
+            &repo,
+            crate::infrastructure::asm_enactment::MOCK_SEQNO_AHEAD_URL,
+            &LandsLater {
+                calls: Arc::clone(&calls),
+                tx: envelope_reveal(COMMIT_C, 2, &cancel_hex),
+            },
+            Authority::StrataAdmin,
+            &target.action_id,
+        )
+        .await
+        .unwrap();
+        assert!(calls.load(Ordering::SeqCst) >= 3);
+
+        let target = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        assert_eq!(target.status, ProposalStatus::Approved);
+        let cancel = repo
+            .find_by_action_id(&cancel.action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancel.broadcast_status, BroadcastStatus::RevealConfirmed);
+    }
+
     /// An approved target whose reveal already confirmed, and a cancel of it still in flight.
     async fn target_with_cancel_in_flight(
         repo: &InMemoryProposalRepository,
@@ -6730,6 +6871,32 @@ mod tests {
         assert_eq!(target.status, ProposalStatus::Canceled);
         let cancel = repo.find_by_action_id(&cancel_id).await.unwrap().unwrap();
         assert_eq!(cancel.status, ProposalStatus::Enacted);
+    }
+
+    /// Enacting writes only an approved row. A target a cancel already marked `canceled` stays
+    /// canceled.
+    #[tokio::test]
+    async fn an_enacted_write_does_not_overwrite_a_canceled_target() {
+        let repo = new_repo();
+        let proposal = save_approved_proposal(&repo, Authority::StrataAdmin, 1).await;
+        repo.update_broadcast_status(
+            &proposal.action_id,
+            BroadcastStatus::RevealConfirmed,
+            Some(ProposalStatus::Canceled),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!repo.enact_if_approved(&proposal.action_id).await.unwrap());
+        let kept = repo
+            .find_by_action_id(&proposal.action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.status, ProposalStatus::Canceled);
     }
 
     /// A supersede applies only to the row this read judged. Once a reveal is confirmed, a stale
