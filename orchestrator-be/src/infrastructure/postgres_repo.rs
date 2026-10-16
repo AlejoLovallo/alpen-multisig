@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
 use crate::application::proposals::{
-    broadcast_write_for_report, decide_additional_pair, reports_tracked_pair, AdditionalPair,
-    AUTHORITY_IN_FLIGHT,
+    broadcast_write_for_report, decide_additional_pair, exceeds_pair_limit, reports_tracked_pair,
+    AdditionalPair, AUTHORITY_IN_FLIGHT, PAIR_LIMIT_REACHED,
 };
 use crate::application::traits::ProposalRepository;
 use crate::domain::authority::Authority;
@@ -640,6 +640,13 @@ impl ProposalRepository for PostgresProposalRepository {
             return self.find_by_action_id(action_id).await;
         }
 
+        if attempt
+            .as_ref()
+            .is_some_and(|attempt| exceeds_pair_limit(&current, attempt))
+        {
+            drop(tx);
+            return Err(AppError::Conflict(PAIR_LIMIT_REACHED.to_string()));
+        }
         if let Some(attempt) = attempt {
             // Txids arrive lowercase. The case-sensitive primary key keeps a pair once.
             sqlx::query(

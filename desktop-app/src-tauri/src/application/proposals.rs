@@ -228,6 +228,11 @@ async fn report_with_retry(
                 }
                 return Ok(());
             }
+            // A decided refusal, such as the per-signer pair limit (#605): retrying changes nothing.
+            Err(OrchestratorError::Backend {
+                status: 409,
+                message,
+            }) => return Err(BroadcastError::Setup(claim_conflict_message(&message))),
             Err(e) if attempt < REPORT_ATTEMPTS => {
                 tracing::warn!(action_id, broadcast_status, attempt, error = %e, "progress report failed; retrying");
                 tokio::time::sleep(REPORT_RETRY_DELAY).await;
@@ -585,10 +590,14 @@ pub async fn submit_commit_then_reveal(
         };
         if let Err(e) = registered {
             crate::infrastructure::pending_reveals_store::remove_and_persist(pending, action_id);
-            // A decided answer — the row tracks another pair, or the registration was refused —
-            // leaves the row to that pair. Only a registration whose answer never came back may
-            // have landed, and is undone by `failed` naming this pair (#605).
-            report_failed = matches!(e, BroadcastError::Orchestrator(_));
+            // A row that tracks another pair is left to it. A claimed row is ours otherwise, and
+            // `failed` reopens the claim. Beside another signer's pair, a refused registration
+            // touches nothing; only one whose answer never came back may have landed, and is
+            // undone by `failed` naming this pair (#605).
+            report_failed = match mode {
+                SendMode::Claim => !matches!(e, BroadcastError::PairNotRegistered),
+                SendMode::AdditionalPair => matches!(e, BroadcastError::Orchestrator(_)),
+            };
             return Err(e);
         }
         report_failed = true;

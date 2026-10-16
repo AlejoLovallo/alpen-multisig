@@ -487,6 +487,31 @@ pub(crate) const PAIR_LIMIT_REACHED: &str =
 /// asks the node about every pair.
 pub(crate) const MAX_PAIRS_PER_SIGNER: usize = 3;
 
+/// Whether listing `attempt` would take its signer past [`MAX_PAIRS_PER_SIGNER`] (#605). A pair
+/// already listed is not a new one. Checked on every path that lists a pair — a registration, and
+/// a claimer's pre-registration — so a claim followed by `failed`, again and again, is bounded too.
+/// Shared by both repositories, which evaluate it under their own lock.
+pub(crate) fn exceeds_pair_limit(proposal: &Proposal, attempt: &BroadcastAttempt) -> bool {
+    let listed =
+        |kept: &&BroadcastAttempt| kept.reveal_txid.eq_ignore_ascii_case(&attempt.reveal_txid);
+    let Some(signer) = attempt.broadcaster_pubkey.as_deref() else {
+        return false;
+    };
+    if proposal.broadcast_attempts.iter().any(|kept| listed(&kept)) {
+        return false;
+    }
+    proposal
+        .broadcast_attempts
+        .iter()
+        .filter(|kept| {
+            kept.broadcaster_pubkey
+                .as_deref()
+                .is_some_and(|kept| kept.eq_ignore_ascii_case(signer))
+        })
+        .count()
+        >= MAX_PAIRS_PER_SIGNER
+}
+
 /// Whether a desktop's report may change the row (#605).
 ///
 /// An untagged row (no reveal yet) accepts it: that is the claimer's pre-registration. A tagged
@@ -565,13 +590,7 @@ pub(crate) fn decide_additional_pair(
     {
         return Ok(AdditionalPair::AlreadyRegistered);
     }
-    if proposal
-        .broadcast_attempts
-        .iter()
-        .filter(|kept| same_signer(kept))
-        .count()
-        >= MAX_PAIRS_PER_SIGNER
-    {
+    if exceeds_pair_limit(proposal, attempt) {
         return Err(PAIR_LIMIT_REACHED);
     }
     let given_up = |kept: &BroadcastAttempt| {
@@ -1606,6 +1625,17 @@ pub(crate) async fn report_broadcast_progress(
     // row tracked it, or registered. A report that names no reveal does not qualify either, once
     // the row is tagged. Checked here to skip the work, and again in the write: a pair that lands
     // after this read, including one that tags an empty claim, is not overwritten and not listed.
+    // A report about the pair the row tracks cannot change its commit: the reconcile checks that
+    // the mined reveal spends it, and a wrong one would leave a winning pair unconfirmed (#605).
+    let commit_txid = match (&raw.commit_txid, &raw.reveal_txid, reveal_txid.as_deref()) {
+        (Some(tracked_commit), Some(tracked), Some(reported))
+            if tracked.eq_ignore_ascii_case(reported) =>
+        {
+            Some(tracked_commit.to_ascii_lowercase())
+        }
+        _ => commit_txid,
+    };
+
     // Validated before the report can be skipped, so a malformed one is a 400 either way.
     let broadcast_status: BroadcastStatus = body.broadcast_status.parse().map_err(|_| {
         AppError::BadRequest(format!(
@@ -5535,6 +5565,87 @@ mod tests {
             matches!(err, AppError::Conflict(ref m) if m == PAIR_LIMIT_REACHED),
             "{err:?}"
         );
+    }
+
+    /// The limit holds on the claim path too: a claim, a pre-registration with made-up txids and
+    /// `failed`, again and again, lists no more than `MAX_PAIRS_PER_SIGNER` pairs for that signer.
+    #[tokio::test]
+    async fn claiming_again_and_again_lists_at_most_max_pairs() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        let mut refused = None;
+        for n in 0..=MAX_PAIRS_PER_SIGNER {
+            let mut failed = report("failed", Some(COMMIT_A), None);
+            failed.reveal_txid = repo
+                .find_by_action_id(&action_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .reveal_txid;
+            failed.broadcast_error = Some("dropped".to_string());
+            report_broadcast_progress(
+                &repo,
+                "mock://asm-membership",
+                session_of(&sig_a()),
+                &action_id,
+                &NodeView::default(),
+                failed,
+            )
+            .await
+            .unwrap();
+            claim_broadcast_coordination(
+                &repo,
+                Authority::StrataAdmin,
+                "mock://asm-membership",
+                &action_id,
+            )
+            .await
+            .unwrap();
+            let (commit, reveal) = (
+                format!("{n:x}").repeat(64),
+                format!("{:x}", n + 8).repeat(64),
+            );
+            let registered = report_broadcast_progress(
+                &repo,
+                "mock://asm-membership",
+                session_of(&sig_a()),
+                &action_id,
+                &NodeView::default(),
+                report("commit_broadcasted", Some(&commit), Some(&reveal)),
+            )
+            .await;
+            if let Err(err) = registered {
+                refused = Some(err);
+                break;
+            }
+        }
+        let err = refused.expect("the limit refuses a pre-registration");
+        assert!(
+            matches!(err, AppError::Conflict(ref m) if m == PAIR_LIMIT_REACHED),
+            "{err:?}"
+        );
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        assert_eq!(proposal.broadcast_attempts.len(), MAX_PAIRS_PER_SIGNER);
+    }
+
+    /// A report about the tracked reveal cannot change the row's commit: the reconcile checks
+    /// that the mined reveal spends it.
+    #[tokio::test]
+    async fn a_report_cannot_change_the_tracked_pairs_commit() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        let after = report_broadcast_progress(
+            &repo,
+            "mock://asm-membership",
+            session_of(&sig_b()),
+            &action_id,
+            &mock_btc(),
+            report("reveal_broadcasted", Some(COMMIT_B), Some(REVEAL_A)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after.commit_txid.as_deref(), Some(COMMIT_A));
+        assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_A));
     }
 
     /// A row tagged with its reveal only (a partial import) still confirms: the commit is the one

@@ -146,6 +146,14 @@ Request body:
 - Same checks as the claim: session authority, `approved`, threshold snapshot, sequence number still open.
 - `409` when there is no pair in flight to send beside, or when the caller already sent a pair for this proposal.
 - The caller registering the same pair again returns `200` and leaves the row as it is, so a registration whose response was lost can be retried.
+- `409` when the caller already listed `MAX_PAIRS_PER_SIGNER` pairs. The same limit applies to a pair listed by a progress report (a claimer's pre-registration).
+
+### 5) Check before signing another signer's pair (#605)
+
+`GET /proposals/:action_id/broadcast/attempts/check`
+
+- Every check of the registration above that does not need txids; answers `200` with the `Proposal`, or the same `409`s.
+- The desktop calls it before the device signs a commit, and claims instead when the answer is that no pair is in flight.
 - Returns the updated `Proposal` JSON. See "Another signer's commit + reveal".
 
 ## Technical Design
@@ -153,7 +161,7 @@ Request body:
 ### Orchestrator (`orchestrator-be`)
 
 - **No** `broadcast_tx` module or signing key in server config.
-- Application: `claim_broadcast_coordination`, `report_broadcast_progress`.
+- Application: `claim_broadcast_coordination`, `report_broadcast_progress`, `register_additional_pair`, `check_additional_pair` (#605).
 - Repository: `claim_broadcast`, `update_broadcast_status`.
 - Bitcoin RPC on server: `/ready` health check only.
 
@@ -411,7 +419,11 @@ acts on; the others are refused on the sequence number and cost only their fees.
   another (`abandoned_pairs_of`). Only a node with `-txindex` can answer "nowhere"; without one the
   signer is refused as before. A signer lists at most `MAX_PAIRS_PER_SIGNER` (3) pairs per proposal,
   abandoned ones included (`409`, "the most commit and reveal pairs allowed"): registration takes any
-  txids, each pair takes the row over, and every reconcile asks the node about every pair.
+  txids, each pair takes the row over, and every reconcile asks the node about every pair. The limit
+  holds for pairs listed by a claimer's pre-registration too (`exceeds_pair_limit`), so claiming and
+  reporting `failed` over and over is bounded the same way. A report about the pair the row tracks
+  keeps the row's commit txid: only the reveal identifies the pair, and the reconcile checks that the
+  mined reveal spends that commit.
 - **The row tracks the latest pair.** Registering sets the row's `commit_txid` / `reveal_txid` to
   the new pair, `commit_broadcasted`, claim time now, error cleared — under a row lock. From there
   the new sender's desktop reports on the row as any claimer would; the per-authority gate is
@@ -512,7 +524,8 @@ acts on; the others are refused on the sequence number and cost only their fees.
   after `failed` leaves the earlier attempt listed, so the new pair is not a lone pair: the node decides
   with `-txindex`, and without it the desktop's report is taken, as above. The pre-check and the
   registration are two calls: the row can move between them, and the registration then refuses after
-  the device signed. Without `-txindex` the node cannot answer that a commit is nowhere, so a signer
+  the device signed. A bundle import reports with the importer's session: on an empty claim it tags the
+  row and lists the pair under the importer. Without `-txindex` the node cannot answer that a commit is nowhere, so a signer
   whose pair was dropped cannot send another: when the row tracks a pair whose sender's desktop died
   before broadcasting it and every other pair was dropped, only a signer who has sent no pair can move
   the proposal until that desktop returns and reports `failed`.

@@ -2,8 +2,8 @@
 
 use crate::application::proposals::{
     broadcast_claim_allowed, broadcast_write_for_report, decide_additional_pair,
-    reports_tracked_pair, row_still_has_reveal, AdditionalPair, BroadcastClaimFacts,
-    AUTHORITY_IN_FLIGHT,
+    exceeds_pair_limit, reports_tracked_pair, row_still_has_reveal, AdditionalPair,
+    BroadcastClaimFacts, AUTHORITY_IN_FLIGHT, PAIR_LIMIT_REACHED,
 };
 use crate::application::traits::ProposalRepository;
 use crate::domain::authority::Authority;
@@ -269,6 +269,12 @@ impl ProposalRepository for InMemoryProposalRepository {
             return Ok(None);
         };
         if reports_tracked_pair(reveal_txid, proposal.reveal_txid.as_deref()) {
+            if attempt
+                .as_ref()
+                .is_some_and(|attempt| exceeds_pair_limit(proposal, attempt))
+            {
+                return Err(AppError::Conflict(PAIR_LIMIT_REACHED.to_string()));
+            }
             if let Some(attempt) = attempt {
                 let kept = proposal
                     .broadcast_attempts
