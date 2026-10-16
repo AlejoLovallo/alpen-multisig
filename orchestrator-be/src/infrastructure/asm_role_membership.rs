@@ -67,6 +67,20 @@ pub(crate) async fn threshold_for_authority(
     Ok(u16::from(authority_config.config().threshold()))
 }
 
+/// The height of the last block the ASM has processed (`strata_asm_getStatus`, `cur_block`).
+pub(crate) async fn asm_processed_height(rpc_url: &str) -> Result<u64, AppError> {
+    // The in-process mocks (refused outside dev/test builds): an ASM at genesis, or one far ahead.
+    if rpc_url == "mock://asm-ahead" {
+        return Ok(u64::MAX);
+    }
+    if is_mock_url(rpc_url) || rpc_url.starts_with("mock://") {
+        return Ok(0);
+    }
+    asm_rpc::fetch_processed_height(rpc_url)
+        .await
+        .map_err(AppError::BadRequest)
+}
+
 /// What the ASM's administration state says about the role that signs `action`, as of one block
 /// (#605): what [`crate::application::proposals`] needs to tell whether the ASM executed a reveal.
 #[derive(Debug, Clone)]
@@ -487,7 +501,7 @@ fn mock_role_around_block(
     block_height: u64,
 ) -> Option<Option<(RoleAtBlock, RoleAtBlock)>> {
     let accepted = match rpc_url {
-        MOCK_MEMBERSHIP_URL => true,
+        MOCK_MEMBERSHIP_URL | crate::infrastructure::asm_enactment::MOCK_SEQNO_AHEAD_URL => true,
         MOCK_ASM_NOT_ACCEPTED_URL => false,
         _ => return None,
     };
@@ -496,20 +510,35 @@ fn mock_role_around_block(
         MultisigAction::Update(_) => Some(2016),
         MultisigAction::Cancel(_) => None,
     };
+    // A cancel's target sits in the queue until the cancel takes it out.
+    let queued = match action {
+        MultisigAction::Cancel(cancel) => vec![(
+            *cancel.target_id(),
+            cancel.update().clone(),
+            block_height + 2016,
+        )],
+        MultisigAction::Update(_) => Vec::new(),
+    };
     let before = RoleAtBlock {
         last_seqno: 0,
         max_seqno_gap: std::num::NonZero::new(10)?,
         config,
         queue_depth,
-        queued: Vec::new(),
+        queued,
     };
     let mut after = before.clone();
     if accepted {
         after.last_seqno = seq_no;
-        if let (MultisigAction::Update(update), Some(depth)) = (action, queue_depth) {
-            after
-                .queued
-                .push((0, update.clone(), block_height + u64::from(depth)));
+        match (action, queue_depth) {
+            (MultisigAction::Update(update), Some(depth)) => {
+                after
+                    .queued
+                    .push((0, update.clone(), block_height + u64::from(depth)))
+            }
+            (MultisigAction::Cancel(cancel), _) => {
+                after.queued.retain(|(id, _, _)| id != cancel.target_id())
+            }
+            _ => {}
         }
     }
     Some(Some((before, after)))

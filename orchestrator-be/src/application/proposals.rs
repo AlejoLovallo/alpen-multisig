@@ -1238,6 +1238,16 @@ async fn confirm_reveal_if_mined(
         .proposal
 }
 
+/// Whether the orchestrator's node has seen every block the ASM has processed (#605).
+async fn node_caught_up_with_asm(
+    btc_client: &dyn BitcoinRpcClient,
+    asm_rpc_url: &str,
+) -> Result<bool, AppError> {
+    let asm_height =
+        crate::infrastructure::asm_role_membership::asm_processed_height(asm_rpc_url).await?;
+    Ok(btc_client.get_chain_tip().await? >= asm_height)
+}
+
 /// The proposal after [`confirm_reveal_if_mined`], and whether the node and the ASM answered
 /// everything it asked (#605). An inconclusive read — a lookup that failed, a block the ASM has not
 /// processed, a node without `-txindex` — must not let the same cycle retire the proposal: the
@@ -1275,28 +1285,56 @@ async fn try_confirm_reveal(
     // leaves in place. The write applies only while the row still tracks the reveal this read
     // observed: a pair registered in between is left for the next reconcile, which sees both
     // (#605).
-    let (commit_txid, reveal_txid) =
-        match first_mined_pair(&proposal, btc_client, asm_rpc_url).await {
-            MinedPair::First(commit_txid, reveal_txid) => (commit_txid, reveal_txid),
-            MinedPair::NotIndexed => {
-                tracing::warn!(
-                    action_id = %proposal.action_id.0,
-                    "the node keeps no transaction index, so no mined reveal can be verified; \
-                     restart bitcoind with -txindex=1"
-                );
-                return RevealCheck {
-                    proposal,
-                    inconclusive: true,
-                };
+    let (commit_txid, reveal_txid) = match first_mined_pair(&proposal, btc_client, asm_rpc_url)
+        .await
+    {
+        MinedPair::First(commit_txid, reveal_txid) => (commit_txid, reveal_txid),
+        MinedPair::NotIndexed => {
+            tracing::warn!(
+                action_id = %proposal.action_id.0,
+                "the node keeps no transaction index, so no mined reveal can be verified; \
+                 restart bitcoind with -txindex=1"
+            );
+            return RevealCheck {
+                proposal,
+                inconclusive: true,
+            };
+        }
+        MinedPair::Unknown => {
+            return RevealCheck {
+                proposal,
+                inconclusive: true,
             }
-            MinedPair::Unknown => {
-                return RevealCheck {
-                    proposal,
-                    inconclusive: true,
+        }
+        MinedPair::None => {
+            // "Not mined" is an answer only from a node that has seen every block the ASM has
+            // processed: one behind it would read an executed reveal as unmined, and the sweep
+            // would retire the proposal it carried.
+            return match node_caught_up_with_asm(btc_client, asm_rpc_url).await {
+                Ok(true) => decided(proposal),
+                Ok(false) => {
+                    tracing::warn!(
+                        action_id = %proposal.action_id.0,
+                        "the bitcoin node is behind the ASM; a reveal it does not see is left open"
+                    );
+                    RevealCheck {
+                        proposal,
+                        inconclusive: true,
+                    }
                 }
-            }
-            MinedPair::None => return decided(proposal),
-        };
+                Err(e) => {
+                    tracing::warn!(
+                        action_id = %proposal.action_id.0,
+                        "reconcile: could not compare the node with the ASM: {e}"
+                    );
+                    RevealCheck {
+                        proposal,
+                        inconclusive: true,
+                    }
+                }
+            };
+        }
+    };
     let updated = repo
         .confirm_tracked_reveal(
             &proposal.action_id,
@@ -1420,12 +1458,27 @@ async fn bitcoin_tip_for_enactment(
 /// write — puts the target back. Only the cancel decides a cancelled target.
 ///
 /// An `Expired` cancel is the case where the target enacted first, so it holds nothing up.
+///
+/// A cancel still in flight may already have executed: only the reconcile confirms it (#605), and
+/// the target can be read first. Its reveal is judged here, before the target's fate; a read that
+/// cannot judge it holds the target too.
 async fn cancel_reached_chain(
     repo: &dyn ProposalRepository,
+    asm_rpc_url: &str,
+    btc_client: &dyn BitcoinRpcClient,
     target_action_id: &ActionId,
 ) -> Result<bool, AppError> {
     let Some(cancel) = repo.find_cancel_for_target(target_action_id).await? else {
         return Ok(false);
+    };
+    let cancel = if cancel.status == ProposalStatus::Approved {
+        let checked = try_confirm_reveal(repo, cancel, btc_client, asm_rpc_url).await;
+        if checked.inconclusive {
+            return Ok(true);
+        }
+        checked.proposal
+    } else {
+        cancel
     };
     Ok(cancel.broadcast_status == BroadcastStatus::RevealConfirmed
         && cancel.status != ProposalStatus::Expired)
@@ -1458,7 +1511,9 @@ async fn reconcile_one(
     let proposal = checked.proposal;
 
     // A cancel that is already on chain owns this proposal's outcome — see `cancel_reached_chain`.
-    if !proposal.is_cancel() && cancel_reached_chain(repo, &proposal.action_id).await? {
+    if !proposal.is_cancel()
+        && cancel_reached_chain(repo, asm_rpc_url, btc_client, &proposal.action_id).await?
+    {
         return Ok(());
     }
 
@@ -6205,6 +6260,111 @@ mod tests {
             ))),
             RevealHeight::Unmined
         ));
+    }
+
+    /// "Not mined" from a node behind the ASM is not an answer: the reveal the ASM executed may be
+    /// in a block this node has not seen, and the sweep would retire the proposal it carried.
+    #[tokio::test]
+    async fn a_node_behind_the_asm_leaves_the_read_open() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+
+        let caught_up = try_confirm_reveal(
+            &repo,
+            proposal.clone(),
+            &NodeView::default(),
+            "mock://asm-membership",
+        )
+        .await;
+        assert!(!caught_up.inconclusive);
+        let behind =
+            try_confirm_reveal(&repo, proposal, &NodeView::default(), "mock://asm-ahead").await;
+        assert!(behind.inconclusive);
+    }
+
+    /// A cancel mined and executed but not confirmed yet holds its target: read first, the target
+    /// would look dead (seqno consumed, gone from the queue) and be retired as `Superseded`, and
+    /// the cancel then `Expired`. The cancel is judged first, confirmed, and owns the target.
+    #[tokio::test]
+    async fn a_target_waits_for_its_cancel_in_flight() {
+        use ssz::Encode;
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        let target = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        repo.update_broadcast_status(
+            &target.action_id,
+            BroadcastStatus::RevealConfirmed,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let cancel_hex = hex::encode(
+            strata_asm_txs_admin::actions::MultisigAction::Cancel(
+                strata_asm_txs_admin::actions::CancelAction::new(0, fixture_update()),
+            )
+            .as_ssz_bytes(),
+        );
+        let cancel = create_cancel_proposal(
+            &repo,
+            "mock://asm-membership",
+            session_of(&sig_a()),
+            target.action_id.clone(),
+            2,
+            &cancel_hex,
+            "cancel_sig",
+        )
+        .await
+        .unwrap();
+        approve_action(&repo, session_of(&sig_b()), &cancel.action_id, &sig_b())
+            .await
+            .unwrap();
+        transition_to_approved(
+            &repo,
+            session_of(&sig_b()),
+            "mock://asm-membership",
+            &cancel.action_id,
+        )
+        .await
+        .unwrap();
+        repo.update_broadcast_status(
+            &cancel.action_id,
+            BroadcastStatus::RevealBroadcasted,
+            None,
+            Some(COMMIT_C),
+            Some(REVEAL_C),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The ASM has moved past both seqnos and the target is out of the queue: read alone, the
+        // target is what the sweep retires.
+        reconcile_enacted_for_action(
+            &repo,
+            crate::infrastructure::asm_enactment::MOCK_SEQNO_AHEAD_URL,
+            &MinedReveals(vec![(
+                REVEAL_C,
+                800_010,
+                envelope_reveal(COMMIT_C, 2, &cancel_hex),
+            )]),
+            Authority::StrataAdmin,
+            &target.action_id,
+        )
+        .await
+        .unwrap();
+
+        let target = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        assert_eq!(target.status, ProposalStatus::Approved);
+        let cancel = repo
+            .find_by_action_id(&cancel.action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancel.broadcast_status, BroadcastStatus::RevealConfirmed);
     }
 
     /// A pair already listed under another signer is refused as such, not as the caller's own.

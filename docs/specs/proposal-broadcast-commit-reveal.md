@@ -470,9 +470,12 @@ acts on; the others are refused on the sequence number and cost only their fees.
   proposal without the administration tag under the configured magic bytes is an open question too —
   a transaction the ASM never saw, or `BITCOIN_MAGIC_BYTES_HEX` set to another network's — and is
   logged as an error. A pair first reported after it was mined (the manual fallback, imported later)
-  still counts: what the ASM did decides, not when it was registered. The orchestrator's node and the
-  ASM runner should follow the same chain (the ASM's node, or one at or behind it): a reveal the ASM
-  executed but this node does not yet see reads as not mined.
+  still counts: what the ASM did decides, not when it was registered. "Not mined" counts only from a
+  node that has seen every block the ASM has processed (`node_caught_up_with_asm`, the ASM's
+  `cur_block` against the node's tip): a node behind the ASM would read an executed reveal as unmined,
+  so that read is left open too. A cancel still in flight is judged before its target is decided
+  (`cancel_reached_chain`): only the reconcile confirms it, and read first the target would look dead
+  — its seqno consumed, gone from the queue.
 - **A failed pair falls back only to a live one.** A `failed` report for the pair the row tracks,
   when another pair is listed, sets the row back to the newest other pair that may still be on its
   way, at `commit_broadcasted`, and clears the error. Only a pair whose commit the node answers is
@@ -557,7 +560,11 @@ acts on; the others are refused on the sequence number and cost only their fees.
   block. When two actions of the same role land in one block — which the claim gate prevents in the
   app, but a manual broadcast can do — a rejected reveal can be credited with the other's effect: an
   immediate action whose sequence number the other took; a queued update identical to one queued by
-  the other; a cancel whose target matured in that same block. The ASM runner must answer
+  the other; a cancel whose target matured in that same block. A signer who mines a transaction that
+  carries the proposal's payload without the administration tag, and reports it, leaves every read of
+  that proposal open until some reveal is executed: the proposal is not retired, and while it is in
+  flight its authority's claim gate stays shut (bounded by the per-signer pair limit, and no worse than
+  the proposal statuses a signer can already report). The ASM runner must answer
   `strata_asm_getAsmState` for the blocks a reconcile reads. The pre-check and the
   registration are two calls: the row can move between them, and the registration then refuses after
   the device signed. The per-signer limit counts every pair listed, including a pre-registered pair

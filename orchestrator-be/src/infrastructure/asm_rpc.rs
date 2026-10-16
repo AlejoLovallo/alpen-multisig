@@ -57,6 +57,15 @@ pub(crate) async fn fetch_admin_state_at(
     decode_admin_state(&anchor).map(Some)
 }
 
+/// The height of the last block the ASM has processed (`cur_block` of `strata_asm_getStatus`).
+pub(crate) async fn fetch_processed_height(rpc_url: &str) -> Result<u64, String> {
+    let status = rpc_call(rpc_url, "strata_asm_getStatus", json!([])).await?;
+    status
+        .pointer("/cur_block/height")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "status result missing `cur_block.height`".to_string())
+}
+
 async fn rpc_call(rpc_url: &str, method: &str, params: Value) -> Result<Value, String> {
     let client = http_client::shared();
     let payload = json!({
