@@ -477,6 +477,16 @@ pub(crate) const NO_PAIR_IN_FLIGHT: &str =
 /// Conflict text when the caller already registered a pair for this proposal (#605).
 pub(crate) const OWN_PAIR_EXISTS: &str = "you already sent a commit and reveal for this proposal";
 
+/// Conflict text when the caller already listed [`MAX_PAIRS_PER_SIGNER`] pairs (#605).
+pub(crate) const PAIR_LIMIT_REACHED: &str =
+    "you already sent the most commit and reveal pairs allowed for this proposal";
+
+/// How many pairs one signer may list for a proposal, abandoned ones included (#605). A pair whose
+/// commit is nowhere lets its signer send another, and registration takes any txids, so without a
+/// bound one signer could list pairs without end: each one takes the row over, and every reconcile
+/// asks the node about every pair.
+pub(crate) const MAX_PAIRS_PER_SIGNER: usize = 3;
+
 /// Whether a desktop's report may change the row (#605).
 ///
 /// An untagged row (no reveal yet) accepts it: that is the claimer's pre-registration. A tagged
@@ -524,8 +534,8 @@ pub(crate) enum AdditionalPair {
 /// proposal — except that the same signer registering the same pair again is the retry of a
 /// registration whose response was lost, and succeeds. A pair of theirs listed in `abandoned`
 /// (its commit is neither in the mempool nor in a block, as when the registering session died
-/// before broadcasting) no longer counts as theirs on its way. Shared by both repositories, which
-/// evaluate it under their own lock.
+/// before broadcasting) no longer counts as theirs on its way, up to [`MAX_PAIRS_PER_SIGNER`] pairs
+/// in all. Shared by both repositories, which evaluate it under their own lock.
 pub(crate) fn decide_additional_pair(
     proposal: &Proposal,
     attempt: &BroadcastAttempt,
@@ -554,6 +564,15 @@ pub(crate) fn decide_additional_pair(
         .any(|kept| same_signer(kept) && same_reveal(kept))
     {
         return Ok(AdditionalPair::AlreadyRegistered);
+    }
+    if proposal
+        .broadcast_attempts
+        .iter()
+        .filter(|kept| same_signer(kept))
+        .count()
+        >= MAX_PAIRS_PER_SIGNER
+    {
+        return Err(PAIR_LIMIT_REACHED);
     }
     let given_up = |kept: &BroadcastAttempt| {
         abandoned
@@ -982,17 +1001,22 @@ async fn first_mined_pair(proposal: &Proposal, btc_client: &dyn BitcoinRpcClient
     });
     let answers = futures::future::join_all(lookups).await;
 
-    let mut mined: Vec<(u64, &str, &str)> = Vec::new();
+    let mut mined: Vec<(u64, String, &str)> = Vec::new();
     let mut not_indexed = false;
     for ((commit, reveal), answer) in candidates.iter().zip(answers) {
         match answer {
             RevealHeight::Mined { height, tx } => {
-                // A pair with no commit on record cannot be checked, nor confirmed.
-                let Some(commit) = commit else { continue };
+                // A row tagged with its reveal only (a partial import) takes the commit the reveal
+                // spends. With neither, the pair cannot be checked, nor confirmed.
+                let commit = match (commit, tx.as_ref().and_then(|tx| tx.input.first())) {
+                    (Some(commit), _) => commit.to_string(),
+                    (None, Some(input)) => input.previous_output.txid.to_string(),
+                    (None, None) => continue,
+                };
                 // `None` only from a test double that reads no transaction.
                 if tx
                     .as_ref()
-                    .is_some_and(|tx| !reveal_carries_proposal(tx, commit, proposal))
+                    .is_some_and(|tx| !reveal_carries_proposal(tx, &commit, proposal))
                 {
                     tracing::warn!(
                         action_id = %proposal.action_id.0,
@@ -1019,7 +1043,7 @@ async fn first_mined_pair(proposal: &Proposal, btc_client: &dyn BitcoinRpcClient
     if not_indexed {
         return MinedPair::NotIndexed;
     }
-    let mut first: Vec<(&str, &str)> = mined
+    let mut first: Vec<(String, &str)> = mined
         .into_iter()
         .filter(|(height, _, _)| *height == lowest)
         .map(|(_, commit, reveal)| (commit, reveal))
@@ -1042,7 +1066,7 @@ async fn first_mined_pair(proposal: &Proposal, btc_client: &dyn BitcoinRpcClient
         };
         (commit, reveal)
     };
-    MinedPair::First(commit.to_string(), reveal.to_string())
+    MinedPair::First(commit, reveal.to_string())
 }
 
 /// Notice a reveal that confirmed while nothing was watching.
@@ -1582,12 +1606,19 @@ pub(crate) async fn report_broadcast_progress(
     // row tracked it, or registered. A report that names no reveal does not qualify either, once
     // the row is tagged. Checked here to skip the work, and again in the write: a pair that lands
     // after this read, including one that tags an empty claim, is not overwritten and not listed.
+    // Validated before the report can be skipped, so a malformed one is a 400 either way.
+    let broadcast_status: BroadcastStatus = body.broadcast_status.parse().map_err(|_| {
+        AppError::BadRequest(format!(
+            "unknown broadcast_status: {}",
+            body.broadcast_status
+        ))
+    })?;
+    let requested_status = requested_proposal_status(body.proposal_status.as_deref())?;
     if !reports_tracked_pair(reveal_txid.as_deref(), raw.reveal_txid.as_deref()) {
         log_report_for_replaced_pair(action_id, reveal_txid.as_deref(), &raw);
         return Ok(raw);
     }
 
-    let broadcast_status: BroadcastStatus = body.broadcast_status.parse()?;
     // With other pairs listed, which reveal confirmed is the node's call, not the report's (#605):
     // an earlier pair may be mined in a lower block. The report records its pair as sent, and the
     // reconcile promotes the pair mined first. A node that does not see it yet leaves the row for
@@ -1621,16 +1652,10 @@ pub(crate) async fn report_broadcast_progress(
     } else {
         broadcast_status
     };
-    let proposal_status = match body.proposal_status.as_deref() {
+    let proposal_status = match requested_status {
         None => None,
-        Some("pending") => Some(ProposalStatus::Pending),
-        Some("approved") => {
-            return Err(AppError::BadRequest(
-                "use PATCH /proposals/:action_id with proposal_status approved to transition; not via broadcast PATCH"
-                    .to_string(),
-            ));
-        }
-        Some("enacted") => {
+        Some(RequestedProposalStatus::Pending) => Some(ProposalStatus::Pending),
+        Some(RequestedProposalStatus::Enacted) => {
             if raw.status == ProposalStatus::Enacted {
                 None
             } else {
@@ -1657,13 +1682,8 @@ pub(crate) async fn report_broadcast_progress(
                 Some(ProposalStatus::Enacted)
             }
         }
-        Some("canceled") => Some(ProposalStatus::Canceled),
-        Some("expired") => Some(ProposalStatus::Expired),
-        Some(other) => {
-            return Err(AppError::BadRequest(format!(
-                "unknown proposal_status: {other}"
-            )));
-        }
+        Some(RequestedProposalStatus::Canceled) => Some(ProposalStatus::Canceled),
+        Some(RequestedProposalStatus::Expired) => Some(ProposalStatus::Expired),
     };
 
     // Listed in the same write as the status, and only when that write applies (#605). A `failed`
@@ -1707,6 +1727,37 @@ pub(crate) async fn report_broadcast_progress(
     }
 
     Ok(updated)
+}
+
+/// A `proposal_status` a broadcast report may carry.
+enum RequestedProposalStatus {
+    Pending,
+    Enacted,
+    Canceled,
+    Expired,
+}
+
+fn requested_proposal_status(
+    raw: Option<&str>,
+) -> Result<Option<RequestedProposalStatus>, AppError> {
+    Ok(match raw {
+        None => None,
+        Some("pending") => Some(RequestedProposalStatus::Pending),
+        Some("approved") => {
+            return Err(AppError::BadRequest(
+                "use PATCH /proposals/:action_id with proposal_status approved to transition; not via broadcast PATCH"
+                    .to_string(),
+            ));
+        }
+        Some("enacted") => Some(RequestedProposalStatus::Enacted),
+        Some("canceled") => Some(RequestedProposalStatus::Canceled),
+        Some("expired") => Some(RequestedProposalStatus::Expired),
+        Some(other) => {
+            return Err(AppError::BadRequest(format!(
+                "unknown proposal_status: {other}"
+            )));
+        }
+    })
 }
 
 /// The pair a report names, stored lowercase so the case-sensitive key matches once (#605).
@@ -5439,6 +5490,98 @@ mod tests {
         .unwrap();
         assert_eq!(confirmed.broadcast_status, BroadcastStatus::RevealConfirmed);
         assert_eq!(confirmed.reveal_txid.as_deref(), Some(REVEAL_B));
+    }
+
+    /// A signer whose pairs keep turning up nowhere may send again, but only up to
+    /// `MAX_PAIRS_PER_SIGNER` pairs in all: registration takes any txids, and each pair takes the
+    /// row over and costs every reconcile a node lookup.
+    #[tokio::test]
+    async fn a_signer_lists_at_most_max_pairs() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        let nowhere = NodeView {
+            mempool: vec![COMMIT_A],
+            ..NodeView::default()
+        };
+        for n in 0..MAX_PAIRS_PER_SIGNER {
+            let (commit, reveal) = (
+                format!("{n:x}").repeat(64),
+                format!("{:x}", n + 8).repeat(64),
+            );
+            register_additional_pair(
+                &repo,
+                session_of(&sig_b()),
+                "mock://asm-membership",
+                &nowhere,
+                &action_id,
+                &commit,
+                &reveal,
+            )
+            .await
+            .unwrap();
+        }
+        let err = register_additional_pair(
+            &repo,
+            session_of(&sig_b()),
+            "mock://asm-membership",
+            &nowhere,
+            &action_id,
+            &"e".repeat(64),
+            &"f".repeat(64),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Conflict(ref m) if m == PAIR_LIMIT_REACHED),
+            "{err:?}"
+        );
+    }
+
+    /// A row tagged with its reveal only (a partial import) still confirms: the commit is the one
+    /// the mined reveal spends.
+    #[tokio::test]
+    async fn a_reveal_with_no_commit_on_record_confirms_on_the_commit_it_spends() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        let mut proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        proposal.commit_txid = None;
+        proposal.broadcast_attempts.clear();
+
+        let winner = first_mined_pair(
+            &proposal,
+            &MinedReveals(vec![(
+                REVEAL_A,
+                800_010,
+                envelope_reveal(COMMIT_A, 1, &test_fixture_action_hex()),
+            )]),
+        )
+        .await;
+        assert_eq!(
+            winner,
+            MinedPair::First(COMMIT_A.to_string(), REVEAL_A.to_string())
+        );
+    }
+
+    /// A malformed report is a 400 even when it names a pair the row does not track.
+    #[tokio::test]
+    async fn a_report_about_an_untracked_pair_is_still_validated() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        for (status, proposal_status) in [("bogus", None), ("failed", Some("approved"))] {
+            let mut body = report(status, Some(COMMIT_B), Some(REVEAL_B));
+            body.proposal_status = proposal_status.map(str::to_string);
+            let err = report_broadcast_progress(
+                &repo,
+                "mock://asm-membership",
+                session_of(&sig_b()),
+                &action_id,
+                &mock_btc(),
+                body,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, AppError::BadRequest(_)), "{err:?}");
+        }
     }
 
     /// The pre-check answers before anything is signed, with the registration's own refusals.

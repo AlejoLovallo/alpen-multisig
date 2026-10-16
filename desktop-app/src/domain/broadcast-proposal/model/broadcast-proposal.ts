@@ -206,13 +206,3 @@ export type SentPair = {
 	commitTxid?: string
 	revealTxid?: string
 }
-
-/**
- * Whether the row still tracks the watched reveal (#605). A row that moved to another signer's pair
- * says nothing about this one: its `failed` is not ours. With no reveal to compare, the row is the
- * only thing to go by.
- */
-export function rowTracksPair(rowReveal: string | undefined, watchedReveal: string | undefined): boolean {
-	if (watchedReveal === undefined || rowReveal === undefined) return true
-	return rowReveal.toLowerCase() === watchedReveal.toLowerCase()
-}

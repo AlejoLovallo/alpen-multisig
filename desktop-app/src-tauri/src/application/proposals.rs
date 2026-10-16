@@ -698,11 +698,11 @@ enum BundleRow {
     Manual,
     /// The row still tracks this very bundle (same reveal txid).
     Ours(Box<Proposal>),
-    /// The row moved on (another bundle, or none): only the coins are settled.
+    /// The row moved on (another bundle, or none): only the coins are settled. That includes a
+    /// row confirmed on another signer's pair (#605): this bundle lost the race, but its reveal is
+    /// still resubmitted while its commit is live, since mining it is what returns the commit
+    /// output — the ASM refuses it on the sequence number, and it ends the tracking once mined.
     NotOurs,
-    /// The proposal is closed on another pair's reveal (`reveal_confirmed`, or no longer
-    /// approved): this bundle lost the race, or is no longer needed (#605).
-    Closed,
     /// No orchestrator session, or it could not be read: nothing can be reported this check.
     Unreachable,
 }
@@ -717,9 +717,6 @@ async fn bundle_row(ctx: &BundleSettleContext<'_>, key: &str, reveal_txid: &str)
     match client.get_proposal(key).await {
         Ok(row) if row.reveal_txid.as_deref() == Some(reveal_txid) => {
             BundleRow::Ours(Box::new(row))
-        }
-        Ok(row) if row.broadcast_status == "reveal_confirmed" || row.status != "approved" => {
-            BundleRow::Closed
         }
         Ok(_) => BundleRow::NotOurs,
         Err(e) => {
@@ -751,7 +748,7 @@ fn decode_tx(hex_str: &str) -> Option<bitcoin::Transaction> {
 ///
 /// Reports go only to a row that still carries this bundle's reveal txid, and only while the
 /// proposal is approved; a row that is closed (`reveal_confirmed`, or no longer approved) ends
-/// the tracking, whichever pair it closed on. A report that does not land keeps the bundle tracked, so the next check retries
+/// the tracking. A report that does not land keeps the bundle tracked, so the next check retries
 /// it — never given up silently.
 pub async fn settle_bundle(
     ctx: &BundleSettleContext<'_>,
@@ -769,18 +766,11 @@ pub async fn settle_bundle(
         return BundleSettlement::NotTracked;
     };
     let row = bundle_row(ctx, key, &stored.reveal_txid).await;
-    let closed = match &row {
-        BundleRow::Ours(proposal) => {
-            proposal.broadcast_status == "reveal_confirmed" || proposal.status != "approved"
+    if let BundleRow::Ours(proposal) = &row {
+        if proposal.broadcast_status == "reveal_confirmed" || proposal.status != "approved" {
+            crate::infrastructure::pending_reveals_store::remove_and_persist(ctx.pending, key);
+            return BundleSettlement::Confirmed;
         }
-        // Another pair's reveal was mined first (#605). Ours, even if it is mined later, is
-        // refused by the ASM on the sequence number; nothing is left to watch or report.
-        BundleRow::Closed => true,
-        _ => false,
-    };
-    if closed {
-        crate::infrastructure::pending_reveals_store::remove_and_persist(ctx.pending, key);
-        return BundleSettlement::Confirmed;
     }
     let ours = match &row {
         BundleRow::Ours(proposal) => Some(proposal.as_ref()),
@@ -1483,12 +1473,15 @@ const NO_PAIR_IN_FLIGHT: &str = "no commit and reveal in flight to send another 
 /// "not approved" and "sequence already used" are different refusals.
 fn claim_conflict_message(body: &str) -> String {
     const GATE: &str = "a broadcast for this authority is already in flight";
-    // The orchestrator's refusal of a second pair from the same signer (#605).
+    // The orchestrator's refusals of another pair from the same signer (#605).
     const OWN_PAIR: &str = "you already sent a commit and reveal for this proposal";
+    const PAIR_LIMIT: &str = "you already sent the most commit and reveal pairs allowed";
     if body.contains(GATE) {
         "A broadcast for this authority is already in flight.".to_string()
     } else if body.contains(OWN_PAIR) {
         "You already sent a commit and reveal for this proposal.".to_string()
+    } else if body.contains(PAIR_LIMIT) {
+        "You already sent the most commit and reveal pairs allowed for this proposal.".to_string()
     } else if body.contains(NO_PAIR_IN_FLIGHT) {
         "This proposal has no commit and reveal in flight to send yours beside.".to_string()
     } else {
@@ -4115,15 +4108,26 @@ mod tests {
                     vec![],
                 )
             },
-            // Another signer's reveal was mined first (#605): ours, still in the mempool, is no
-            // longer watched, and nothing is reported against the other pair.
+            // Another signer's reveal was mined first (#605): ours is still watched, so its reveal
+            // can return the commit output, but nothing is reported against the other pair.
             SettleCase {
-                tracked: false,
+                recorded: 2,
                 ..case(
                     vec![(IN_MEMPOOL, IN_MEMPOOL)],
                     vec![0],
                     RowFixture::WonByAnother,
-                    BundleSettlement::Confirmed,
+                    BundleSettlement::Live,
+                    vec![],
+                )
+            },
+            SettleCase {
+                resubmitted: true,
+                recorded: 2,
+                ..case(
+                    vec![(NotFound, IN_MEMPOOL)],
+                    vec![0],
+                    RowFixture::WonByAnother,
+                    BundleSettlement::Live,
                     vec![],
                 )
             },
@@ -4502,5 +4506,10 @@ mod tests {
         let other =
             r#"{"error":"conflict: proposal must be in 'approved' state","errorCode":"conflict"}"#;
         assert!(super::claim_conflict_message(other).contains("approved"));
+        let limit = r#"{"error":"conflict: you already sent the most commit and reveal pairs allowed for this proposal","errorCode":"conflict"}"#;
+        assert_eq!(
+            super::claim_conflict_message(limit),
+            "You already sent the most commit and reveal pairs allowed for this proposal."
+        );
     }
 }

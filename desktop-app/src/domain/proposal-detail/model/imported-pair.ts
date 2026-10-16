@@ -1,4 +1,15 @@
 /**
+ * The txid an import reports, or `null` for none (#605). A txid the row already has is left out —
+ * unless the import also advances the broadcast status: the orchestrator ignores a report that
+ * names no reveal once the row tracks one, so a status update for the tracked pair must name it.
+ */
+export function importedTxid(raw: unknown, existing: string | null, advancesStatus: boolean): string | null {
+	if (typeof raw !== 'string') return null
+	if (raw === existing && !advancesStatus) return null
+	return raw
+}
+
+/**
  * Whether the orchestrator kept the broadcast state an import reported (#605).
  *
  * A report about a pair the row does not track changes nothing and still answers 200, so the

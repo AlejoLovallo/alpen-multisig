@@ -18,7 +18,7 @@ import { deviceCopy } from '@/lib/device-copy'
 import { failedBroadcastDetail, hasPairInFlight } from '@/lib/proposal-send-state'
 
 import type { BroadcastError, BroadcastPhase, SentPair } from '../model/broadcast-proposal'
-import { deriveBroadcastError, phaseForBroadcastStatus, rowTracksPair } from '../model/broadcast-proposal'
+import { deriveBroadcastError, phaseForBroadcastStatus } from '../model/broadcast-proposal'
 
 export type SignerKind = 'hardware' | 'mnemonic'
 
@@ -126,9 +126,9 @@ export function useBroadcastProposal(
 	 * confirmation task never ran (e.g. the app was reopened later).
 	 */
 	/**
-	 * Polls until the proposal confirms. `sent` is the pair this screen just sent: the row may move
-	 * to another signer's pair (#605), so the chain is asked about this one, and only its own
-	 * `failed` ends the watch. Without it (a resumed screen) the row's pair is watched.
+	 * Polls until the proposal confirms or fails. `sent` is the pair this screen just sent: the row may
+	 * move to another signer's pair (#605), so the chain is asked about this one, and its confirmation
+	 * is reported. Without it (a resumed screen) the row's pair is watched.
 	 */
 	const startConfirmationPoll = useCallback(
 		(sent?: SentPair) => {
@@ -139,7 +139,9 @@ export function useBroadcastProposal(
 				const p = res.data
 				applyProposal(p)
 				const watched = sent ?? { commitTxid: p.commitTxid, revealTxid: p.revealTxid }
-				if (p.broadcastStatus === 'failed' && rowTracksPair(p.revealTxid, watched.revealTxid)) {
+				// A `failed` row means no listed pair is left: a failed pair falls back to any other whose
+				// commit the node still has (#605). Whichever pair it names, this one is gone too.
+				if (p.broadcastStatus === 'failed') {
 					clearConfirmationPoll()
 					setError(settledFailure(p.broadcastError))
 					setPhase('error')

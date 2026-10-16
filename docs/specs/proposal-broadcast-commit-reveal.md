@@ -409,7 +409,9 @@ acts on; the others are refused on the sequence number and cost only their fees.
   nowhere — neither in the mempool nor in a block, as when the registering session died before
   broadcasting, or the pair was dropped — no longer counts as theirs on its way, so they may register
   another (`abandoned_pairs_of`). Only a node with `-txindex` can answer "nowhere"; without one the
-  signer is refused as before.
+  signer is refused as before. A signer lists at most `MAX_PAIRS_PER_SIGNER` (3) pairs per proposal,
+  abandoned ones included (`409`, "the most commit and reveal pairs allowed"): registration takes any
+  txids, each pair takes the row over, and every reconcile asks the node about every pair.
 - **The row tracks the latest pair.** Registering sets the row's `commit_txid` / `reveal_txid` to
   the new pair, `commit_broadcasted`, claim time now, error cleared — under a row lock. From there
   the new sender's desktop reports on the row as any claimer would; the per-authority gate is
@@ -455,26 +457,33 @@ acts on; the others are refused on the sequence number and cost only their fees.
   `PATCH` on a row not yet confirmed records its pair as `reveal_broadcasted` and then runs the same
   reconcile, so an earlier pair in a lower block still wins. A node that does not see the reveal yet
   leaves the row at `reveal_broadcasted` until the next read. A lone pair has nothing to race, so its
-  `reveal_confirmed` is taken as before. So is a report the node cannot check because it runs without
-  `-txindex` (its answer about the reported reveal says so): it could never find a mined reveal, and the
-  proposal would otherwise never confirm. Which pair won and its activation height are then the
+  `reveal_confirmed` is taken as before. So is a report about the tracked pair that the node cannot
+  check because it runs without `-txindex` (its answer about the reported reveal says so): it could
+  never find a mined reveal, and the proposal would otherwise never confirm. A report about a pair
+  the row no longer tracks is still ignored. Which pair won and its activation height are then the
   desktop's word, as before #605; the orchestrator logs a warning for each such report.
 - **Node requirement.** Choosing between several pairs needs `getrawtransaction` to find mined
   transactions, so the orchestrator's Bitcoin node must run with `-txindex=1` for the orchestrator to
-  decide which of several pairs won; without it the reconcile cannot confirm them, and the desktop's
-  report is taken unchecked. The orchestrator checks `getindexinfo` at startup and logs an error when
+  decide which of several pairs won; without it the reconcile cannot confirm them, and only the
+  tracked pair's own report confirms the row, unchecked. If a replaced pair is the one mined and the
+  tracked pair then fails, nothing confirms the proposal. The orchestrator checks `getindexinfo` at startup and logs an error when
   the index is missing, and a warning while it is not yet synced. Staging (`staging/entrypoint-bitcoin.sh`) and
   `scripts/bitcoind-asm-runner.sh` set it; see the runbook for other deployments.
 - **Watchers stop on a confirmed row, not on a 200.** The desktop's settle loop and the send screen's
   poll report `reveal_confirmed` and stop only once the row they get back says `reveal_confirmed`;
   otherwise the bundle stays tracked and the next check reports again. The send screen watches the
-  pair it sent, not whichever pair the row tracks: it asks the chain about its own txids, and only a
-  `failed` row that still tracks its reveal ends the watch. A row confirmed on another signer's pair
-  ends both: the settle loop drops its stored bundle (`BundleRow::Closed`) — the ASM refuses that
-  reveal on the sequence number if it is mined later — and the send screen shows the proposal done.
+  pair it sent, not whichever pair the row tracks: it asks the chain about its own txids and reports
+  their confirmation. A `failed` row ends the watch whichever pair it names: a failed pair falls back
+  to any other the node still has, so none is left. A row confirmed on another signer's pair shows the
+  proposal done on the send screen. The settle loop keeps the losing bundle (`NotOurs`): it reports
+  nothing, but resubmits the reveal while the commit is live, since mining it is what returns the
+  commit output (the ASM refuses it on the sequence number), and stops once it is mined or gone.
 - **Txids are validated.** Every txid in a `PATCH` or a registration must be 64 hex chars (`400`
   otherwise). A malformed pair backfilled from before this check is skipped by the reconcile instead of
   holding back the other pairs.
+- **An import names the pair it updates.** The import modal sends a txid the row already has when
+  the bundle also advances the broadcast status: a report that names no reveal does not move a row
+  that tracks one.
 - **The import says when it was ignored.** A `PATCH` about a pair the row does not track still answers
   `200`; the detail screen compares the reveal it imported with the one the row tracks and shows a notice
   when they differ — including an import that named no reveal while the row tracks one.
