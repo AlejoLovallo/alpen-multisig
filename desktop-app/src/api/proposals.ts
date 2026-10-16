@@ -57,10 +57,11 @@ export type Proposal = {
 	/** Served by the backend that enforces the window (#551); `null` from one that predates it. */
 	expiresAtMs: number | null
 	/**
-	 * Every commit + reveal pair sent for the proposal, oldest first (#605). Absent on proposals
-	 * built locally (the manual generator), which have no orchestrator row.
+	 * Every commit + reveal pair sent for the proposal, oldest first (#605). `null` from an
+	 * orchestrator that predates the field, and absent on proposals built locally (the manual
+	 * generator), which have no orchestrator row. Either way no second pair can be registered.
 	 */
-	broadcastAttempts?: BroadcastAttempt[]
+	broadcastAttempts?: BroadcastAttempt[] | null
 }
 
 /** One commit + reveal pair sent for a proposal. The ASM acts on whichever reveal is mined first (#605). */
@@ -131,6 +132,14 @@ export function listProposals(input: ListProposalsInput): Promise<ApiResult<Prop
 
 export function getProposalByActionId(input: GetProposalInput): Promise<ApiResult<Proposal>> {
 	return tauriCall('proposals_get', { input }, proposalSchema)
+}
+
+/**
+ * Whether this desktop still holds a commit + reveal bundle for the proposal (#605). It keeps one
+ * until the bundle is mined or dropped from the network.
+ */
+export function hasStoredBundle(actionId: string): Promise<ApiResult<boolean>> {
+	return tauriCall<boolean>('proposals_has_stored_bundle', { input: { actionId } })
 }
 
 // Pre-broadcast guard for a Cancel proposal: is its target action still queued on the ASM?

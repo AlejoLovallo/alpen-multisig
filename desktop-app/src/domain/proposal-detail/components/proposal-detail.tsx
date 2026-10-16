@@ -33,6 +33,8 @@ type Props = {
 	onBroadcast: () => void
 	/** Send this signer's own commit + reveal beside the pair in flight (#605). Omitted where there is no row. */
 	onSendAdditionalPair?: () => void
+	/** Whether this desktop still keeps a bundle for the proposal; `null` when unknown (#605). */
+	holdsBundle?: boolean | null
 	onPasteSignatures?: (sigs: PastedSignature[], broadcastState: ImportBroadcastState) => void
 	onManualExecute?: () => void
 }
@@ -91,6 +93,7 @@ export function ProposalDetail({
 	onSign,
 	onBroadcast,
 	onSendAdditionalPair,
+	holdsBundle = null,
 	onPasteSignatures,
 	onManualExecute: _onManualExecute,
 }: Props) {
@@ -105,7 +108,8 @@ export function ProposalDetail({
 		harborFrozeDestination: harborFrozeDestination(proposal, decodedData.safeHarborActivated),
 	})
 	const lastChange = lastChangeLabel(proposal.updatedAtMs)
-	const offersAdditionalPair = onSendAdditionalPair !== undefined && canSendAdditionalPair(proposal, signerPubkey)
+	const offersAdditionalPair =
+		onSendAdditionalPair !== undefined && canSendAdditionalPair(proposal, signerPubkey, holdsBundle)
 	const broadcastPairs = describeBroadcastPairs(proposal, signerPubkey)
 
 	const displayStatus = proposalDisplayStatus(proposal)

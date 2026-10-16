@@ -391,6 +391,7 @@ pub async fn register_broadcast_attempt(
             signer_pubkey: &auth.signer_pubkey,
         },
         &state.asm_rpc_url,
+        state.btc_client.as_ref(),
         &action_id,
         &body.commit_txid,
         &body.reveal_txid,

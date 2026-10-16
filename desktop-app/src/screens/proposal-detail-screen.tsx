@@ -12,6 +12,7 @@ import { ProposalDetail } from '@/domain/proposal-detail/components/proposal-det
 import { canCancelProposal } from '@/domain/proposal-detail/model/derive-proposal-actions'
 import { useDecodedProposal } from '@/domain/proposal-detail/hooks/use-decoded-proposal'
 import { useProposalDetail } from '@/domain/proposal-detail/hooks/use-proposal-detail'
+import { useStoredBundle } from '@/domain/proposal-detail/hooks/use-stored-bundle'
 import { useActivationRefresh } from '@/hooks/use-activation-refresh'
 import { useBlockHeight } from '@/hooks/use-block-height'
 import { useSession } from '@/hooks/use-session'
@@ -44,6 +45,7 @@ export function ProposalDetailScreen() {
 	const decodedData = useDecodedProposal(proposal)
 	const currentBlockHeight = useBlockHeight()
 	const [importNotice, setImportNotice] = useState<string | null>(null)
+	const holdsBundle = useStoredBundle(actionId, proposal?.updatedAtMs)
 
 	useActivationRefresh(proposal !== null && isActivationReached(proposal, currentBlockHeight), refresh)
 
@@ -174,6 +176,7 @@ export function ProposalDetailScreen() {
 								decodedData={decodedData}
 								onSign={() => navigate(`/proposals/${actionId}/sign`)}
 								onBroadcast={() => navigate(`/proposals/${actionId}/broadcast`)}
+								holdsBundle={holdsBundle}
 								onSendAdditionalPair={() => navigate(`/proposals/${actionId}/broadcast?pair=additional`)}
 								onPasteSignatures={(sigs, broadcastState) => void handlePasteSignatures(sigs, broadcastState)}
 								onManualExecute={() =>

@@ -192,6 +192,7 @@ impl ProposalRepository for InMemoryProposalRepository {
         &self,
         action_id: &ActionId,
         attempt: BroadcastAttempt,
+        abandoned: &[String],
     ) -> Result<Proposal, AppError> {
         // The write lock serializes registrations in this process.
         let mut proposals = self
@@ -201,7 +202,7 @@ impl ProposalRepository for InMemoryProposalRepository {
         let Some(proposal) = proposals.get_mut(action_id) else {
             return Err(AppError::NotFound);
         };
-        match decide_additional_pair(proposal, &attempt) {
+        match decide_additional_pair(proposal, &attempt, abandoned) {
             Err(refusal) => return Err(AppError::Conflict(refusal.to_string())),
             Ok(AdditionalPair::AlreadyRegistered) => return Ok(proposal.clone()),
             Ok(AdditionalPair::Register) => {}

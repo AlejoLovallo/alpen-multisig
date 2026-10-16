@@ -117,7 +117,8 @@ pub struct ProposalDto {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub expires_at_ms: Option<u64>,
-    pub broadcast_attempts: Vec<BroadcastAttemptDto>,
+    /// `None` from an orchestrator that predates #605.
+    pub broadcast_attempts: Option<Vec<BroadcastAttemptDto>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -258,16 +259,17 @@ fn map_proposal(proposal: Proposal) -> ProposalDto {
         created_at_ms,
         updated_at_ms,
         expires_at_ms,
-        broadcast_attempts: proposal
-            .broadcast_attempts
-            .into_iter()
-            .map(|attempt| BroadcastAttemptDto {
-                broadcaster_pubkey: attempt.broadcaster_pubkey,
-                commit_txid: attempt.commit_txid,
-                reveal_txid: attempt.reveal_txid,
-                created_at_ms: attempt.created_at as u64,
-            })
-            .collect(),
+        broadcast_attempts: proposal.broadcast_attempts.map(|attempts| {
+            attempts
+                .into_iter()
+                .map(|attempt| BroadcastAttemptDto {
+                    broadcaster_pubkey: attempt.broadcaster_pubkey,
+                    commit_txid: attempt.commit_txid,
+                    reveal_txid: attempt.reveal_txid,
+                    created_at_ms: attempt.created_at.max(0) as u64,
+                })
+                .collect()
+        }),
     }
 }
 
@@ -367,6 +369,26 @@ mod wallet_session_state_tests {
             let _ = proposals_broadcast(input, s, nc, p, ec);
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HasStoredBundleInput {
+    pub action_id: String,
+}
+
+/// Whether this desktop still holds a commit + reveal bundle for the proposal (#605). The settle
+/// loop keeps one until it is mined or dropped, so `false` means any pair this signer sent before
+/// is no longer on its way from here, and another may be offered.
+#[tauri::command]
+pub fn proposals_has_stored_bundle(
+    input: HasStoredBundleInput,
+    pending: tauri::State<'_, PendingReveals>,
+) -> bool {
+    pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&input.action_id)
 }
 
 #[derive(Debug, Deserialize)]

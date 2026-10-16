@@ -153,9 +153,15 @@ export function useBroadcastProposal(
 					commitTxid: p.commitTxid,
 					revealTxid: p.revealTxid,
 				})
-				if (promoted.ok) applyProposal(promoted.data)
-				clearConfirmationPoll()
-				setPhase('done')
+				if (!promoted.ok) return
+				applyProposal(promoted.data)
+				// A 200 is not a confirmation (#605): beside other pairs the orchestrator keeps the
+				// row at `reveal_broadcasted` until its own node sees the block. Keep polling until
+				// the row it wrote back is done.
+				if (phaseForBroadcastStatus(promoted.data.broadcastStatus, promoted.data.status) === 'done') {
+					clearConfirmationPoll()
+					setPhase('done')
+				}
 			}
 		}
 		pollRef.current = setInterval(() => void tick(), CONFIRMATION_POLL_INTERVAL_MS)

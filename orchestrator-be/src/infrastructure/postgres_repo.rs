@@ -492,6 +492,7 @@ impl ProposalRepository for PostgresProposalRepository {
         &self,
         action_id: &ActionId,
         attempt: BroadcastAttempt,
+        abandoned: &[String],
     ) -> Result<Proposal, AppError> {
         // Lock the row so two registrations — or one beside a claim or a report — are decided
         // one after the other on what the previous one wrote.
@@ -514,7 +515,7 @@ impl ProposalRepository for PostgresProposalRepository {
         let mut current = row_to_proposal_no_sigs(&row, action_id.0.clone())?;
         current.broadcast_attempts = load_broadcast_attempts(&mut *tx, &action_id.0).await?;
 
-        match decide_additional_pair(&current, &attempt) {
+        match decide_additional_pair(&current, &attempt, abandoned) {
             Err(refusal) => return Err(AppError::Conflict(refusal.to_string())),
             // Dropping the transaction releases the lock; the row is left as it is.
             Ok(AdditionalPair::AlreadyRegistered) => {
@@ -826,5 +827,223 @@ impl ProposalRepository for PostgresProposalRepository {
         })?;
 
         Ok(true)
+    }
+}
+
+/// #605 against a real Postgres: run with
+/// `TEST_DATABASE_URL=postgres://… cargo test -p orchestrator-be -- --ignored postgres_`.
+/// The in-memory repository covers the same rules in every run; this exercises the SQL itself.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::proposals::OWN_PAIR_EXISTS;
+
+    const COMMIT_A: &str = "aa00000000000000000000000000000000000000000000000000000000000000";
+    const REVEAL_A: &str = "aa11111111111111111111111111111111111111111111111111111111111111";
+    const COMMIT_B: &str = "bb00000000000000000000000000000000000000000000000000000000000000";
+    const REVEAL_B: &str = "bb11111111111111111111111111111111111111111111111111111111111111";
+    const COMMIT_C: &str = "cc00000000000000000000000000000000000000000000000000000000000000";
+    const REVEAL_C: &str = "cc11111111111111111111111111111111111111111111111111111111111111";
+    const SIGNER_A: &str = "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SIGNER_B: &str = "03bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    async fn repo() -> Option<PostgresProposalRepository> {
+        let url = std::env::var("TEST_DATABASE_URL").ok()?;
+        let pool = PgPool::connect(&url)
+            .await
+            .expect("connect TEST_DATABASE_URL");
+        sqlx::migrate!().run(&pool).await.expect("migrations");
+        Some(PostgresProposalRepository::new(pool))
+    }
+
+    fn attempt(signer: &str, commit: &str, reveal: &str) -> BroadcastAttempt {
+        BroadcastAttempt {
+            broadcaster_pubkey: Some(signer.to_string()),
+            commit_txid: commit.to_string(),
+            reveal_txid: reveal.to_string(),
+            created_at: Utc::now(),
+        }
+    }
+
+    /// An approved proposal whose claimer (signer A) reported its pair as sent.
+    async fn save_with_pair_of_a(repo: &PostgresProposalRepository) -> ActionId {
+        let nanos = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let action_id = ActionId(format!("pg-605-{nanos}"));
+        repo.save_proposal(Proposal {
+            action_id: action_id.clone(),
+            seq_no: u64::try_from(nanos).unwrap_or_default(),
+            authority: Authority::StrataAdmin,
+            status: ProposalStatus::Approved,
+            required_signatures: 2,
+            action_hex: "deadbeef".to_string(),
+            title: None,
+            signatures: vec![ProposalSignature {
+                signer_pubkey: SIGNER_A.to_string(),
+                signature_hex: "sig0".to_string(),
+            }],
+            broadcast_status: BroadcastStatus::CommitBroadcasted,
+            commit_txid: None,
+            reveal_txid: None,
+            broadcast_error: None,
+            target_action_id: None,
+            activation_height: None,
+            update_id_in_queue: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            broadcast_claimed_at: Some(Utc::now()),
+            broadcast_attempts: Vec::new(),
+        })
+        .await
+        .unwrap();
+        repo.update_reported_pair_status(
+            &action_id,
+            BroadcastStatus::RevealBroadcasted,
+            None,
+            Some(COMMIT_A),
+            Some(REVEAL_A),
+            None,
+            Some(attempt(SIGNER_A, COMMIT_A, REVEAL_A)),
+        )
+        .await
+        .unwrap();
+        action_id
+    }
+
+    fn reveals(proposal: &Proposal) -> Vec<&str> {
+        proposal
+            .broadcast_attempts
+            .iter()
+            .map(|attempt| attempt.reveal_txid.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn postgres_registers_reports_and_confirms_pairs() {
+        let Some(repo) = repo().await else {
+            return;
+        };
+        let action_id = save_with_pair_of_a(&repo).await;
+
+        // Another signer's pair becomes the tracked one; a retry of it changes nothing.
+        let registered = repo
+            .register_additional_pair(&action_id, attempt(SIGNER_B, COMMIT_B, REVEAL_B), &[])
+            .await
+            .unwrap();
+        assert_eq!(registered.reveal_txid.as_deref(), Some(REVEAL_B));
+        assert_eq!(
+            registered.broadcast_status,
+            BroadcastStatus::CommitBroadcasted
+        );
+        assert_eq!(reveals(&registered), [REVEAL_A, REVEAL_B]);
+        let again = repo
+            .register_additional_pair(&action_id, attempt(SIGNER_B, COMMIT_B, REVEAL_B), &[])
+            .await
+            .unwrap();
+        assert_eq!(again.broadcast_attempts, registered.broadcast_attempts);
+
+        // A second pair of their own is refused, unless the earlier one is nowhere.
+        let err = repo
+            .register_additional_pair(&action_id, attempt(SIGNER_A, COMMIT_C, REVEAL_C), &[])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::Conflict(ref m) if m == OWN_PAIR_EXISTS),
+            "{err:?}"
+        );
+
+        // A report about the replaced pair changes nothing, and an unknown pair is not listed.
+        let after = repo
+            .update_reported_pair_status(
+                &action_id,
+                BroadcastStatus::Failed,
+                None,
+                Some(COMMIT_A),
+                Some(REVEAL_A),
+                Some("dropped"),
+                Some(attempt(SIGNER_A, COMMIT_A, REVEAL_A)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.broadcast_status, BroadcastStatus::CommitBroadcasted);
+        assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_B));
+        assert!(after.broadcast_error.is_none());
+        let after = repo
+            .update_reported_pair_status(
+                &action_id,
+                BroadcastStatus::RevealBroadcasted,
+                None,
+                Some(COMMIT_C),
+                Some(REVEAL_C),
+                None,
+                Some(attempt(SIGNER_A, COMMIT_C, REVEAL_C)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reveals(&after), [REVEAL_A, REVEAL_B]);
+
+        // The listing carries every pair.
+        let listed = repo
+            .list_by_status(Authority::StrataAdmin, Some(ProposalStatus::Approved))
+            .await
+            .unwrap();
+        let mine = listed
+            .iter()
+            .find(|proposal| proposal.action_id == action_id)
+            .expect("listed");
+        assert_eq!(reveals(mine), [REVEAL_A, REVEAL_B]);
+
+        // A confirmation decided against a row that moved on does not apply; one that did, does.
+        let stale = repo
+            .confirm_tracked_reveal(&action_id, Some(REVEAL_A), COMMIT_A, REVEAL_A)
+            .await
+            .unwrap();
+        assert!(stale.is_none());
+        let confirmed = repo
+            .confirm_tracked_reveal(
+                &action_id,
+                Some(&REVEAL_B.to_uppercase()),
+                &COMMIT_A.to_uppercase(),
+                &REVEAL_A.to_uppercase(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(confirmed.broadcast_status, BroadcastStatus::RevealConfirmed);
+        assert_eq!(confirmed.commit_txid.as_deref(), Some(COMMIT_A));
+        assert_eq!(confirmed.reveal_txid.as_deref(), Some(REVEAL_A));
+
+        // Once confirmed, nothing is registered beside it.
+        let err = repo
+            .register_additional_pair(&action_id, attempt(SIGNER_A, COMMIT_C, REVEAL_C), &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Conflict(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn postgres_lets_a_signer_replace_a_pair_that_is_nowhere() {
+        let Some(repo) = repo().await else {
+            return;
+        };
+        let action_id = save_with_pair_of_a(&repo).await;
+        repo.register_additional_pair(&action_id, attempt(SIGNER_B, COMMIT_B, REVEAL_B), &[])
+            .await
+            .unwrap();
+
+        let replaced = repo
+            .register_additional_pair(
+                &action_id,
+                attempt(SIGNER_A, COMMIT_C, REVEAL_C),
+                &[REVEAL_A.to_string()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(replaced.reveal_txid.as_deref(), Some(REVEAL_C));
+        assert_eq!(reveals(&replaced), [REVEAL_A, REVEAL_B, REVEAL_C]);
     }
 }

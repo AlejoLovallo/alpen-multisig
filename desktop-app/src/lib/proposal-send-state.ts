@@ -188,7 +188,7 @@ type AdditionalPairInput = {
 	status: ProposalStatus
 	broadcastStatus: BroadcastStatus
 	revealTxid?: string
-	broadcastAttempts?: ReadonlyArray<{ broadcasterPubkey: string | null }>
+	broadcastAttempts?: ReadonlyArray<{ broadcasterPubkey: string | null }> | null
 }
 
 /**
@@ -210,13 +210,26 @@ export function hasPairInFlight(proposal: Omit<AdditionalPairInput, 'broadcastAt
  * A low-fee bundle can sit in the mempool with nobody else able to advance it. Every pair carries
  * the same signed payload, so whichever reveal is mined first is the one the ASM acts on. Offered
  * only beside a pair that is on its way — an empty claim is a signer still at the device, and
- * `idle` / `failed` already offer Send — and only to a signer who has not sent one: whoever did
- * bumps its fee instead. The orchestrator applies the same rule (`decide_additional_pair`).
+ * `idle` / `failed` already offer Send — and only to a signer with no pair of their own on its
+ * way: whoever has one bumps its fee instead.
+ *
+ * `holdsBundle` is whether this desktop still keeps a bundle for the proposal (`null` when
+ * unknown). A signer whose earlier pair this desktop no longer keeps — dropped, or registered by a
+ * session that died before broadcasting it — may send another; the orchestrator lets them only once
+ * its node finds that earlier commit nowhere (`decide_additional_pair`).
  */
-export function canSendAdditionalPair(proposal: AdditionalPairInput, signerPubkey: string | null): boolean {
+export function canSendAdditionalPair(
+	proposal: AdditionalPairInput,
+	signerPubkey: string | null,
+	holdsBundle: boolean | null = null,
+): boolean {
 	if (signerPubkey === null || !hasPairInFlight(proposal)) return false
+	// No list at all is an orchestrator without the registration endpoint (#605).
+	if (proposal.broadcastAttempts === undefined || proposal.broadcastAttempts === null) return false
+	if (holdsBundle === true) return false
 	const own = normalizePubkey(signerPubkey)
-	return !(proposal.broadcastAttempts ?? []).some(
+	const sentBefore = proposal.broadcastAttempts.some(
 		(attempt) => attempt.broadcasterPubkey !== null && normalizePubkey(attempt.broadcasterPubkey) === own,
 	)
+	return !sentBefore || holdsBundle === false
 }

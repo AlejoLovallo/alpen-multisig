@@ -778,9 +778,19 @@ pub async fn settle_bundle(
             return BundleSettlement::Live;
         }
         if ours.is_some() {
-            if let Err(e) = report("reveal_confirmed").await {
-                tracing::warn!(action_id = key, error = %e, "settle: reveal_confirmed report failed; retried next check");
-                return BundleSettlement::Live;
+            // A 200 is not a confirmation (#605): beside other pairs the orchestrator records the
+            // report as `reveal_broadcasted` and confirms only once its own node sees a mined
+            // reveal. Keep the bundle until the returned row says `reveal_confirmed`.
+            match report("reveal_confirmed").await {
+                Ok(row) if row.broadcast_status == "reveal_confirmed" => {}
+                Ok(row) => {
+                    tracing::info!(action_id = key, broadcast_status = %row.broadcast_status, "settle: reveal mined but the orchestrator has not confirmed it yet; retried next check");
+                    return BundleSettlement::Live;
+                }
+                Err(e) => {
+                    tracing::warn!(action_id = key, error = %e, "settle: reveal_confirmed report failed; retried next check");
+                    return BundleSettlement::Live;
+                }
             }
         }
         crate::infrastructure::pending_reveals_store::remove_and_persist(ctx.pending, key);
@@ -846,27 +856,30 @@ pub async fn settle_bundle(
     }
 }
 
-/// Reports `status` for a stored bundle, with both its txids.
+/// Reports `status` for a stored bundle, with both its txids, and returns the row the
+/// orchestrator wrote back: what it recorded can differ from what was reported (#605).
 async fn report_bundle(
     ctx: &BundleSettleContext<'_>,
     key: &str,
     stored: &crate::application::pending_reveals::PendingReveal,
     status: &str,
     broadcast_error: Option<&str>,
-) -> Result<(), BroadcastError> {
+) -> Result<Proposal, BroadcastError> {
     let client = ctx
         .orchestrator
         .ok_or_else(|| BroadcastError::Setup("no orchestrator session".to_string()))?;
-    report_broadcast(
-        client,
-        key,
-        status,
-        None,
-        Some(&stored.commit_txid),
-        Some(&stored.reveal_txid),
-        broadcast_error,
-    )
-    .await
+    Ok(client
+        .report_broadcast_progress(
+            key,
+            ReportBroadcastProgressRequest {
+                broadcast_status: status.to_string(),
+                proposal_status: None,
+                commit_txid: Some(stored.commit_txid.clone()),
+                reveal_txid: Some(stored.reveal_txid.clone()),
+                broadcast_error: broadcast_error.map(str::to_string),
+            },
+        )
+        .await?)
 }
 
 /// Reports a dropped bundle as `failed`, retrying up to [`REPORT_ATTEMPTS`] times.
@@ -885,7 +898,7 @@ async fn report_failed_with_retry(
                 tokio::time::sleep(REPORT_RETRY_DELAY).await;
                 attempt += 1;
             }
-            other => return other,
+            other => return other.map(|_| ()),
         }
     }
 }
@@ -1654,7 +1667,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
-                broadcast_attempts: Vec::new(),
+                broadcast_attempts: None,
             };
             *self.last_create_request.lock().unwrap() = Some(request);
             Ok(response)
@@ -1706,7 +1719,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
-                broadcast_attempts: Vec::new(),
+                broadcast_attempts: None,
             };
             *self.last_cancel_request.lock().unwrap() =
                 Some((target_action_id.to_string(), request));
@@ -1742,7 +1755,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
-                broadcast_attempts: Vec::new(),
+                broadcast_attempts: None,
             })
         }
 
@@ -1802,7 +1815,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
-                broadcast_attempts: Vec::new(),
+                broadcast_attempts: None,
             })
         }
 
@@ -1844,7 +1857,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
-                broadcast_attempts: Vec::new(),
+                broadcast_attempts: None,
             })
         }
 
@@ -1880,7 +1893,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
-                broadcast_attempts: Vec::new(),
+                broadcast_attempts: None,
             }])
         }
 
@@ -1924,7 +1937,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
-                broadcast_attempts: Vec::new(),
+                broadcast_attempts: None,
             })
         }
 
@@ -1965,7 +1978,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
-                broadcast_attempts: Vec::new(),
+                broadcast_attempts: None,
             })
         }
     }
@@ -2447,6 +2460,9 @@ mod tests {
         /// When set, a progress report is recorded and the response tracks this reveal instead
         /// of the one the report named (#605).
         tracked_reveal: Option<&'static str>,
+        /// When set, the response carries this broadcast status instead of the reported one, as
+        /// when the orchestrator records a `reveal_confirmed` as `reveal_broadcasted` (#605).
+        written_status: Option<&'static str>,
     }
 
     impl MockOrchestratorClientLargeAction {
@@ -2538,7 +2554,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
-                broadcast_attempts: Vec::new(),
+                broadcast_attempts: None,
             })
         }
         async fn get_cancel_target_status(
@@ -2601,7 +2617,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
-                broadcast_attempts: Vec::new(),
+                broadcast_attempts: None,
             })
         }
         async fn report_broadcast_progress(
@@ -2638,7 +2654,10 @@ mod tests {
                 status: "approved".to_string(),
                 required_signatures: 2,
                 signatures: vec![],
-                broadcast_status: request.broadcast_status,
+                broadcast_status: self
+                    .written_status
+                    .map(str::to_string)
+                    .unwrap_or(request.broadcast_status),
                 commit_txid: request.commit_txid,
                 reveal_txid,
                 broadcast_error: None,
@@ -2651,7 +2670,7 @@ mod tests {
                 cancel_proposal: None,
                 is_cancelable: false,
                 broadcast_claim_stale: false,
-                broadcast_attempts: Vec::new(),
+                broadcast_attempts: None,
             })
         }
         async fn register_broadcast_attempt(
@@ -3923,6 +3942,54 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// #605: beside other pairs the orchestrator answers a `reveal_confirmed` report with a row
+    /// still at `reveal_broadcasted` until its own node sees the block. That 200 is not a
+    /// confirmation: the bundle stays tracked and the next check reports again.
+    #[tokio::test]
+    async fn a_confirmation_the_orchestrator_did_not_write_keeps_the_bundle() {
+        let (stored, _, _) = stored_bundle();
+        let pending = crate::application::pending_reveals::new();
+        pending
+            .lock()
+            .unwrap()
+            .insert("action-unconfirmed".to_string(), stored.clone());
+        let lookups = mined_lookups();
+        let row = Some(("reveal_broadcasted", stored.reveal_txid.clone()));
+        let behind = MockOrchestratorClientLargeAction {
+            row: row.clone(),
+            written_status: Some("reveal_broadcasted"),
+            ..MockOrchestratorClientLargeAction::default()
+        };
+        let caught_up = MockOrchestratorClientLargeAction {
+            row,
+            ..MockOrchestratorClientLargeAction::default()
+        };
+        let spy = SpyCommitFunding::new("ignored");
+        let mut tracker = AbsenceTracker::new(AbsenceWindow::DEFAULT);
+        let now = std::time::Instant::now();
+        let broadcasters = ok_broadcasters();
+        let ctx_behind = BundleSettleContext {
+            lookups: &lookups,
+            broadcasters: &broadcasters,
+            orchestrator: Some(&behind),
+            funding: Some(&spy),
+            pending: &pending,
+        };
+        let ctx_caught_up = BundleSettleContext {
+            orchestrator: Some(&caught_up),
+            ..ctx_behind
+        };
+
+        let settled = settle_bundle(&ctx_behind, &mut tracker, "action-unconfirmed", now).await;
+        assert_eq!(settled, BundleSettlement::Live);
+        assert!(pending.lock().unwrap().contains_key("action-unconfirmed"));
+
+        let settled = settle_bundle(&ctx_caught_up, &mut tracker, "action-unconfirmed", now).await;
+        assert_eq!(settled, BundleSettlement::Confirmed);
+        assert_eq!(caught_up.reported_statuses(), vec!["reveal_confirmed"]);
+        assert!(!pending.lock().unwrap().contains_key("action-unconfirmed"));
     }
 
     /// #516: a dropped bundle's `failed` report that does not land is never given up: the bundle

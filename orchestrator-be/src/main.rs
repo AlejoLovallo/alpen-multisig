@@ -32,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
         &config.bitcoin_rpc_user,
         &config.bitcoin_rpc_pass,
     ));
+    warn_without_txindex(btc_client.clone());
 
     let state = if let Some(database_url) = &config.database_url {
         let pool = PgPoolOptions::new()
@@ -92,4 +93,20 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app).await.context("server error")?;
 
     Ok(())
+}
+
+/// A node without `-txindex` cannot find a mined reveal, so a proposal with more than one commit +
+/// reveal pair never confirms (#605). Checked once in the background so a slow node does not hold
+/// back startup; the operator sees it in the log.
+fn warn_without_txindex(btc_client: Arc<infrastructure::bitcoin_rpc::HttpBitcoinRpcClient>) {
+    tokio::spawn(async move {
+        match btc_client.txindex_enabled().await {
+            Ok(true) => tracing::info!("bitcoin node keeps a transaction index (-txindex)"),
+            Ok(false) => tracing::error!(
+                "bitcoin node runs without -txindex: a proposal with more than one commit + reveal \
+                 pair cannot be confirmed by the orchestrator; restart bitcoind with -txindex=1"
+            ),
+            Err(e) => tracing::warn!(error = %e, "could not check the bitcoin node for -txindex"),
+        }
+    });
 }

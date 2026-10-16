@@ -4,7 +4,7 @@ import { normalizePubkey, truncatePubkey } from '@/lib/pubkey'
 type BroadcastPairsInput = {
 	broadcastStatus: BroadcastStatus
 	revealTxid?: string
-	broadcastAttempts?: ReadonlyArray<BroadcastAttempt>
+	broadcastAttempts?: ReadonlyArray<BroadcastAttempt> | null
 }
 
 export type BroadcastPairRow = {

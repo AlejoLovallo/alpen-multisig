@@ -45,12 +45,14 @@ pub(crate) trait ProposalRepository: Send + Sync {
     /// tracks (`commit_broadcasted`, claim time now, error cleared) (#605).
     ///
     /// Decided under the repository's lock with `decide_additional_pair`; a refusal is
-    /// `Err(Conflict)` carrying its text. Never touches another proposal: the authority's
-    /// in-flight bundle is already this one.
+    /// `Err(Conflict)` carrying its text. `abandoned` names this signer's earlier pairs the node
+    /// finds nowhere. Never touches another proposal: the authority's in-flight bundle is already
+    /// this one.
     async fn register_additional_pair(
         &self,
         action_id: &ActionId,
         attempt: BroadcastAttempt,
+        abandoned: &[String],
     ) -> Result<Proposal, AppError>;
 
     /// Update broadcast sub-status and related txids/error for an approved proposal.

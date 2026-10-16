@@ -522,11 +522,14 @@ pub(crate) enum AdditionalPair {
 /// device; `idle`, `failed` and a stale empty claim go through the claim instead. One pair per
 /// signer: whoever already sent one bumps its fee, and the desktop holds one stored bundle per
 /// proposal — except that the same signer registering the same pair again is the retry of a
-/// registration whose response was lost, and succeeds. Shared by both repositories, which
+/// registration whose response was lost, and succeeds. A pair of theirs listed in `abandoned`
+/// (its commit is neither in the mempool nor in a block, as when the registering session died
+/// before broadcasting) no longer counts as theirs on its way. Shared by both repositories, which
 /// evaluate it under their own lock.
 pub(crate) fn decide_additional_pair(
     proposal: &Proposal,
     attempt: &BroadcastAttempt,
+    abandoned: &[String],
 ) -> Result<AdditionalPair, &'static str> {
     let in_flight = proposal.status == ProposalStatus::Approved
         && match proposal.broadcast_status {
@@ -552,14 +555,59 @@ pub(crate) fn decide_additional_pair(
     {
         return Ok(AdditionalPair::AlreadyRegistered);
     }
+    let given_up = |kept: &BroadcastAttempt| {
+        abandoned
+            .iter()
+            .any(|reveal| reveal.eq_ignore_ascii_case(&kept.reveal_txid))
+    };
     if proposal
         .broadcast_attempts
         .iter()
-        .any(|kept| same_signer(kept) || same_reveal(kept))
+        .any(|kept| (same_signer(kept) && !given_up(kept)) || same_reveal(kept))
     {
         return Err(OWN_PAIR_EXISTS);
     }
     Ok(AdditionalPair::Register)
+}
+
+/// Whether the node answered that a transaction is nowhere: neither in its mempool nor in a block.
+/// Only a node with `-txindex` can say so; without one the answer is not taken (#605).
+fn tx_nowhere(result: &Result<u64, AppError>) -> bool {
+    match result {
+        Err(AppError::BadRequest(message)) => {
+            let message = message.to_ascii_lowercase();
+            message.contains("no such mempool or blockchain transaction")
+                && !message.contains("being indexed")
+        }
+        _ => false,
+    }
+}
+
+/// The reveal txids of `signer`'s own listed pairs whose commit the node finds nowhere (#605): a
+/// registration whose session died before broadcasting, or a pair dropped from the mempool.
+async fn abandoned_pairs_of(
+    proposal: &Proposal,
+    signer: &str,
+    btc_client: &dyn BitcoinRpcClient,
+) -> Vec<String> {
+    let mut abandoned = Vec::new();
+    for kept in &proposal.broadcast_attempts {
+        let own = kept
+            .broadcaster_pubkey
+            .as_deref()
+            .is_some_and(|pubkey| pubkey.eq_ignore_ascii_case(signer));
+        if !own || !is_txid(&kept.commit_txid) {
+            continue;
+        }
+        if tx_nowhere(
+            &btc_client
+                .get_block_height_for_txid(&kept.commit_txid)
+                .await,
+        ) {
+            abandoned.push(kept.reveal_txid.clone());
+        }
+    }
+    abandoned
 }
 
 fn is_txid(txid: &str) -> bool {
@@ -587,6 +635,7 @@ pub(crate) async fn register_additional_pair(
     repo: &dyn ProposalRepository,
     session: SessionContext<'_>,
     asm_rpc_url: &str,
+    btc_client: &dyn BitcoinRpcClient,
     action_id: &ActionId,
     commit_txid: &str,
     reveal_txid: &str,
@@ -603,14 +652,17 @@ pub(crate) async fn register_additional_pair(
     ensure_threshold_snapshot_current(&proposal, asm_rpc_url).await?;
     ensure_seq_no_still_open(&proposal, asm_rpc_url).await?;
 
+    let signer = normalize_signer_pubkey_hex(session.signer_pubkey);
+    let abandoned = abandoned_pairs_of(&proposal, &signer, btc_client).await;
     repo.register_additional_pair(
         action_id,
         BroadcastAttempt {
-            broadcaster_pubkey: Some(normalize_signer_pubkey_hex(session.signer_pubkey)),
+            broadcaster_pubkey: Some(signer),
             commit_txid: commit_txid.to_ascii_lowercase(),
             reveal_txid: reveal_txid.to_ascii_lowercase(),
             created_at: Utc::now(),
         },
+        &abandoned,
     )
     .await
 }
@@ -655,23 +707,32 @@ fn classify_reveal_height(result: Result<u64, AppError>) -> RevealHeight {
     }
 }
 
+/// Whether the node answered that the transaction is not in a block: in the mempool, or nowhere.
+///
+/// A node without `-txindex` answers -5 "No such mempool transaction. Use -txindex …" for a
+/// transaction that *is* mined, and one still building its index says so too: neither is an
+/// answer, and reading them as "not mined" would skip the reveal that won (#605).
 fn reveal_not_in_a_block(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
+    if message.contains("-txindex") || message.contains("being indexed") {
+        return false;
+    }
     message.contains("not yet confirmed")
-        || message.contains("no such mempool")
+        || message.contains("no such mempool or blockchain transaction")
         || message.contains("no such transaction")
 }
 
 /// The commit + reveal pair mined first, out of the row's own pair and every pair registered for
-/// the proposal (#605): the lowest block height, the row's own pair on a tie. Two reveals in one
-/// block activate at the same height whichever the ASM took. `None` when no reveal is mined, when
-/// the node could not say about one of them, or when the winner has no commit txid on record.
+/// the proposal (#605): the lowest block height, and within one block the reveal the block lists
+/// first — the one the ASM executed. `None` when no reveal is mined, when the node could not say
+/// about one of them, or when the winner has no commit txid on record.
 async fn first_mined_pair(
     proposal: &Proposal,
     btc_client: &dyn BitcoinRpcClient,
 ) -> Option<(String, String)> {
     let tracked = proposal.reveal_txid.as_deref();
-    // The row's own pair goes first, so a tie keeps it.
+    // A malformed txid (stored before reports were validated) can never be mined, and its failing
+    // lookup would hold back every other pair; this includes one on the row itself.
     let candidates = tracked
         .map(|reveal| (proposal.commit_txid.as_deref(), reveal))
         .into_iter()
@@ -682,30 +743,44 @@ async fn first_mined_pair(
                 .filter(|attempt| {
                     !tracked.is_some_and(|txid| txid.eq_ignore_ascii_case(&attempt.reveal_txid))
                 })
-                // A malformed txid backfilled from before reports were validated can never be
-                // mined, and its failing lookup would hold back every other pair.
-                .filter(|attempt| is_txid(&attempt.reveal_txid))
                 .map(|attempt| {
                     (
                         Some(attempt.commit_txid.as_str()),
                         attempt.reveal_txid.as_str(),
                     )
                 }),
-        );
+        )
+        .filter(|(_, reveal)| is_txid(reveal));
 
-    let mut best: Option<(u64, Option<&str>, &str)> = None;
+    let mut mined: Vec<(u64, Option<&str>, &str)> = Vec::new();
     for (commit, reveal) in candidates {
-        let height =
-            match classify_reveal_height(btc_client.get_block_height_for_txid(reveal).await) {
-                RevealHeight::Mined(height) => height,
-                RevealHeight::Unmined => continue,
-                RevealHeight::Unknown => return None,
-            };
-        if best.is_none_or(|(best_height, _, _)| height < best_height) {
-            best = Some((height, commit, reveal));
+        match classify_reveal_height(btc_client.get_block_height_for_txid(reveal).await) {
+            RevealHeight::Mined(height) => mined.push((height, commit, reveal)),
+            RevealHeight::Unmined => {}
+            RevealHeight::Unknown => return None,
         }
     }
-    let (_, commit, reveal) = best?;
+    let lowest = mined.iter().map(|(height, _, _)| *height).min()?;
+    let mut first: Vec<(Option<&str>, &str)> = mined
+        .into_iter()
+        .filter(|(height, _, _)| *height == lowest)
+        .map(|(_, commit, reveal)| (commit, reveal))
+        .collect();
+    let (commit, reveal) = if first.len() == 1 {
+        first.remove(0)
+    } else {
+        // Two reveals in one block: the ASM acts on the one the block lists first. A node that
+        // cannot place them leaves the row for the next read rather than guess.
+        let mut placed = Vec::with_capacity(first.len());
+        for (commit, reveal) in first {
+            let position = btc_client.get_tx_position_in_block(reveal).await.ok()?;
+            placed.push((position, commit, reveal));
+        }
+        let (_, commit, reveal) = placed
+            .into_iter()
+            .min_by_key(|(position, _, _)| *position)?;
+        (commit, reveal)
+    };
     Some((commit?.to_string(), reveal.to_string()))
 }
 
@@ -1423,6 +1498,7 @@ mod tests {
     };
     use crate::infrastructure::bitcoin_rpc::BitcoinRpcClient;
     use crate::infrastructure::memory_repo::InMemoryProposalRepository;
+    use serde_json::json;
 
     fn new_repo() -> InMemoryProposalRepository {
         InMemoryProposalRepository::new()
@@ -3026,8 +3102,8 @@ mod tests {
             &action_id,
             BroadcastStatus::RevealBroadcasted,
             None,
-            Some("commit"),
-            Some("reveal"),
+            Some(COMMIT_A),
+            Some(REVEAL_A),
             None,
         )
         .await
@@ -3062,8 +3138,8 @@ mod tests {
                 &action_id,
                 status,
                 None,
-                Some("commit"),
-                Some("reveal"),
+                Some(COMMIT_A),
+                Some(REVEAL_A),
                 None,
             )
             .await
@@ -3100,8 +3176,8 @@ mod tests {
             &action_id,
             BroadcastStatus::Failed,
             None,
-            Some("commit"),
-            Some("reveal"),
+            Some(COMMIT_A),
+            Some(REVEAL_A),
             Some("dropped: the bundle is no longer in the mempool or the chain"),
         )
         .await
@@ -3837,11 +3913,21 @@ mod tests {
 
     /// Signer A claimed, pre-registered its pair and sent it: the row is `reveal_broadcasted`.
     async fn save_with_pair_of_a(repo: &InMemoryProposalRepository) -> ActionId {
+        save_with_pair(repo, 1, COMMIT_A, REVEAL_A).await
+    }
+
+    /// `save_with_pair_of_a` with signer A's pair given, at this sequence number.
+    async fn save_with_pair(
+        repo: &InMemoryProposalRepository,
+        seq_no: u64,
+        commit: &str,
+        reveal: &str,
+    ) -> ActionId {
         // A decodable action, so the confirmed reveal yields an activation height.
         let created = create_update_action(
             repo,
             session_of(&sig_a()),
-            1,
+            seq_no,
             &test_fixture_action_hex(),
             &sig_a(),
             2,
@@ -3876,7 +3962,7 @@ mod tests {
                 session_of(&sig_a()),
                 &action_id,
                 &mock_btc(),
-                report(status, Some(COMMIT_A), Some(REVEAL_A)),
+                report(status, Some(commit), Some(reveal)),
             )
             .await
             .unwrap();
@@ -3892,6 +3978,7 @@ mod tests {
             repo,
             session_of(&sig_b()),
             "mock://asm-membership",
+            &mock_btc(),
             action_id,
             COMMIT_B,
             REVEAL_B,
@@ -3951,6 +4038,7 @@ mod tests {
             &repo,
             session_of(&sig_a()),
             "mock://asm-membership",
+            &mock_btc(),
             &action_id,
             COMMIT_B,
             REVEAL_B,
@@ -3967,6 +4055,7 @@ mod tests {
             &repo,
             session_of(&sig_b()),
             "mock://asm-membership",
+            &mock_btc(),
             &action_id,
             COMMIT_C,
             REVEAL_C,
@@ -4044,6 +4133,7 @@ mod tests {
             &repo,
             session_of(&sig_b()),
             "mock://asm-membership",
+            &mock_btc(),
             &action_id,
             "commit",
             REVEAL_B,
@@ -4443,6 +4533,511 @@ mod tests {
         );
         assert_eq!(unchanged.reveal_txid.as_deref(), Some(REVEAL_B));
         assert!(unchanged.activation_height.is_none());
+    }
+
+    /// A Bitcoin Core node as the reconcile sees it (#605): mined txids with their height and place
+    /// in the block, txids in the mempool, and the -5 answer for anything else — which, without
+    /// `-txindex`, is also its answer for a mined txid it cannot index.
+    #[derive(Default)]
+    struct NodeView {
+        mined: std::collections::HashMap<&'static str, (u64, usize)>,
+        mempool: Vec<&'static str>,
+        without_txindex: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl BitcoinRpcClient for NodeView {
+        async fn estimate_fee_rate_sats_per_vb(
+            &self,
+            _target_blocks: u16,
+        ) -> Result<u64, AppError> {
+            Ok(1)
+        }
+
+        async fn get_block_height_for_txid(&self, txid: &str) -> Result<u64, AppError> {
+            if self.without_txindex && !self.mempool.contains(&txid) {
+                return Err(AppError::BadRequest(
+                    "bitcoin rpc `getrawtransaction` failed (HTTP 500 Internal Server Error): No such \
+                     mempool transaction. Use -txindex or provide a block hash to enable blockchain \
+                     transaction queries. Use gettransaction for wallet transactions."
+                        .to_string(),
+                ));
+            }
+            if let Some((height, _)) = self.mined.get(txid) {
+                return Ok(*height);
+            }
+            if self.mempool.contains(&txid) {
+                return Err(AppError::BadRequest(format!(
+                    "getrawtransaction: tx {txid} has no blockhash — not yet confirmed"
+                )));
+            }
+            Err(AppError::BadRequest(
+                "bitcoin rpc `getrawtransaction` failed (HTTP 500 Internal Server Error): No such \
+                 mempool or blockchain transaction. Use gettransaction for wallet transactions."
+                    .to_string(),
+            ))
+        }
+
+        async fn get_tx_position_in_block(&self, txid: &str) -> Result<usize, AppError> {
+            self.mined
+                .get(txid)
+                .map(|(_, position)| *position)
+                .ok_or_else(|| AppError::BadRequest("not in a block".to_string()))
+        }
+
+        async fn get_chain_tip(&self) -> Result<u64, AppError> {
+            Ok(800_000)
+        }
+    }
+
+    /// Without `-txindex` the node cannot find a mined reveal. That is not "not mined": the
+    /// reconcile must not skip it and confirm another pair in its place.
+    #[tokio::test]
+    async fn a_node_without_txindex_is_not_read_as_unmined() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        let btc = NodeView {
+            without_txindex: true,
+            ..NodeView::default()
+        };
+
+        let unchanged =
+            confirm_reveal_if_mined(&repo, proposal, &btc, "mock://asm-membership").await;
+
+        assert_eq!(
+            unchanged.broadcast_status,
+            BroadcastStatus::CommitBroadcasted
+        );
+    }
+
+    /// Two reveals in one block: the ASM executed the one the block lists first, whichever pair
+    /// the row tracked.
+    #[tokio::test]
+    async fn of_two_reveals_in_one_block_the_first_listed_wins() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        let btc = NodeView {
+            mined: [(REVEAL_A, (800_010, 3)), (REVEAL_B, (800_010, 7))]
+                .into_iter()
+                .collect(),
+            ..NodeView::default()
+        };
+
+        let confirmed =
+            confirm_reveal_if_mined(&repo, proposal, &btc, "mock://asm-membership").await;
+
+        assert_eq!(confirmed.broadcast_status, BroadcastStatus::RevealConfirmed);
+        assert_eq!(
+            confirmed.reveal_txid.as_deref(),
+            Some(REVEAL_A),
+            "listed first, though the row tracked B"
+        );
+    }
+
+    /// A tie the node cannot order is left for the next read rather than guessed.
+    #[tokio::test]
+    async fn a_tie_the_node_cannot_order_leaves_the_row_in_flight() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        // `MinedTxids` gives heights only, like a client that cannot place a txid in its block.
+        let btc = MinedTxids(
+            [(REVEAL_A, 800_010), (REVEAL_B, 800_010)]
+                .into_iter()
+                .collect(),
+        );
+
+        let unchanged =
+            confirm_reveal_if_mined(&repo, proposal, &btc, "mock://asm-membership").await;
+
+        assert_eq!(
+            unchanged.broadcast_status,
+            BroadcastStatus::CommitBroadcasted
+        );
+    }
+
+    /// A malformed txid on the row itself (stored before reports were validated) is skipped too.
+    #[tokio::test]
+    async fn a_malformed_tracked_reveal_does_not_block_the_reconcile() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+        let mut proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        proposal.reveal_txid = Some("reveal".to_string());
+        let btc = RevealLookup {
+            heights: [(REVEAL_A, 800_010)].into_iter().collect(),
+            unreadable: "reveal",
+        };
+
+        let winner = first_mined_pair(&proposal, &btc).await;
+
+        assert_eq!(winner, Some((COMMIT_A.to_string(), REVEAL_A.to_string())));
+    }
+
+    /// A signer whose earlier registration never reached the network (the session died before
+    /// broadcasting) may register another pair; one whose pair is still in the mempool may not.
+    #[tokio::test]
+    async fn a_signer_whose_pair_is_nowhere_may_register_another() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+        let register_a = |btc: NodeView| {
+            let repo = &repo;
+            let action_id = &action_id;
+            async move {
+                register_additional_pair(
+                    repo,
+                    session_of(&sig_a()),
+                    "mock://asm-membership",
+                    &btc,
+                    action_id,
+                    COMMIT_C,
+                    REVEAL_C,
+                )
+                .await
+            }
+        };
+
+        let err = register_a(NodeView {
+            mempool: vec![COMMIT_A],
+            ..NodeView::default()
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Conflict(ref m) if m == OWN_PAIR_EXISTS),
+            "still in the mempool: {err:?}"
+        );
+
+        let err = register_a(NodeView {
+            without_txindex: true,
+            ..NodeView::default()
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Conflict(ref m) if m == OWN_PAIR_EXISTS),
+            "a node that cannot tell: {err:?}"
+        );
+
+        let registered = register_a(NodeView::default()).await.unwrap();
+        assert_eq!(registered.reveal_txid.as_deref(), Some(REVEAL_C));
+        assert_eq!(registered.broadcast_attempts.len(), 3);
+    }
+
+    // ── #605 against a real regtest bitcoind ───────────────────────────────
+    //
+    // `cargo test -p orchestrator-be -- --ignored regtest_` with `bitcoind` on PATH. Each test
+    // starts its own node in a temporary datadir. Wallet transactions stand in for the reveals:
+    // the reconcile only asks the node where a txid is.
+
+    struct Regtest {
+        child: std::process::Child,
+        datadir: std::path::PathBuf,
+        node: crate::infrastructure::bitcoin_rpc::HttpBitcoinRpcClient,
+        wallet: crate::infrastructure::bitcoin_rpc::HttpBitcoinRpcClient,
+        address: String,
+    }
+
+    impl Drop for Regtest {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.datadir);
+        }
+    }
+
+    impl Regtest {
+        async fn start(txindex: bool) -> Self {
+            use crate::infrastructure::bitcoin_rpc::HttpBitcoinRpcClient;
+            let free_port = || {
+                std::net::TcpListener::bind("127.0.0.1:0")
+                    .unwrap()
+                    .local_addr()
+                    .unwrap()
+                    .port()
+            };
+            let (rpc_port, p2p_port) = (free_port(), free_port());
+            let datadir = std::env::temp_dir().join(format!(
+                "orchestrator-605-{}",
+                Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            ));
+            std::fs::create_dir_all(&datadir).unwrap();
+            let child = std::process::Command::new("bitcoind")
+                .args([
+                    "-regtest".to_string(),
+                    format!("-datadir={}", datadir.display()),
+                    format!("-rpcport={rpc_port}"),
+                    format!("-port={p2p_port}"),
+                    "-rpcuser=u".to_string(),
+                    "-rpcpassword=p".to_string(),
+                    "-listen=0".to_string(),
+                    "-fallbackfee=0.0001".to_string(),
+                    // Each send spends its own confirmed coin, so any one of them can be mined
+                    // without the others.
+                    "-spendzeroconfchange=0".to_string(),
+                    format!("-txindex={}", u8::from(txindex)),
+                ])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("bitcoind on PATH");
+            let url = format!("http://127.0.0.1:{rpc_port}");
+            let node = HttpBitcoinRpcClient::new(&url, "u", "p");
+            for _ in 0..100 {
+                if node.rpc("getblockchaininfo", json!([])).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            node.rpc("createwallet", json!(["w"])).await.unwrap();
+            let wallet = HttpBitcoinRpcClient::new(&format!("{url}/wallet/w"), "u", "p");
+            let address = wallet.rpc("getnewaddress", json!([])).await.unwrap();
+            let address = address.as_str().unwrap().to_string();
+            node.rpc("generatetoaddress", json!([120, address]))
+                .await
+                .unwrap();
+            let regtest = Self {
+                child,
+                datadir,
+                node,
+                wallet,
+                address,
+            };
+            if txindex {
+                regtest.wait_for_txindex().await;
+            }
+            regtest
+        }
+
+        async fn wait_for_txindex(&self) {
+            for _ in 0..100 {
+                let info = self.node.rpc("getindexinfo", json!(["txindex"])).await;
+                if info
+                    .ok()
+                    .and_then(|info| info.pointer("/txindex/synced").and_then(|v| v.as_bool()))
+                    == Some(true)
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            panic!("txindex never synced");
+        }
+
+        /// A wallet transaction left in the mempool.
+        async fn send(&self) -> String {
+            let txid = self
+                .wallet
+                .rpc("sendtoaddress", json!([self.address, 0.1]))
+                .await
+                .unwrap();
+            txid.as_str().unwrap().to_string()
+        }
+
+        /// Mines one block holding exactly `txids`, in this order. Returns its height.
+        async fn mine(&self, txids: &[&str]) -> u64 {
+            self.node
+                .rpc("generateblock", json!([self.address, txids]))
+                .await
+                .unwrap();
+            if self
+                .node
+                .rpc("getindexinfo", json!(["txindex"]))
+                .await
+                .is_ok_and(|i| i.get("txindex").is_some())
+            {
+                self.wait_for_txindex().await;
+            }
+            self.node.get_chain_tip().await.unwrap()
+        }
+    }
+
+    /// Signer A's pair is stuck in the mempool; signer B sends their own and B's reveal is mined.
+    /// The row confirms on B's pair and the activation height comes from B's block.
+    #[tokio::test]
+    #[ignore = "needs bitcoind on PATH"]
+    async fn regtest_the_second_signers_pair_mined_first_confirms() {
+        let chain = Regtest::start(true).await;
+        let (commit_a, reveal_a) = (chain.send().await, chain.send().await);
+        let (commit_b, reveal_b) = (chain.send().await, chain.send().await);
+        let repo = new_repo();
+        let action_id = save_with_pair(&repo, 1, &commit_a, &reveal_a).await;
+        register_additional_pair(
+            &repo,
+            session_of(&sig_b()),
+            "mock://asm-membership",
+            &chain.node,
+            &action_id,
+            &commit_b,
+            &reveal_b,
+        )
+        .await
+        .unwrap();
+
+        let height = chain.mine(&[&commit_b, &reveal_b]).await;
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        let confirmed =
+            confirm_reveal_if_mined(&repo, proposal, &chain.node, "mock://asm-membership").await;
+
+        assert_eq!(confirmed.broadcast_status, BroadcastStatus::RevealConfirmed);
+        assert_eq!(confirmed.commit_txid.as_deref(), Some(commit_b.as_str()));
+        assert_eq!(confirmed.reveal_txid.as_deref(), Some(reveal_b.as_str()));
+        let stored = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        // B's block + the uniform mock lock period 2016
+        assert_eq!(stored.activation_height, Some(height + 2016));
+        let reveals: Vec<&str> = stored
+            .broadcast_attempts
+            .iter()
+            .map(|attempt| attempt.reveal_txid.as_str())
+            .collect();
+        assert_eq!(reveals, [reveal_a.as_str(), reveal_b.as_str()]);
+    }
+
+    /// Both reveals in one block: the one the block lists first is the one the ASM executed.
+    #[tokio::test]
+    #[ignore = "needs bitcoind on PATH"]
+    async fn regtest_two_reveals_in_one_block_follow_the_block_order() {
+        let chain = Regtest::start(true).await;
+        let (commit_a, reveal_a) = (chain.send().await, chain.send().await);
+        let (commit_b, reveal_b) = (chain.send().await, chain.send().await);
+        let repo = new_repo();
+        let action_id = save_with_pair(&repo, 1, &commit_a, &reveal_a).await;
+        register_additional_pair(
+            &repo,
+            session_of(&sig_b()),
+            "mock://asm-membership",
+            &chain.node,
+            &action_id,
+            &commit_b,
+            &reveal_b,
+        )
+        .await
+        .unwrap();
+
+        chain.mine(&[&reveal_a, &reveal_b]).await;
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        let confirmed =
+            confirm_reveal_if_mined(&repo, proposal, &chain.node, "mock://asm-membership").await;
+
+        assert_eq!(confirmed.broadcast_status, BroadcastStatus::RevealConfirmed);
+        assert_eq!(
+            confirmed.reveal_txid.as_deref(),
+            Some(reveal_a.as_str()),
+            "listed first in the block, though the row tracked B"
+        );
+    }
+
+    /// Without `-txindex` the node cannot find B's mined reveal once it left the mempool. The row
+    /// stays in flight instead of confirming A's unmined pair or skipping B's; a lone pair's
+    /// report is still taken.
+    #[tokio::test]
+    #[ignore = "needs bitcoind on PATH"]
+    async fn regtest_a_node_without_txindex_leaves_several_pairs_in_flight() {
+        let chain = Regtest::start(false).await;
+        let (commit_a, reveal_a) = (chain.send().await, chain.send().await);
+        let (commit_b, reveal_b) = (chain.send().await, chain.send().await);
+        let repo = new_repo();
+        let action_id = save_with_pair(&repo, 1, &commit_a, &reveal_a).await;
+        register_additional_pair(
+            &repo,
+            session_of(&sig_b()),
+            "mock://asm-membership",
+            &chain.node,
+            &action_id,
+            &commit_b,
+            &reveal_b,
+        )
+        .await
+        .unwrap();
+
+        chain.mine(&[&commit_b, &reveal_b]).await;
+        let proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        let unchanged =
+            confirm_reveal_if_mined(&repo, proposal, &chain.node, "mock://asm-membership").await;
+        assert_eq!(
+            unchanged.broadcast_status,
+            BroadcastStatus::CommitBroadcasted
+        );
+        assert!(!chain.node.txindex_enabled().await.unwrap());
+
+        // A lone pair on the same node: its desktop's report confirms it.
+        let (commit_c, reveal_c) = (chain.send().await, chain.send().await);
+        // Its own repository: one broadcast in flight per authority.
+        let lone_repo = new_repo();
+        let lone = save_with_pair(&lone_repo, 2, &commit_c, &reveal_c).await;
+        chain.mine(&[&commit_c, &reveal_c]).await;
+        let confirmed = report_broadcast_progress(
+            &lone_repo,
+            "mock://asm-membership",
+            session_of(&sig_a()),
+            &lone,
+            &chain.node,
+            report("reveal_confirmed", Some(&commit_c), Some(&reveal_c)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(confirmed.broadcast_status, BroadcastStatus::RevealConfirmed);
+    }
+
+    /// A registration whose session died before broadcasting leaves a commit the node finds
+    /// nowhere; that signer may register again. While it is in the mempool, they may not.
+    #[tokio::test]
+    #[ignore = "needs bitcoind on PATH"]
+    async fn regtest_a_pair_that_never_reached_the_network_can_be_replaced() {
+        let chain = Regtest::start(true).await;
+        assert!(chain.node.txindex_enabled().await.unwrap());
+        let (commit_a, reveal_a) = (chain.send().await, chain.send().await);
+        let repo = new_repo();
+        let action_id = save_with_pair(&repo, 1, &commit_a, &reveal_a).await;
+        // B registered this pair and died before broadcasting it.
+        let never_sent = ("ab".repeat(32), "cd".repeat(32));
+        register_additional_pair(
+            &repo,
+            session_of(&sig_b()),
+            "mock://asm-membership",
+            &chain.node,
+            &action_id,
+            &never_sent.0,
+            &never_sent.1,
+        )
+        .await
+        .unwrap();
+
+        let (commit_b, reveal_b) = (chain.send().await, chain.send().await);
+        let replaced = register_additional_pair(
+            &repo,
+            session_of(&sig_b()),
+            "mock://asm-membership",
+            &chain.node,
+            &action_id,
+            &commit_b,
+            &reveal_b,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replaced.reveal_txid.as_deref(), Some(reveal_b.as_str()));
+
+        // A's commit is in the mempool: A's pair is still on its way.
+        let err = register_additional_pair(
+            &repo,
+            session_of(&sig_a()),
+            "mock://asm-membership",
+            &chain.node,
+            &action_id,
+            &"ef".repeat(32),
+            &"fe".repeat(32),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Conflict(ref m) if m == OWN_PAIR_EXISTS),
+            "{err:?}"
+        );
     }
 
     /// Mines the txids it is given. One txid is a node failure rather than "not in a block".

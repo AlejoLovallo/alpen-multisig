@@ -19,6 +19,14 @@ pub(crate) trait BitcoinRpcClient: Send + Sync {
 
     /// Return the current chain tip height (`getblockcount`).
     async fn get_chain_tip(&self) -> Result<u64, AppError>;
+
+    /// Return where a mined `txid` sits in its block's transaction list (0 = coinbase). Used to
+    /// order two reveals mined in the same block (#605). Fails if it is not in a block.
+    async fn get_tx_position_in_block(&self, _txid: &str) -> Result<usize, AppError> {
+        Err(AppError::BadRequest(
+            "this bitcoin client cannot place a transaction in its block".to_string(),
+        ))
+    }
 }
 
 pub(crate) struct HttpBitcoinRpcClient {
@@ -36,6 +44,20 @@ impl HttpBitcoinRpcClient {
             pass: pass.to_string(),
             client: http_client::shared(),
         }
+    }
+
+    /// Whether the node keeps a transaction index (#605). Without one, `getrawtransaction` cannot
+    /// find a mined transaction, so the reconcile cannot tell which of several pairs was mined.
+    /// `Err` when the node could not be asked.
+    pub(crate) async fn txindex_enabled(&self) -> Result<bool, AppError> {
+        let info = self.call("getindexinfo", json!(["txindex"])).await?;
+        Ok(info.get("txindex").is_some())
+    }
+
+    /// Any RPC call, for tests that drive a real regtest node.
+    #[cfg(test)]
+    pub(crate) async fn rpc(&self, method: &str, params: Value) -> Result<Value, AppError> {
+        self.call(method, params).await
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, AppError> {
@@ -141,6 +163,30 @@ impl BitcoinRpcClient for HttpBitcoinRpcClient {
                 AppError::BadRequest(format!(
                     "getblockheader: missing `height` for blockhash {blockhash}"
                 ))
+            })
+    }
+
+    async fn get_tx_position_in_block(&self, txid: &str) -> Result<usize, AppError> {
+        let tx = self.call("getrawtransaction", json!([txid, true])).await?;
+        let blockhash = tx
+            .get("blockhash")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "getrawtransaction: tx {txid} has no blockhash — not yet confirmed"
+                ))
+            })?;
+        let block = self.call("getblock", json!([blockhash, 1])).await?;
+        block
+            .get("tx")
+            .and_then(|v| v.as_array())
+            .and_then(|txids| {
+                txids
+                    .iter()
+                    .position(|t| t.as_str().is_some_and(|t| t.eq_ignore_ascii_case(txid)))
+            })
+            .ok_or_else(|| {
+                AppError::BadRequest(format!("getblock: tx {txid} is not in block {blockhash}"))
             })
     }
 

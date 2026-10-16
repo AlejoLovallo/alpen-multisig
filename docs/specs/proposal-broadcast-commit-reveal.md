@@ -405,7 +405,11 @@ acts on; the others are refused on the sequence number and cost only their fees.
   pair per signer: whoever already sent one bumps its fee (CPFP on the reveal change), and the
   desktop holds one stored bundle per proposal. The same signer registering the same pair again
   succeeds without changing the row: it is the retry of a registration whose response was lost,
-  and the desktop retries it before broadcasting.
+  and the desktop retries it before broadcasting. A signer's earlier pair whose commit the node finds
+  nowhere — neither in the mempool nor in a block, as when the registering session died before
+  broadcasting, or the pair was dropped — no longer counts as theirs on its way, so they may register
+  another (`abandoned_pairs_of`). Only a node with `-txindex` can answer "nowhere"; without one the
+  signer is refused as before.
 - **The row tracks the latest pair.** Registering sets the row's `commit_txid` / `reveal_txid` to
   the new pair, `commit_broadcasted`, claim time now, error cleared — under a row lock. From there
   the new sender's desktop reports on the row as any claimer would; the per-authority gate is
@@ -425,9 +429,12 @@ acts on; the others are refused on the sequence number and cost only their fees.
   names its pair. A pre-registration is a success only when the response still tracks that reveal; a
   200 that tracks another pair aborts the send before anything is broadcast and reports nothing.
 - **Reconcile picks the pair mined first.** `confirm_reveal_if_mined` looks up the row's reveal and
-  every listed pair's; the lowest block height wins, the row's own pair on a tie (two reveals in one
-  block activate at the same height). A lookup the node cannot answer leaves the row alone — "not in a
-  block" is the only miss that is skipped. The winner's txids are written explicitly, and only while the
+  every listed pair's; the lowest block height wins, and two reveals in one block are ordered by their
+  place in it (`getblock`) — the first listed is the one the ASM executed. A tie the node cannot order
+  waits for the next read. A lookup the node cannot answer leaves the row alone — "not in a block" is
+  the only miss that is skipped, and Bitcoin Core's -5 counts as that only with `-txindex` ("No such
+  mempool or blockchain transaction"); without it ("Use -txindex …") or while the index syncs, a mined
+  reveal looks the same, so the answer is not taken. The winner's txids are written explicitly, and only while the
   row still tracks the reveal observed on that read (`confirm_tracked_reveal`); a pair registered in between
   waits for the next read. The activation height and the queue id come from the winner.
 - **With other pairs, only the reconcile confirms.** When another pair is listed, a `reveal_confirmed`
@@ -437,8 +444,13 @@ acts on; the others are refused on the sequence number and cost only their fees.
   `reveal_confirmed` is taken as before: the orchestrator's node may run without `-txindex`, and then
   cannot find a reveal once it left the mempool.
 - **Node requirement.** Choosing between several pairs needs `getrawtransaction` to find mined
-  transactions, so the orchestrator's Bitcoin node must run with `-txindex` for multi-pair proposals to
-  confirm. Without it every mined reveal reads as "not in a block".
+  transactions, so the orchestrator's Bitcoin node must run with `-txindex=1` for multi-pair proposals to
+  confirm; without it they stay `reveal_broadcasted`. The orchestrator checks `getindexinfo` at startup
+  and logs an error when the index is missing. Staging (`staging/entrypoint-bitcoin.sh`) and
+  `scripts/bitcoind-asm-runner.sh` set it; see the runbook for other deployments.
+- **Watchers stop on a confirmed row, not on a 200.** The desktop's settle loop and the send screen's
+  poll report `reveal_confirmed` and stop only once the row they get back says `reveal_confirmed`;
+  otherwise the bundle stays tracked and the next check reports again.
 - **Txids are validated.** Every txid in a `PATCH` or a registration must be 64 hex chars (`400`
   otherwise). A malformed pair backfilled from before this check is skipped by the reconcile instead of
   holding back the other pairs.
@@ -446,7 +458,9 @@ acts on; the others are refused on the sequence number and cost only their fees.
   `200`; the detail screen compares the reveal it imported with the one the row tracks and shows a notice
   when they differ.
 - **Desktop.** The detail screen offers *Send your own commit + reveal* under the in-flight stage
-  (`canSendAdditionalPair`) and lists every pair once there is more than one (*Current*, *Sent*,
+  (`canSendAdditionalPair`) — to a signer with no pair, or to one whose earlier pair this desktop no
+  longer keeps (`proposals_has_stored_bundle`), and never when the orchestrator sends no
+  `broadcastAttempts` (one that predates the endpoint) — and lists every pair once there is more than one (*Current*, *Sent*,
   *Mined*, *Not used*). The send screen opens with `?pair=additional`; while a pair is in flight it
   prepares a fresh send instead of resuming, and `proposals_broadcast` runs with
   `additional_pair: true` (`SendMode::AdditionalPair`): no claim, the pair is registered through the

@@ -53,4 +53,14 @@ for (const status of ['idle', 'failed', 'reveal_confirmed'] as const) {
 assert.equal(canSendAdditionalPair(row('reveal_broadcasted', [ALICE], 'superseded'), BOB), false)
 assert.equal(canSendAdditionalPair(row('reveal_broadcasted'), null), false, 'no signer, no offer')
 
+// ── This desktop's stored bundle decides for a signer who sent one before ──
+assert.equal(canSendAdditionalPair(row('reveal_broadcasted'), ALICE, false), true, 'her pair is no longer on its way')
+assert.equal(canSendAdditionalPair(row('reveal_broadcasted'), ALICE, true), false, 'her bundle is still tracked')
+assert.equal(canSendAdditionalPair(row('reveal_broadcasted'), BOB, true), false, 'a bundle of his own is on its way')
+assert.equal(canSendAdditionalPair(row('reveal_broadcasted'), ALICE, null), false, 'unknown: as if still tracked')
+
+// ── An orchestrator without the registration endpoint sends no list: nothing is offered ──
+assert.equal(canSendAdditionalPair({ ...row('reveal_broadcasted'), broadcastAttempts: null }, BOB), false)
+assert.equal(canSendAdditionalPair({ ...row('reveal_broadcasted'), broadcastAttempts: undefined }, BOB), false)
+
 console.log('additional-pair: all assertions passed')
