@@ -431,12 +431,17 @@ impl ProposalRepository for InMemoryProposalRepository {
             .write()
             .map_err(|_| AppError::Internal(anyhow::anyhow!("repo lock poisoned")))?;
 
-        let target_is_approved = proposals
+        let target_open = proposals
             .get(target_action_id)
-            .map(|p| p.status == ProposalStatus::Approved)
+            .map(|p| {
+                matches!(
+                    p.status,
+                    ProposalStatus::Approved | ProposalStatus::Superseded
+                )
+            })
             .unwrap_or(false);
 
-        if !target_is_approved {
+        if !target_open {
             return Ok(false);
         }
 

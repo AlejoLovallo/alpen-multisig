@@ -866,11 +866,12 @@ impl ProposalRepository for PostgresProposalRepository {
             })?;
 
         let result = sqlx::query(
-            "UPDATE proposals SET status = $1, updated_at = NOW() WHERE action_id = $2 AND status = $3",
+            "UPDATE proposals SET status = $1, updated_at = NOW() WHERE action_id = $2 AND status IN ($3, $4)",
         )
         .bind(status_to_db(ProposalStatus::Canceled))
         .bind(&target_action_id.0)
         .bind(status_to_db(ProposalStatus::Approved))
+        .bind(status_to_db(ProposalStatus::Superseded))
         .execute(&mut *tx)
         .await
         .map_err(|e| {

@@ -1493,8 +1493,9 @@ enum CancelOfTarget {
 
 /// A cancel that confirms takes its target out of the admin queue while the target's seqno is
 /// already consumed — the exact shape `supersede_if_seq_no_consumed` reads as "dead". Left alone,
-/// a cancelled Defcon 3 would land on `Superseded` instead of `Canceled`, and `enact_cancel` would
-/// then refuse (it requires an Approved target) and retire the cancel as `Expired`. The other
+/// a cancelled Defcon 3 would land on `Superseded` instead of `Canceled`. A cancel confirmed
+/// later repairs that row (`enact_cancel` accepts `superseded` too); judging it here is what
+/// keeps the target `approved` while the pair is already on the row. The other
 /// ordering loses too: the cancel writes `Canceled`, and this sweep's copy — read before that
 /// write — puts the target back. Only the cancel decides a cancelled target.
 ///
@@ -6863,6 +6864,49 @@ mod tests {
             &mock_btc(),
             Authority::StrataAdmin,
             &target_id,
+        )
+        .await
+        .unwrap();
+
+        let target = repo.find_by_action_id(&target_id).await.unwrap().unwrap();
+        assert_eq!(target.status, ProposalStatus::Canceled);
+        let cancel = repo.find_by_action_id(&cancel_id).await.unwrap().unwrap();
+        assert_eq!(cancel.status, ProposalStatus::Enacted);
+    }
+
+    /// The sweep retired the target before the cancel's reveal was on the row. Confirming that
+    /// reveal later repairs the target to `canceled` instead of expiring the cancel.
+    #[tokio::test]
+    async fn a_late_cancel_repairs_a_superseded_target() {
+        let repo = new_repo();
+        let (target_id, cancel_id) = target_with_cancel_in_flight(&repo).await;
+        repo.update_broadcast_status(
+            &target_id,
+            BroadcastStatus::RevealConfirmed,
+            Some(ProposalStatus::Superseded),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        repo.update_broadcast_status(
+            &cancel_id,
+            BroadcastStatus::RevealConfirmed,
+            None,
+            Some(COMMIT_C),
+            Some(REVEAL_C),
+            None,
+        )
+        .await
+        .unwrap();
+
+        reconcile_enacted_for_action(
+            &repo,
+            "mock://asm-enacted",
+            &mock_btc(),
+            Authority::StrataAdmin,
+            &cancel_id,
         )
         .await
         .unwrap();

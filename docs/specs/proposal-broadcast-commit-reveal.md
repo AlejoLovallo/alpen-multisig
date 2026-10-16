@@ -527,7 +527,10 @@ acts on; the others are refused on the sequence number and cost only their fees.
   since nothing revisits such a row to repair it — except a `superseded` row, which still lists a
   pair. An immediate action can be retired while the reveal that executed it is not listed yet; the
   import lists it, and if the ASM executed it the row returns to `approved` at `reveal_confirmed`
-  (`confirm_tracked_reveal`). A supersede applies only while the row is still `approved` at the
+  (`confirm_tracked_reveal`). A cancel confirmed that way repairs a target already marked
+  `superseded`: that is the row written when the cancel's pair was not listed yet and the queue was
+  already empty. `enact_cancel` applies to `approved` or `superseded`; a target already `enacted`
+  still expires the cancel. A supersede applies only while the row is still `approved` at the
   broadcast status that read observed (`supersede_if_unchanged`), so a confirmation that landed
   during the read is not overwritten. Decided in the write (`report_effect`).
 - **Watchers stop on a confirmed row, not on a 200.** The desktop's settle loop and the send screen's
