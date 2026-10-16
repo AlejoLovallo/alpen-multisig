@@ -59,6 +59,10 @@ pub(crate) trait ProposalRepository: Send + Sync {
     /// — a cancel wrote `canceled` during this read — is left as it is.
     async fn enact_if_approved(&self, action_id: &ActionId) -> Result<bool, AppError>;
 
+    /// Mark `approved` + `reveal_confirmed` as `expired`. A row a concurrent read already
+    /// enacted is left as it is.
+    async fn expire_if_approved(&self, action_id: &ActionId) -> Result<bool, AppError>;
+
     /// Mark `approved` as `superseded`, but only while `broadcast_status` is still `observed`.
     ///
     /// A confirmation that landed after this read started does not match, and is left in place.
@@ -135,24 +139,15 @@ pub(crate) trait ProposalRepository: Send + Sync {
         update_id: u32,
     ) -> Result<(), AppError>;
 
-    /// Atomically mark a cancel proposal as `Enacted` and its target as `Canceled`,
-    /// but only if the target is still `Approved` or `Superseded`.
+    /// Atomically mark a cancel proposal as `Enacted` and its target as `Canceled`, when the
+    /// target is `Approved`, `Superseded`, or `Enacted`.
     ///
-    /// `Superseded` is the row this sweep writes when a cancel's pair is not on it yet and the
-    /// queue is already empty. A later confirm of that cancel repairs it.
+    /// `Superseded` is the row this sweep writes when a cancel's pair is not on it yet.
+    /// `Enacted` is the shape a cancel leaves for an `EeStfVk` or a Defcon 3 whose harbor is
+    /// already on. The confirm that calls this has passed `asm_executed`.
     ///
-    /// Returns `Ok(true)` when the target was one of those and both transitions were applied.
-    /// Returns `Ok(false)` without mutating anything when the target was already `Enacted`,
-    /// `Canceled`, or gone — the cancel did not take the target, and the caller expires it.
-    ///
-    /// [`Self::enact_executed_cancel`] is the same write plus a target already marked `Enacted`.
-    /// Only the confirm path calls it, after the cancel's own reveal passed `asm_executed`.
+    /// Returns `Ok(false)` without writing when the target is already `Canceled` or gone.
     async fn enact_executed_cancel(
-        &self,
-        cancel_action_id: &ActionId,
-        target_action_id: &ActionId,
-    ) -> Result<bool, AppError>;
-    async fn enact_cancel(
         &self,
         cancel_action_id: &ActionId,
         target_action_id: &ActionId,

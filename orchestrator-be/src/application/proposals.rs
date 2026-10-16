@@ -1499,7 +1499,7 @@ enum CancelOfTarget {
 /// A cancel that confirms takes its target out of the admin queue while the target's seqno is
 /// already consumed — the exact shape `supersede_if_seq_no_consumed` reads as "dead". Left alone,
 /// a cancelled Defcon 3 would land on `Superseded` instead of `Canceled`. A cancel confirmed
-/// later repairs that row (`enact_cancel` accepts `superseded` too); judging it here is what
+/// later repairs that row (`enact_executed_cancel` accepts `superseded` too); judging it here is what
 /// keeps the target `approved` while the pair is already on the row. The other
 /// ordering loses too: the cancel writes `Canceled`, and this sweep's copy — read before that
 /// write — puts the target back. Only the cancel decides a cancelled target.
@@ -1561,10 +1561,19 @@ async fn cancel_of_target(
     }
 }
 
+/// What [`enact_confirmed_cancel`] was able to decide.
+#[derive(PartialEq, Eq)]
+enum CancelWrite {
+    /// The cancel was applied, or this read could not decide. The caller must not expire it.
+    Done,
+    /// The ASM says this cancel did not execute.
+    DidNotExecute,
+}
+
 /// Enact a cancel whose reveal is already confirmed, when the ASM says it executed.
 ///
 /// Called from the target's read: that read may be the only one that sees the cancel. A cancel the
-/// ASM does not show as executed is left for its own reconcile. `Ok(false)` from `enact_cancel`
+/// ASM does not show as executed is left for its own reconcile. `Ok(false)` from `enact_executed_cancel`
 /// means the target was no longer approved — expire the cancel only while it is still approved, so
 /// a second pass over a cancel this read just enacted does not mark it expired.
 async fn enact_confirmed_cancel(
@@ -1572,14 +1581,13 @@ async fn enact_confirmed_cancel(
     asm_rpc_url: &str,
     btc_client: &dyn BitcoinRpcClient,
     cancel: &Proposal,
-    repair_enacted_target: bool,
-) -> Result<(), AppError> {
+) -> Result<CancelWrite, AppError> {
     if !matches!(
         cancel.status,
         ProposalStatus::Approved | ProposalStatus::Enacted
     ) || cancel.broadcast_status != BroadcastStatus::RevealConfirmed
     {
-        return Ok(());
+        return Ok(CancelWrite::Done);
     }
     let bitcoin_tip = match bitcoin_tip_for_enactment(&cancel.action_hex, btc_client).await {
         Ok(tip) => tip,
@@ -1588,7 +1596,7 @@ async fn enact_confirmed_cancel(
                 action_id = %cancel.action_id.0,
                 "reconcile: bitcoin tip lookup failed for cancel: {e}"
             );
-            return Ok(());
+            return Ok(CancelWrite::Done);
         }
     };
     let enacted = match crate::infrastructure::asm_enactment::is_proposal_enacted_on_asm(
@@ -1607,26 +1615,24 @@ async fn enact_confirmed_cancel(
                 action_id = %cancel.action_id.0,
                 "reconcile: ASM enactment check failed for cancel: {e}"
             );
-            return Ok(());
+            return Ok(CancelWrite::Done);
         }
     };
     if !enacted {
-        return Ok(());
+        return Ok(CancelWrite::DidNotExecute);
     }
     let Some(target_action_id) = &cancel.target_action_id else {
-        return Ok(());
+        return Ok(CancelWrite::Done);
     };
-    let applied = if repair_enacted_target {
-        repo.enact_executed_cancel(&cancel.action_id, target_action_id)
-            .await?
-    } else {
-        repo.enact_cancel(&cancel.action_id, target_action_id)
-            .await?
-    };
+    // Includes a target already marked `enacted`. The confirm that got us here passed
+    // `asm_executed`; a later sweep must not expire this cancel just because that write missed.
+    let applied = repo
+        .enact_executed_cancel(&cancel.action_id, target_action_id)
+        .await?;
     if !applied {
         expire_cancel_if_still_approved(repo, &cancel.action_id).await?;
     }
-    Ok(())
+    Ok(CancelWrite::Done)
 }
 
 /// A cancel whose reveal just confirmed owns its target, including one this sweep already marked
@@ -1638,7 +1644,7 @@ async fn settle_confirmed_cancel(
     proposal: Proposal,
 ) -> Result<Proposal, AppError> {
     if proposal.is_cancel() && proposal.broadcast_status == BroadcastStatus::RevealConfirmed {
-        enact_confirmed_cancel(repo, asm_rpc_url, btc_client, &proposal, true).await?;
+        enact_confirmed_cancel(repo, asm_rpc_url, btc_client, &proposal).await?;
         if let Some(reloaded) = repo.find_by_action_id(&proposal.action_id).await? {
             return Ok(reloaded);
         }
@@ -1646,26 +1652,13 @@ async fn settle_confirmed_cancel(
     Ok(proposal)
 }
 
-/// The target enacted first, so the cancel is moot — unless a concurrent read already enacted it.
+/// The target enacted first, so the cancel is moot. The write matches only a row still
+/// `approved`: a concurrent read that already enacted this cancel is left in place.
 async fn expire_cancel_if_still_approved(
     repo: &dyn ProposalRepository,
     cancel_action_id: &ActionId,
 ) -> Result<(), AppError> {
-    let Some(cancel) = repo.find_by_action_id(cancel_action_id).await? else {
-        return Ok(());
-    };
-    if cancel.status != ProposalStatus::Approved {
-        return Ok(());
-    }
-    repo.update_broadcast_status(
-        cancel_action_id,
-        BroadcastStatus::RevealConfirmed,
-        Some(ProposalStatus::Expired),
-        None,
-        None,
-        None,
-    )
-    .await?;
+    repo.expire_if_approved(cancel_action_id).await?;
     Ok(())
 }
 
@@ -1699,7 +1692,7 @@ async fn cancel_blocks_target(
     }
     if cancel == CancelOfTarget::OnChain {
         if let Some(cancel_proposal) = repo.find_cancel_for_target(&proposal.action_id).await? {
-            enact_confirmed_cancel(repo, asm_rpc_url, btc_client, &cancel_proposal, false).await?;
+            enact_confirmed_cancel(repo, asm_rpc_url, btc_client, &cancel_proposal).await?;
         }
     }
     Ok(cancel != CancelOfTarget::None)
@@ -1723,12 +1716,7 @@ async fn reconcile_one(
     // First: did its reveal confirm while nobody was watching? Both the enactment check and the
     // sweep below read the broadcast status, so a missed confirmation would make an executed
     // proposal look dead.
-    let was_confirmed = proposal.broadcast_status == BroadcastStatus::RevealConfirmed;
     let checked = try_confirm_reveal(repo, proposal, btc_client, asm_rpc_url).await;
-    // This read's confirm is the one that passed `asm_executed`. A reveal confirmed earlier is
-    // only the weak enactment check from here on.
-    let just_confirmed =
-        !was_confirmed && checked.proposal.broadcast_status == BroadcastStatus::RevealConfirmed;
     // A reveal that could not be judged may be the one that took the sequence number: neither
     // decide enactment nor retire the proposal on this read (#605).
     if checked.inconclusive {
@@ -1789,13 +1777,12 @@ async fn reconcile_one(
     }
 
     if let Some(target_action_id) = &proposal.target_action_id {
-        let applied = if just_confirmed {
-            repo.enact_executed_cancel(&proposal.action_id, target_action_id)
-                .await?
-        } else {
-            repo.enact_cancel(&proposal.action_id, target_action_id)
-                .await?
-        };
+        // The reveal is already confirmed, so this cancel passed `asm_executed` on the read that
+        // confirmed it. An enacted target is the shape that confirm is allowed to correct; expiring
+        // the cancel here would drop the reveal.
+        let applied = repo
+            .enact_executed_cancel(&proposal.action_id, target_action_id)
+            .await?;
         if !applied {
             expire_cancel_if_still_approved(repo, &proposal.action_id).await?;
         }
@@ -1806,7 +1793,7 @@ async fn reconcile_one(
         return Ok(());
     }
     if repo.enact_if_approved(&proposal.action_id).await? {
-        cascade_enact_associated_cancel(repo, &proposal.action_id).await?;
+        cascade_enact_associated_cancel(repo, asm_rpc_url, btc_client, &proposal.action_id).await?;
     }
     Ok(())
 }
@@ -1911,11 +1898,16 @@ pub(crate) async fn reconcile_enacted_for_action(
     reconcile_one(repo, asm_rpc_url, btc_client, proposal, last_seqno).await
 }
 
-/// When a target proposal becomes `Enacted` via the normal flow, its associated cancel
-/// proposal (if any, and still pending/approved) is now moot — the ASM would reject its
-/// broadcast, so mark it `Expired` so it stops appearing as actionable.
+/// When a target proposal becomes `Enacted`, settle its cancel.
+///
+/// A cancel still in flight, or idle, is left: the reveal that executed may not be the pair on
+/// the row, and an expired row takes no import. A cancel already `reveal_confirmed` is applied
+/// (`enact_confirmed_cancel`) — that write may be the one the cancel's own read missed. It is
+/// expired only when the ASM says the cancel did not execute.
 async fn cascade_enact_associated_cancel(
     repo: &dyn ProposalRepository,
+    asm_rpc_url: &str,
+    btc_client: &dyn BitcoinRpcClient,
     target_action_id: &ActionId,
 ) -> Result<(), AppError> {
     let Some(cancel) = repo.find_cancel_for_target(target_action_id).await? else {
@@ -1928,20 +1920,20 @@ async fn cascade_enact_associated_cancel(
         return Ok(());
     }
     // Idle, or a pair still in flight. Expiring either is terminal: the reveal that executed may
-    // not be the pair on the row yet, and an expired row takes no import. A reveal already
-    // confirmed is the cancel that lost.
-    if !matches!(cancel.broadcast_status, BroadcastStatus::RevealConfirmed) {
+    // not be the pair on the row yet, and an expired row takes no import.
+    if cancel.broadcast_status != BroadcastStatus::RevealConfirmed {
         return Ok(());
     }
-    repo.update_broadcast_status(
-        &cancel.action_id,
-        cancel.broadcast_status,
-        Some(ProposalStatus::Expired),
-        None,
-        None,
-        None,
-    )
-    .await?;
+    // Confirmed, but the enact write may not have finished. Apply it now. Expire only when the
+    // ASM says this cancel did not execute; an error leaves the row for the next read.
+    if enact_confirmed_cancel(repo, asm_rpc_url, btc_client, &cancel).await?
+        != CancelWrite::DidNotExecute
+    {
+        return Ok(());
+    }
+    // Matches only a row still `approved`. The cancel's own read may have enacted it while this
+    // check was in flight; that write must not be overwritten.
+    expire_cancel_if_still_approved(repo, &cancel.action_id).await?;
     Ok(())
 }
 
@@ -2210,7 +2202,7 @@ pub(crate) async fn report_broadcast_progress(
     }
     if updated.is_cancel() && updated.status == ProposalStatus::Enacted {
         if let Some(target_action_id) = updated.target_action_id.clone() {
-            repo.enact_cancel(&updated.action_id, &target_action_id)
+            repo.enact_executed_cancel(&updated.action_id, &target_action_id)
                 .await?;
             if let Some(reloaded) = repo.find_by_action_id(action_id).await? {
                 return Ok(reloaded);
@@ -4244,7 +4236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_marks_cancel_expired_when_target_already_enacted() {
+    async fn a_confirmed_cancel_corrects_a_target_already_enacted() {
         let repo = new_repo();
         let target = save_approved_proposal(&repo, Authority::StrataAdmin, 1).await;
 
@@ -4318,9 +4310,9 @@ mod tests {
             .unwrap();
         assert_eq!(target.status, ProposalStatus::Enacted);
 
-        // The cancel reaches RevealConfirmed afterwards, but its target is no longer Approved —
-        // the ASM would have rejected the cancel tx, so it should be marked Expired without
-        // touching the already-enacted target.
+        // The cancel's reveal is confirmed on a later read. That confirm already passed
+        // `asm_executed`, so the target marked enacted above is corrected instead of the cancel
+        // being expired.
         repo.update_broadcast_status(
             &cancel.action_id,
             BroadcastStatus::RevealConfirmed,
@@ -4345,14 +4337,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(cancel.status, ProposalStatus::Expired);
+        assert_eq!(cancel.status, ProposalStatus::Enacted);
 
         let target = repo
             .find_by_action_id(&target.action_id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(target.status, ProposalStatus::Enacted);
+        assert_eq!(target.status, ProposalStatus::Canceled);
     }
 
     // ---------------------------------------------------------------------------
@@ -7246,6 +7238,147 @@ mod tests {
         let cancel = repo.find_by_action_id(&cancel_id).await.unwrap().unwrap();
         assert_eq!(cancel.status, ProposalStatus::Approved);
         assert_eq!(cancel.broadcast_status, BroadcastStatus::RevealBroadcasted);
+    }
+
+    /// The target was marked enacted before this cascade saw the cancel's reveal. The reveal is
+    /// already confirmed and the ASM shows the cancel executed, so cascade applies it.
+    #[tokio::test]
+    async fn enacting_the_target_applies_a_reveal_confirmed_cancel() {
+        let repo = new_repo();
+        let (target_id, cancel_id) = target_with_cancel_in_flight(&repo).await;
+        repo.update_broadcast_status(
+            &target_id,
+            BroadcastStatus::RevealConfirmed,
+            Some(ProposalStatus::Enacted),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        repo.update_broadcast_status(
+            &cancel_id,
+            BroadcastStatus::RevealConfirmed,
+            None,
+            Some(COMMIT_C),
+            Some(REVEAL_C),
+            None,
+        )
+        .await
+        .unwrap();
+
+        cascade_enact_associated_cancel(&repo, "mock://asm-enacted", &mock_btc(), &target_id)
+            .await
+            .unwrap();
+
+        let target = repo.find_by_action_id(&target_id).await.unwrap().unwrap();
+        assert_eq!(target.status, ProposalStatus::Canceled);
+        let cancel = repo.find_by_action_id(&cancel_id).await.unwrap().unwrap();
+        assert_eq!(cancel.status, ProposalStatus::Enacted);
+    }
+
+    /// The ASM says that confirmed cancel did not execute. Cascade expires it and leaves the
+    /// target enacted.
+    #[tokio::test]
+    async fn enacting_the_target_expires_a_cancel_the_asm_did_not_execute() {
+        let repo = new_repo();
+        let (target_id, cancel_id) = target_with_cancel_in_flight(&repo).await;
+        repo.update_broadcast_status(
+            &target_id,
+            BroadcastStatus::RevealConfirmed,
+            Some(ProposalStatus::Enacted),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        repo.update_broadcast_status(
+            &cancel_id,
+            BroadcastStatus::RevealConfirmed,
+            None,
+            Some(COMMIT_C),
+            Some(REVEAL_C),
+            None,
+        )
+        .await
+        .unwrap();
+
+        cascade_enact_associated_cancel(
+            &repo,
+            crate::infrastructure::asm_enactment::MOCK_SEQNO_AHEAD_URL,
+            &mock_btc(),
+            &target_id,
+        )
+        .await
+        .unwrap();
+
+        let target = repo.find_by_action_id(&target_id).await.unwrap().unwrap();
+        assert_eq!(target.status, ProposalStatus::Enacted);
+        let cancel = repo.find_by_action_id(&cancel_id).await.unwrap().unwrap();
+        assert_eq!(cancel.status, ProposalStatus::Expired);
+    }
+
+    /// The expire matches a row still `approved`. One a concurrent read already enacted stays enacted.
+    #[tokio::test]
+    async fn expire_if_approved_leaves_an_enacted_cancel() {
+        let repo = new_repo();
+        let (_, cancel_id) = target_with_cancel_in_flight(&repo).await;
+        repo.update_broadcast_status(
+            &cancel_id,
+            BroadcastStatus::RevealConfirmed,
+            Some(ProposalStatus::Enacted),
+            Some(COMMIT_C),
+            Some(REVEAL_C),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let applied = repo.expire_if_approved(&cancel_id).await.unwrap();
+
+        assert!(!applied);
+        let cancel = repo.find_by_action_id(&cancel_id).await.unwrap().unwrap();
+        assert_eq!(cancel.status, ProposalStatus::Enacted);
+        assert_eq!(cancel.broadcast_status, BroadcastStatus::RevealConfirmed);
+    }
+
+    /// The ASM check errors after the target is already enacted. Cascade leaves the confirmed
+    /// cancel in place so the next read can still apply it.
+    #[tokio::test]
+    async fn an_asm_error_does_not_expire_a_reveal_confirmed_cancel() {
+        let repo = new_repo();
+        let (target_id, cancel_id) = target_with_cancel_in_flight(&repo).await;
+        repo.update_broadcast_status(
+            &target_id,
+            BroadcastStatus::RevealConfirmed,
+            Some(ProposalStatus::Enacted),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        repo.update_broadcast_status(
+            &cancel_id,
+            BroadcastStatus::RevealConfirmed,
+            None,
+            Some(COMMIT_C),
+            Some(REVEAL_C),
+            None,
+        )
+        .await
+        .unwrap();
+
+        cascade_enact_associated_cancel(&repo, "mock://asm-unreadable", &mock_btc(), &target_id)
+            .await
+            .unwrap();
+
+        let target = repo.find_by_action_id(&target_id).await.unwrap().unwrap();
+        assert_eq!(target.status, ProposalStatus::Enacted);
+        let cancel = repo.find_by_action_id(&cancel_id).await.unwrap().unwrap();
+        assert_eq!(cancel.status, ProposalStatus::Approved);
+        assert_eq!(cancel.broadcast_status, BroadcastStatus::RevealConfirmed);
     }
 
     /// The sweep already retired the cancel. The reveal that executed is listed afterwards, and

@@ -531,13 +531,16 @@ acts on; the others are refused on the sequence number and cost only their fees.
   `superseded` or `enacted`: that `enacted` row is what an EeStfVk, or a Defcon 3 whose harbor is
   already on, looks like once a cancel has removed it and the cancel's pair was not listed yet.
   The confirm path applies that repair (`enact_executed_cancel`), and so does the sweep when
-  this read is the one that confirmed the reveal. A report cannot mark the target `enacted` while
+  this read is the one that confirmed the reveal, and so does every later read: an ASM error on
+  the enact write must not expire the cancel on the next sweep. Enacting the target, when the
+  cancel is already `reveal_confirmed`, applies that same repair; the cancel is expired only when
+  the ASM says it did not execute, and only while the row is still `approved` (`expire_if_approved`). A report cannot mark the target `enacted` while
   its cancel is idle or already on chain. Enacting the target does not expire a cancel that is
   still in flight: the reveal that executed may not be the pair on the row, and an expired row
   takes no import. A superseded cancel that still has a pair is judged before the target is
   enacted. A cancel reported `enacted`
   after it is already `reveal_confirmed` cancels a target still `approved` or `superseded`
-  (`enact_cancel`).   An idle cancel — no pair on the row — holds its target, including after the sweep would
+  (`enact_executed_cancel`). An idle cancel — no pair on the row — holds its target, including after the sweep would
   otherwise have marked the cancel `superseded`: a cancel is never in the queue, so a consumed
   sequence number is also what that cancel executing looks like. Enacting the
   target does not expire that idle cancel. A supersede applies only while the row is still

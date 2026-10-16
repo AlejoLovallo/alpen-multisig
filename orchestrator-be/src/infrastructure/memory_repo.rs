@@ -236,6 +236,24 @@ impl ProposalRepository for InMemoryProposalRepository {
         Ok(true)
     }
 
+    async fn expire_if_approved(&self, action_id: &ActionId) -> Result<bool, AppError> {
+        let mut proposals = self
+            .proposals
+            .write()
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("repo lock poisoned")))?;
+        let Some(proposal) = proposals.get_mut(action_id) else {
+            return Ok(false);
+        };
+        if proposal.status != ProposalStatus::Approved
+            || proposal.broadcast_status != BroadcastStatus::RevealConfirmed
+        {
+            return Ok(false);
+        }
+        proposal.status = ProposalStatus::Expired;
+        proposal.updated_at = Utc::now();
+        Ok(true)
+    }
+
     async fn supersede_if_unchanged(
         &self,
         action_id: &ActionId,
@@ -419,41 +437,6 @@ impl ProposalRepository for InMemoryProposalRepository {
             proposal.updated_at = Utc::now();
         }
         Ok(())
-    }
-
-    async fn enact_cancel(
-        &self,
-        cancel_action_id: &ActionId,
-        target_action_id: &ActionId,
-    ) -> Result<bool, AppError> {
-        let mut proposals = self
-            .proposals
-            .write()
-            .map_err(|_| AppError::Internal(anyhow::anyhow!("repo lock poisoned")))?;
-
-        let target_open = proposals
-            .get(target_action_id)
-            .map(|p| {
-                matches!(
-                    p.status,
-                    ProposalStatus::Approved | ProposalStatus::Superseded
-                )
-            })
-            .unwrap_or(false);
-
-        if !target_open {
-            return Ok(false);
-        }
-
-        if let Some(target) = proposals.get_mut(target_action_id) {
-            target.status = ProposalStatus::Canceled;
-            target.updated_at = Utc::now();
-        }
-        if let Some(proposal) = proposals.get_mut(cancel_action_id) {
-            proposal.status = ProposalStatus::Enacted;
-            proposal.updated_at = Utc::now();
-        }
-        Ok(true)
     }
 
     async fn enact_executed_cancel(
