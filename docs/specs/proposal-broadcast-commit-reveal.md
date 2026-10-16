@@ -430,11 +430,21 @@ acts on; the others are refused on the sequence number and cost only their fees.
   block" is the only miss that is skipped. The winner's txids are written explicitly, and only while the
   row still tracks the reveal observed on that read (`confirm_tracked_reveal`); a pair registered in between
   waits for the next read. The activation height and the queue id come from the winner.
-- **Only the reconcile confirms.** A `reveal_confirmed` `PATCH` on a row not yet confirmed records its
-  pair as `reveal_broadcasted` and then runs the same reconcile, so an earlier pair in a lower block
-  still wins. A node that does not see the reveal yet leaves the row at `reveal_broadcasted` until the
-  next read. Since every confirmation is decided by the lowest mined height, a confirmed row is never
-  re-opened.
+- **With other pairs, only the reconcile confirms.** When another pair is listed, a `reveal_confirmed`
+  `PATCH` on a row not yet confirmed records its pair as `reveal_broadcasted` and then runs the same
+  reconcile, so an earlier pair in a lower block still wins. A node that does not see the reveal yet
+  leaves the row at `reveal_broadcasted` until the next read. A lone pair has nothing to race, so its
+  `reveal_confirmed` is taken as before: the orchestrator's node may run without `-txindex`, and then
+  cannot find a reveal once it left the mempool.
+- **Node requirement.** Choosing between several pairs needs `getrawtransaction` to find mined
+  transactions, so the orchestrator's Bitcoin node must run with `-txindex` for multi-pair proposals to
+  confirm. Without it every mined reveal reads as "not in a block".
+- **Txids are validated.** Every txid in a `PATCH` or a registration must be 64 hex chars (`400`
+  otherwise). A malformed pair backfilled from before this check is skipped by the reconcile instead of
+  holding back the other pairs.
+- **The import says when it was ignored.** A `PATCH` about a pair the row does not track still answers
+  `200`; the detail screen compares the reveal it imported with the one the row tracks and shows a notice
+  when they differ.
 - **Desktop.** The detail screen offers *Send your own commit + reveal* under the in-flight stage
   (`canSendAdditionalPair`) and lists every pair once there is more than one (*Current*, *Sent*,
   *Mined*, *Not used*). The send screen opens with `?pair=additional`; while a pair is in flight it

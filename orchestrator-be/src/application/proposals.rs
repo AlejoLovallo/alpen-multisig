@@ -562,8 +562,12 @@ pub(crate) fn decide_additional_pair(
     Ok(AdditionalPair::Register)
 }
 
+fn is_txid(txid: &str) -> bool {
+    txid.len() == 64 && txid.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn require_txid(name: &str, txid: &str) -> Result<(), AppError> {
-    if txid.len() == 64 && txid.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if is_txid(txid) {
         return Ok(());
     }
     Err(AppError::BadRequest(format!(
@@ -678,6 +682,9 @@ async fn first_mined_pair(
                 .filter(|attempt| {
                     !tracked.is_some_and(|txid| txid.eq_ignore_ascii_case(&attempt.reveal_txid))
                 })
+                // A malformed txid backfilled from before reports were validated can never be
+                // mined, and its failing lookup would hold back every other pair.
+                .filter(|attempt| is_txid(&attempt.reveal_txid))
                 .map(|attempt| {
                     (
                         Some(attempt.commit_txid.as_str()),
@@ -1213,6 +1220,14 @@ pub(crate) async fn report_broadcast_progress(
         .await?
         .ok_or(AppError::NotFound)?;
     require_proposal_authority(&raw, session.authority)?;
+    // A malformed txid would be listed and then fail every node lookup, which holds back the
+    // reconcile of every pair of the proposal (#605).
+    if let Some(txid) = body.commit_txid.as_deref() {
+        require_txid("commit_txid", txid)?;
+    }
+    if let Some(txid) = body.reveal_txid.as_deref() {
+        require_txid("reveal_txid", txid)?;
+    }
 
     let commit_txid = body
         .commit_txid
@@ -1236,11 +1251,19 @@ pub(crate) async fn report_broadcast_progress(
     }
 
     let broadcast_status: BroadcastStatus = body.broadcast_status.parse()?;
-    // Which reveal confirmed is the node's call, not the report's (#605): an earlier pair may be
-    // mined in a lower block. The report records its pair as sent, and the reconcile promotes the
-    // pair mined first. A node that does not see it yet leaves the row for the next read.
+    // With other pairs listed, which reveal confirmed is the node's call, not the report's (#605):
+    // an earlier pair may be mined in a lower block. The report records its pair as sent, and the
+    // reconcile promotes the pair mined first. A node that does not see it yet leaves the row for
+    // the next read. A lone pair has nothing to race, so its report is taken as before: a node
+    // without `-txindex` cannot find a mined reveal, and would otherwise never confirm it.
+    let competing_pairs = raw.broadcast_attempts.iter().any(|attempt| {
+        !reveal_txid
+            .as_deref()
+            .is_some_and(|reported| attempt.reveal_txid.eq_ignore_ascii_case(reported))
+    });
     let confirming = broadcast_status == BroadcastStatus::RevealConfirmed
-        && raw.broadcast_status != BroadcastStatus::RevealConfirmed;
+        && raw.broadcast_status != BroadcastStatus::RevealConfirmed
+        && competing_pairs;
     let broadcast_status = if confirming {
         BroadcastStatus::RevealBroadcasted
     } else {
@@ -2865,8 +2888,8 @@ mod tests {
             &created.action_id,
             BroadcastStatus::RevealConfirmed,
             None,
-            Some("commit"),
-            Some("reveal"),
+            Some(COMMIT_A),
+            Some(REVEAL_A),
             None,
         )
         .await
@@ -2891,8 +2914,8 @@ mod tests {
             ReportBroadcastProgressRequest {
                 broadcast_status: "reveal_confirmed".to_string(),
                 proposal_status: None,
-                commit_txid: Some("commit".to_string()),
-                reveal_txid: Some("reveal".to_string()),
+                commit_txid: Some(COMMIT_A.to_string()),
+                reveal_txid: Some(REVEAL_A.to_string()),
                 broadcast_error: None,
             },
         )
@@ -2920,8 +2943,8 @@ mod tests {
             ReportBroadcastProgressRequest {
                 broadcast_status: "reveal_confirmed".to_string(),
                 proposal_status: Some("enacted".to_string()),
-                commit_txid: Some("commit".to_string()),
-                reveal_txid: Some("reveal".to_string()),
+                commit_txid: Some(COMMIT_A.to_string()),
+                reveal_txid: Some(REVEAL_A.to_string()),
                 broadcast_error: None,
             },
         )
@@ -4281,10 +4304,33 @@ mod tests {
         assert_eq!(stored.activation_height, Some(802_026));
     }
 
-    /// A `reveal_confirmed` the node cannot see yet records the pair as sent; the next read
-    /// confirms it.
+    /// Beside other pairs, a `reveal_confirmed` the node cannot see yet records the pair as sent;
+    /// the next read confirms it.
     #[tokio::test]
     async fn a_confirmed_report_the_node_does_not_see_waits_for_the_reconcile() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+
+        let after = report_broadcast_progress(
+            &repo,
+            "mock://asm-membership",
+            session_of(&sig_b()),
+            &action_id,
+            &MinedTxids(std::collections::HashMap::new()),
+            report("reveal_confirmed", Some(COMMIT_B), Some(REVEAL_B)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(after.broadcast_status, BroadcastStatus::RevealBroadcasted);
+        assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_B));
+    }
+
+    /// A lone pair has nothing to race: its `reveal_confirmed` is taken even when the node cannot
+    /// find the reveal, as on a node without `-txindex` once the reveal left the mempool.
+    #[tokio::test]
+    async fn a_lone_pairs_confirmed_report_is_taken_without_the_node() {
         let repo = new_repo();
         let action_id = save_with_pair_of_a(&repo).await;
 
@@ -4299,8 +4345,54 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(after.broadcast_status, BroadcastStatus::RevealBroadcasted);
+        assert_eq!(after.broadcast_status, BroadcastStatus::RevealConfirmed);
         assert_eq!(after.reveal_txid.as_deref(), Some(REVEAL_A));
+    }
+
+    /// A report must name real txids: a malformed one would be listed and fail every lookup.
+    #[tokio::test]
+    async fn a_report_with_a_malformed_txid_is_refused() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+
+        let err = report_broadcast_progress(
+            &repo,
+            "mock://asm-membership",
+            session_of(&sig_a()),
+            &action_id,
+            &mock_btc(),
+            report("reveal_broadcasted", Some(COMMIT_A), Some("reveal")),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::BadRequest(_)), "{err:?}");
+    }
+
+    /// A malformed pair backfilled from before reports were validated is skipped by the
+    /// reconcile instead of holding back the pair that was mined.
+    #[tokio::test]
+    async fn a_malformed_listed_pair_does_not_block_the_reconcile() {
+        let repo = new_repo();
+        let action_id = save_with_pair_of_a(&repo).await;
+        register_pair_of_b(&repo, &action_id).await.unwrap();
+        let mut proposal = repo.find_by_action_id(&action_id).await.unwrap().unwrap();
+        proposal.broadcast_attempts.push(BroadcastAttempt {
+            broadcaster_pubkey: None,
+            commit_txid: "commit".to_string(),
+            reveal_txid: "reveal".to_string(),
+            created_at: Utc::now(),
+        });
+        let btc = RevealLookup {
+            heights: [(REVEAL_B, 800_010)].into_iter().collect(),
+            unreadable: "reveal",
+        };
+
+        let confirmed =
+            confirm_reveal_if_mined(&repo, proposal, &btc, "mock://asm-membership").await;
+
+        assert_eq!(confirmed.broadcast_status, BroadcastStatus::RevealConfirmed);
+        assert_eq!(confirmed.reveal_txid.as_deref(), Some(REVEAL_B));
     }
 
     /// A report that does not name a reveal must not fail, or enact, the pair the row tracks.

@@ -131,15 +131,45 @@ where
     .await
     .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to load broadcast attempts: {e}")))?;
 
-    Ok(rows
-        .into_iter()
-        .map(|row| BroadcastAttempt {
-            broadcaster_pubkey: row.get("broadcaster_pubkey"),
-            commit_txid: row.get("commit_txid"),
-            reveal_txid: row.get("reveal_txid"),
-            created_at: row.get("created_at"),
-        })
-        .collect())
+    Ok(rows.iter().map(row_to_broadcast_attempt).collect())
+}
+
+/// Every pair of the listed proposals in one query, grouped by action id, each list oldest first.
+async fn load_broadcast_attempts_for(
+    pool: &PgPool,
+    action_ids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<BroadcastAttempt>>, AppError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT action_id, broadcaster_pubkey, commit_txid, reveal_txid, created_at
+        FROM broadcast_attempts
+        WHERE action_id = ANY($1)
+        ORDER BY created_at ASC, reveal_txid ASC
+        "#,
+    )
+    .bind(action_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to load broadcast attempts: {e}")))?;
+
+    let mut by_action: std::collections::HashMap<String, Vec<BroadcastAttempt>> =
+        std::collections::HashMap::new();
+    for row in &rows {
+        by_action
+            .entry(row.get("action_id"))
+            .or_default()
+            .push(row_to_broadcast_attempt(row));
+    }
+    Ok(by_action)
+}
+
+fn row_to_broadcast_attempt(row: &sqlx::postgres::PgRow) -> BroadcastAttempt {
+    BroadcastAttempt {
+        broadcaster_pubkey: row.get("broadcaster_pubkey"),
+        commit_txid: row.get("commit_txid"),
+        reveal_txid: row.get("reveal_txid"),
+        created_at: row.get("created_at"),
+    }
 }
 
 fn row_to_proposal_no_sigs(
@@ -355,6 +385,9 @@ impl ProposalRepository for PostgresProposalRepository {
         }
         .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to list proposals: {e}")))?;
 
+        let action_ids: Vec<String> = rows.iter().map(|row| row.get("action_id")).collect();
+        let mut attempts = load_broadcast_attempts_for(&self.pool, &action_ids).await?;
+
         let mut proposals = Vec::with_capacity(rows.len());
         for row in rows {
             let action_id_str: String = row.get("action_id");
@@ -362,7 +395,7 @@ impl ProposalRepository for PostgresProposalRepository {
             let mut proposal = row_to_proposal_no_sigs(&row, action_id_str)?;
             proposal.signatures = signatures;
             proposal.broadcast_attempts =
-                load_broadcast_attempts(&self.pool, &proposal.action_id.0).await?;
+                attempts.remove(&proposal.action_id.0).unwrap_or_default();
             proposals.push(proposal);
         }
 
