@@ -26,6 +26,7 @@ pub(crate) trait BitcoinRpcClient: Send + Sync {
         Ok(MinedReveal {
             height: self.get_block_height_for_txid(txid).await?,
             tx: None,
+            block: None,
         })
     }
 
@@ -54,6 +55,16 @@ pub(crate) struct MinedReveal {
     pub height: u64,
     /// The decoded transaction. `None` only from a client that does not read transactions.
     pub tx: Option<bitcoin::Transaction>,
+    /// The hashes of its block and of that block's parent, which name the ASM states before and
+    /// after the block. `None` only from a client that does not read them.
+    pub block: Option<MinedBlock>,
+}
+
+/// Where a mined transaction sits: its block and the block before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MinedBlock {
+    pub hash: String,
+    pub parent_hash: String,
 }
 
 /// The node's transaction index, as `getindexinfo` reports it (#605).
@@ -227,7 +238,36 @@ impl BitcoinRpcClient for HttpBitcoinRpcClient {
     }
 
     async fn get_mined_reveal(&self, txid: &str) -> Result<MinedReveal, AppError> {
-        let (result, height) = self.locate(txid).await?;
+        let result = self.call("getrawtransaction", json!([txid, true])).await?;
+        let blockhash = result
+            .get("blockhash")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "getrawtransaction: tx {txid} has no blockhash — not yet confirmed"
+                ))
+            })?
+            .to_string();
+        let header = self
+            .call("getblockheader", json!([blockhash, true]))
+            .await?;
+        let height = header
+            .get("height")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "getblockheader: missing `height` for blockhash {blockhash}"
+                ))
+            })?;
+        let parent_hash = header
+            .get("previousblockhash")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "getblockheader: missing `previousblockhash` for blockhash {blockhash}"
+                ))
+            })?
+            .to_string();
         let tx = result
             .get("hex")
             .and_then(Value::as_str)
@@ -240,6 +280,10 @@ impl BitcoinRpcClient for HttpBitcoinRpcClient {
         Ok(MinedReveal {
             height,
             tx: Some(tx),
+            block: Some(MinedBlock {
+                hash: blockhash,
+                parent_hash,
+            }),
         })
     }
 

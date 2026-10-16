@@ -67,38 +67,77 @@ pub(crate) async fn threshold_for_authority(
     Ok(u16::from(authority_config.config().threshold()))
 }
 
-/// The role's live signer configuration — its keys in index order and its threshold — exactly as
-/// the ASM verifies a payload's signatures against it (#605).
-pub(crate) async fn threshold_config_for_authority(
-    rpc_url: &str,
-    authority: Authority,
-) -> Result<strata_crypto::threshold_signature::ThresholdConfig, AppError> {
-    if let Some(config) = mock_threshold_config(rpc_url, authority) {
-        return Ok(config);
-    }
-
-    let admin = asm_rpc::fetch_admin_state(rpc_url)
-        .await
-        .map_err(AppError::BadRequest)?;
-    let role = authority_to_role(authority).map_err(AppError::BadRequest)?;
-    let authority_config = admin
-        .authority(role)
-        .ok_or_else(|| asm_rpc::missing_authority(role))?;
-    Ok(authority_config.config().clone())
+/// What the ASM's administration state says about the role that signs `action`, as of one block
+/// (#605): what [`crate::application::proposals`] needs to tell whether the ASM executed a reveal.
+#[derive(Debug, Clone)]
+pub(crate) struct RoleAtBlock {
+    pub last_seqno: u64,
+    pub max_seqno_gap: std::num::NonZero<u8>,
+    /// The role's signer configuration: keys in index order, and threshold.
+    pub config: strata_crypto::threshold_signature::ThresholdConfig,
+    /// The confirmation depth of the action's update type; `None` when it applies immediately, or
+    /// for a cancel.
+    pub queue_depth: Option<u16>,
+    /// The ASM's queued updates: id, action, activation height.
+    pub queued: Vec<(u32, strata_asm_txs_admin::actions::UpdateAction, u64)>,
 }
 
-/// Whether the ASM has accepted an action of this role at `seq_no` or later (#605): its
-/// `last_seqno` only moves when it accepts one, after the same checks a reveal is confirmed on —
-/// so a reveal mined but rejected (a sequence number beyond the allowed gap, say) does not count.
-pub(crate) async fn seqno_consumed_by_asm(
-    rpc_url: &str,
-    authority: Authority,
-    seq_no: u64,
-) -> Result<bool, AppError> {
-    if let Some(consumed) = mock_seqno_consumed(rpc_url) {
-        return Ok(consumed);
+impl RoleAtBlock {
+    fn of(admin: &AdministrationSubprotoState, action: &MultisigAction) -> Option<Self> {
+        let role = admin.resolve_action_role(action);
+        let authority = admin.authority(role)?;
+        let queue_depth = match action {
+            MultisigAction::Update(update) => admin.confirmation_depth(update.update_tx_type()),
+            MultisigAction::Cancel(_) => None,
+        };
+        Some(Self {
+            last_seqno: authority.last_seqno(),
+            max_seqno_gap: admin.max_seqno_gap(),
+            config: authority.config().clone(),
+            queue_depth,
+            queued: admin
+                .queued()
+                .iter()
+                .map(|queued| {
+                    (
+                        *queued.id(),
+                        queued.action().clone(),
+                        u64::from(queued.activation_height()),
+                    )
+                })
+                .collect(),
+        })
     }
-    Ok(last_seqno_for_authority(rpc_url, authority).await? >= seq_no)
+}
+
+/// The role that signs `action`, before and after the ASM processed the block `block_hash`
+/// (#605): as of `parent_hash`, and as of `block_hash`. The role is the one the ASM resolves from
+/// the action itself. `None` when the ASM has not processed one of the two blocks yet.
+pub(crate) async fn role_around_block(
+    rpc_url: &str,
+    action: &MultisigAction,
+    seq_no: u64,
+    block_height: u64,
+    block_hash: &str,
+    parent_hash: &str,
+) -> Result<Option<(RoleAtBlock, RoleAtBlock)>, AppError> {
+    if let Some(views) = mock_role_around_block(rpc_url, action, seq_no, block_height) {
+        return Ok(views);
+    }
+    let before = asm_rpc::fetch_admin_state_at(rpc_url, parent_hash)
+        .await
+        .map_err(AppError::BadRequest)?;
+    let after = asm_rpc::fetch_admin_state_at(rpc_url, block_hash)
+        .await
+        .map_err(AppError::BadRequest)?;
+    let (Some(before), Some(after)) = (before, after) else {
+        return Ok(None);
+    };
+    let role = |admin: &AdministrationSubprotoState| {
+        RoleAtBlock::of(admin, action)
+            .ok_or_else(|| asm_rpc::missing_authority(admin.resolve_action_role(action)))
+    };
+    Ok(Some((role(&before)?, role(&after)?)))
 }
 
 /// Return the confirmation depth (in blocks) before the update in `action_hex` activates.
@@ -411,7 +450,6 @@ fn mock_threshold(rpc_url: &str, authority: Authority) -> Option<u16> {
     // The seqno fixtures answer the same threshold as the membership one: they exist to move
     // `last_seqno`, not to drift the snapshot.
     let known = rpc_url == MOCK_MEMBERSHIP_URL
-        || rpc_url == MOCK_ASM_NOT_ACCEPTED_URL
         || rpc_url == crate::infrastructure::asm_enactment::MOCK_SEQNO_AHEAD_URL
         || rpc_url == crate::infrastructure::asm_enactment::MOCK_ENACTED_AHEAD_URL;
     if !known {
@@ -432,33 +470,65 @@ fn mock_threshold(_rpc_url: &str, _authority: Authority) -> Option<u16> {
     None
 }
 
-/// An ASM that has not accepted the fixture's action: its role sits where the membership fixture
-/// does, but a mined reveal is not yet (or never) taken.
+/// An ASM whose state did not change in the reveal's block: it did not execute the reveal.
 #[cfg(any(test, feature = "dev-mocks"))]
 pub(crate) const MOCK_ASM_NOT_ACCEPTED_URL: &str = "mock://asm-not-accepted";
 
-/// The membership fixture stands for an ASM that already processed every block the tests mine;
-/// [`MOCK_ASM_NOT_ACCEPTED_URL`] for one that rejected (or has not reached) the reveal.
+/// The membership fixture's role around a reveal's block. Before it: `last_seqno` 0, a gap of 10,
+/// the fixture signers, the uniform depth of 2016. After it, under [`MOCK_MEMBERSHIP_URL`], what
+/// the ASM leaves once it accepted an action at `seq_no` — taken, and queued when it waits — and,
+/// under [`MOCK_ASM_NOT_ACCEPTED_URL`], the same as before. Whether the reveal *could* have been
+/// accepted (window, signatures) is still decided against the state before.
 #[cfg(any(test, feature = "dev-mocks"))]
-fn mock_seqno_consumed(rpc_url: &str) -> Option<bool> {
-    if rpc_url == MOCK_MEMBERSHIP_URL {
-        return Some(true);
+fn mock_role_around_block(
+    rpc_url: &str,
+    action: &MultisigAction,
+    seq_no: u64,
+    block_height: u64,
+) -> Option<Option<(RoleAtBlock, RoleAtBlock)>> {
+    let accepted = match rpc_url {
+        MOCK_MEMBERSHIP_URL => true,
+        MOCK_ASM_NOT_ACCEPTED_URL => false,
+        _ => return None,
+    };
+    let config = mock_threshold_config(MOCK_MEMBERSHIP_URL, Authority::StrataAdmin)?;
+    let queue_depth = match action {
+        MultisigAction::Update(_) => Some(2016),
+        MultisigAction::Cancel(_) => None,
+    };
+    let before = RoleAtBlock {
+        last_seqno: 0,
+        max_seqno_gap: std::num::NonZero::new(10)?,
+        config,
+        queue_depth,
+        queued: Vec::new(),
+    };
+    let mut after = before.clone();
+    if accepted {
+        after.last_seqno = seq_no;
+        if let (MultisigAction::Update(update), Some(depth)) = (action, queue_depth) {
+            after
+                .queued
+                .push((0, update.clone(), block_height + u64::from(depth)));
+        }
     }
-    if rpc_url == MOCK_ASM_NOT_ACCEPTED_URL {
-        return Some(false);
-    }
-    None
+    Some(Some((before, after)))
 }
 
 #[cfg(not(any(test, feature = "dev-mocks")))]
-fn mock_seqno_consumed(_rpc_url: &str) -> Option<bool> {
+fn mock_role_around_block(
+    _rpc_url: &str,
+    _action: &MultisigAction,
+    _seq_no: u64,
+    _block_height: u64,
+) -> Option<Option<(RoleAtBlock, RoleAtBlock)>> {
     None
 }
 
 /// The membership fixture's signers — 1·G at index 0 and 2·G at index 1 — at the fixture threshold
 /// of 2, for every URL `mock_threshold` answers.
 #[cfg(any(test, feature = "dev-mocks"))]
-fn mock_threshold_config(
+pub(crate) fn mock_threshold_config(
     rpc_url: &str,
     authority: Authority,
 ) -> Option<strata_crypto::threshold_signature::ThresholdConfig> {
@@ -480,14 +550,6 @@ fn mock_threshold_config(
         std::num::NonZero::new(u8::try_from(threshold).ok()?)?,
     )
     .ok()
-}
-
-#[cfg(not(any(test, feature = "dev-mocks")))]
-fn mock_threshold_config(
-    _rpc_url: &str,
-    _authority: Authority,
-) -> Option<strata_crypto::threshold_signature::ThresholdConfig> {
-    None
 }
 
 /// Every depth set to `depth`. Upstream's `get` still overrides the variants it hardcodes, which is

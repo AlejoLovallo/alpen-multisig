@@ -122,20 +122,6 @@ pub(crate) trait ProposalRepository: Send + Sync {
         update_id: u32,
     ) -> Result<(), AppError>;
 
-    /// Keep the role's signer configuration (SSZ `ThresholdConfig`) as it stood when a pair of
-    /// this proposal was sent (#605), replacing an earlier one.
-    async fn record_broadcast_role_config(
-        &self,
-        action_id: &ActionId,
-        config_ssz: &[u8],
-    ) -> Result<(), AppError>;
-
-    /// The configuration [`Self::record_broadcast_role_config`] kept, if any.
-    async fn broadcast_role_config(
-        &self,
-        action_id: &ActionId,
-    ) -> Result<Option<Vec<u8>>, AppError>;
-
     /// Atomically mark a cancel proposal as `Enacted` and its target as `Canceled`,
     /// but only if the target is still `Approved`.
     ///

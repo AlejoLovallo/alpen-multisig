@@ -18,7 +18,6 @@ use std::sync::RwLock;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct InMemoryProposalRepository {
     proposals: RwLock<HashMap<ActionId, Proposal>>,
-    role_configs: RwLock<HashMap<ActionId, Vec<u8>>>,
 }
 
 impl InMemoryProposalRepository {
@@ -26,7 +25,6 @@ impl InMemoryProposalRepository {
     pub(crate) fn new() -> Self {
         Self {
             proposals: RwLock::new(HashMap::new()),
-            role_configs: RwLock::new(HashMap::new()),
         }
     }
 
@@ -93,30 +91,6 @@ fn apply_broadcast_status(
 
 #[async_trait::async_trait]
 impl ProposalRepository for InMemoryProposalRepository {
-    async fn record_broadcast_role_config(
-        &self,
-        action_id: &ActionId,
-        config_ssz: &[u8],
-    ) -> Result<(), AppError> {
-        self.role_configs
-            .write()
-            .map_err(|_| AppError::Internal(anyhow::anyhow!("repo lock poisoned")))?
-            .insert(action_id.clone(), config_ssz.to_vec());
-        Ok(())
-    }
-
-    async fn broadcast_role_config(
-        &self,
-        action_id: &ActionId,
-    ) -> Result<Option<Vec<u8>>, AppError> {
-        Ok(self
-            .role_configs
-            .read()
-            .map_err(|_| AppError::Internal(anyhow::anyhow!("repo lock poisoned")))?
-            .get(action_id)
-            .cloned())
-    }
-
     async fn save_proposal(&self, proposal: Proposal) -> Result<(), AppError> {
         let mut proposals = self
             .proposals

@@ -144,7 +144,7 @@ Request body:
 `POST /proposals/:action_id/broadcast/attempts` with `{ "commit_txid": "hex", "reveal_txid": "hex" }` (64-char txids).
 
 - Same checks as the claim: session authority, `approved`, threshold snapshot, sequence number still open.
-- `409` when there is no pair in flight to send beside, or when the caller already sent a pair for this proposal.
+- `409` when there is no pair in flight to send beside, when the caller already sent a pair for this proposal, or when the pair is already listed under another signer.
 - The caller registering the same pair again returns `200` and leaves the row as it is, so a registration whose response was lost can be retried.
 - `409` when the caller already listed `MAX_PAIRS_PER_SIGNER` pairs. The same limit applies to a pair listed by a progress report (a claimer's pre-registration).
 
@@ -442,27 +442,33 @@ acts on; the others are refused on the sequence number and cost only their fees.
   reports only to a row that carries its own reveal txid (`BundleRow::Ours`), and a `failed` report now
   names its pair. A pre-registration is a success only when the response still tracks that reveal; a
   200 that tracks another pair aborts the send before anything is broadcast and reports nothing.
-- **Only a reveal that carries the proposal counts.** Registration takes any well-formed txids, so
-  the reconcile checks every mined reveal it considers: its first input must spend the pair's commit,
-  and its envelope must decode — the way the ASM reads it (`parse_tx`: taproot leaf script,
-  `parse_envelope_payload`, SSZ `SignedPayload`) — to this proposal's sequence number and action,
-  and its signatures must pass the ASM's own `verify_threshold_signatures` against the role's live
-  signer configuration from the ASM (`threshold_config_for_authority`: keys in index order and
-  threshold), or against the configuration kept when the proposal's latest pair was sent (claim or
-  registration, `broadcast_role_config`) — a rotation of this very role changes the live one in its
-  reveal's own block. An approval at an index that is not that approver's, too few signatures, or a key
-  outside the role is what the ASM rejects, and so does the reconcile (`reveal_carries_proposal`). A
-  role configuration the ASM cannot return leaves the row for the next read. Its first output must also
-  carry the SPS-50 tag of the administration subprotocol under the network's magic bytes
-  (`BITCOIN_MAGIC_BYTES_HEX`, the same value as the ASM's and the desktop's): the ASM never routes a
-  transaction without it to the subprotocol. A mined transaction that
-  does not pass is ignored, however low its block,
-  and the row stays in flight. A pair first reported after it was mined (the manual fallback,
-  imported later) still counts: what it carries decides, not when it was registered.
+- **Only a reveal the ASM executed counts.** Registration takes any well-formed txids, so the
+  reconcile checks every mined reveal it considers in two steps.
+  - *It is this proposal's* (`proposal_payload`): its first output carries the SPS-50 tag of the
+    administration subprotocol under the network's magic bytes (`BITCOIN_MAGIC_BYTES_HEX`, the same
+    value as the ASM's and the desktop's — the ASM's tx filter drops a transaction without it), its
+    first input spends the pair's commit, and its envelope decodes the way the ASM reads it
+    (`parse_tx`: taproot leaf script, `parse_envelope_payload`, SSZ `SignedPayload`) to this
+    proposal's sequence number and action.
+  - *The ASM executed it* (`asm_executed`), judged from the ASM's own state of the role that signs
+    the action (`strata_asm_getAsmState`, `role_around_block`) just before the reveal's block and
+    just after it. Before: the ASM's `verify_action_signature` passes — the sequence number above
+    the role's `last_seqno` and within `max_seqno_gap` of it, the signatures valid against the
+    role's configuration of that moment (keys in index order, threshold), which is the one the ASM
+    checked even when the action rotates that very role. After: `last_seqno` reached it, and the
+    action left its trace — an update with a confirmation depth queued to activate at the block's
+    height plus that depth; a cancel's target, queued before, gone.
+
+  A reveal the ASM rejected — an approval at an index that is not that approver's, too few
+  signatures, a sequence number out of the window or already taken — passes neither, is ignored
+  however low its block, and the row stays in flight, where any signer can send again. An ASM that
+  has not processed the reveal's block yet, or cannot answer, leaves the row for the next read. A
+  pair first reported after it was mined (the manual fallback, imported later) still counts: what
+  the ASM did decides, not when it was registered.
 - **A failed pair falls back only to a live one.** A `failed` report for the pair the row tracks,
-  when another pair is listed, sets the row back to the newest other pair whose commit the node still
-  has — in its mempool or in a block — at `commit_broadcasted`, and clears the error. A pair whose
-  commit is nowhere, or that the node could not place, is not a fallback: the row becomes `failed`,
+  when another pair is listed, sets the row back to the newest other pair that may still be on its
+  way, at `commit_broadcasted`, and clears the error. Only a pair whose commit the node answers is
+  nowhere is dead; a node that cannot answer does not make one dead. With none left the row becomes `failed`,
   and a fresh claim may send again. A `failed` report never lists its pair: a pair that reached the
   orchestrator is listed already, and one whose pre-registration never landed was never broadcast.
 - **Reconcile picks the pair mined first.** `confirm_reveal_if_mined` looks up the row's reveal and
@@ -474,11 +480,6 @@ acts on; the others are refused on the sequence number and cost only their fees.
   reveal looks the same, so the answer is not taken. The winner's txids are written explicitly, and only while the
   row still tracks the reveal observed on that read (`confirm_tracked_reveal`); a pair registered in between
   waits for the next read. The activation height and the queue id come from the winner.
-- **The ASM must have taken the sequence number.** A winner is confirmed only once the ASM's
-  `last_seqno` for the role has reached the proposal's (`seqno_consumed_by_asm`). The ASM moves it only
-  when it accepts an action, after the same checks plus the sequence-number window (`max_seqno_gap`):
-  a reveal it rejected — a sequence number too far ahead, say — or a block it has not processed yet is
-  not a confirmation, and the row stays in flight, where any signer can send again.
 - **Only the reconcile confirms.** A `reveal_confirmed` `PATCH` on a row not yet confirmed — a lone
   pair's too — records its pair as `reveal_broadcasted` and then runs the same reconcile: an earlier
   pair in a lower block still wins, and a reveal the ASM would reject is never confirmed on its
@@ -535,12 +536,11 @@ acts on; the others are refused on the sequence number and cost only their fees.
   changing.
 - **Accepted limits.** A pair backfilled with no broadcaster does not lock its sender out. A retry
   after `failed` leaves the earlier attempt listed; the node decides among them like any other pairs.
-  The kept configuration is the one of the latest send: if the role rotates through another proposal
-  between that send and the winner being mined, and the live configuration has moved on again before
-  the reconcile, a valid winner can fail both checks; the row then stays in flight until its sequence
-  number is consumed, and the sweep retires it as `superseded`. A pair whose reveal was mined after
-  another action of the same role took the sequence number passes both checks and is confirmed; the
-  enactment check then finds nothing and the sweep retires it the same way. The pre-check and the
+  The ASM's state just after the reveal's block cannot show which transaction of the block moved
+  `last_seqno`: if another action of the same role, earlier in the same block, took this sequence
+  number (or a higher one) and this proposal's action is immediate, the reveal is taken as
+  executed. The ASM runner must answer `strata_asm_getAsmState` for the blocks a reconcile reads,
+  which needs Bitcoin Core 29 or later (staging runs 29.0). The pre-check and the
   registration are two calls: the row can move between them, and the registration then refuses after
   the device signed. The per-signer limit counts every pair listed, including a pre-registered pair
   whose broadcast the node refused: a signer whose sends failed three times cannot send this proposal
