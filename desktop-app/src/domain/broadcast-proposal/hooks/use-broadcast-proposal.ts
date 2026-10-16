@@ -17,8 +17,8 @@ import type { WalletAdapter } from '@/wallet/types'
 import { deviceCopy } from '@/lib/device-copy'
 import { failedBroadcastDetail, hasPairInFlight } from '@/lib/proposal-send-state'
 
-import type { BroadcastError, BroadcastPhase } from '../model/broadcast-proposal'
-import { deriveBroadcastError, phaseForBroadcastStatus } from '../model/broadcast-proposal'
+import type { BroadcastError, BroadcastPhase, SentPair } from '../model/broadcast-proposal'
+import { deriveBroadcastError, phaseForBroadcastStatus, rowTracksPair } from '../model/broadcast-proposal'
 
 export type SignerKind = 'hardware' | 'mnemonic'
 
@@ -125,47 +125,57 @@ export function useBroadcastProposal(
 	 * the reveal has a confirmation. This keeps the UI converging even if the background
 	 * confirmation task never ran (e.g. the app was reopened later).
 	 */
-	const startConfirmationPoll = useCallback(() => {
-		clearConfirmationPoll()
-		const tick = async () => {
-			const res = await getProposalByActionId({ baseUrl, actionId })
-			if (!res.ok) return
-			const p = res.data
-			applyProposal(p)
-			if (p.broadcastStatus === 'failed') {
-				clearConfirmationPoll()
-				setError(settledFailure(p.broadcastError))
-				setPhase('error')
-				return
-			}
-			if (phaseForBroadcastStatus(p.broadcastStatus, p.status) === 'done') {
-				clearConfirmationPoll()
-				setPhase('done')
-				return
-			}
-			// Not yet promoted by the background task — reconcile against the chain.
-			const resolved = await resolveBroadcastStatus({ commitTxid: p.commitTxid, revealTxid: p.revealTxid })
-			if (resolved.ok && resolved.data.broadcastStatus === 'reveal_confirmed') {
-				const promoted = await reportBroadcastProgress({
-					baseUrl,
-					actionId,
-					broadcastStatus: 'reveal_confirmed',
-					commitTxid: p.commitTxid,
-					revealTxid: p.revealTxid,
-				})
-				if (!promoted.ok) return
-				applyProposal(promoted.data)
-				// A 200 is not a confirmation (#605): beside other pairs the orchestrator keeps the
-				// row at `reveal_broadcasted` until its own node sees the block. Keep polling until
-				// the row it wrote back is done.
-				if (phaseForBroadcastStatus(promoted.data.broadcastStatus, promoted.data.status) === 'done') {
+	/**
+	 * Polls until the proposal confirms. `sent` is the pair this screen just sent: the row may move
+	 * to another signer's pair (#605), so the chain is asked about this one, and only its own
+	 * `failed` ends the watch. Without it (a resumed screen) the row's pair is watched.
+	 */
+	const startConfirmationPoll = useCallback(
+		(sent?: SentPair) => {
+			clearConfirmationPoll()
+			const tick = async () => {
+				const res = await getProposalByActionId({ baseUrl, actionId })
+				if (!res.ok) return
+				const p = res.data
+				applyProposal(p)
+				const watched = sent ?? { commitTxid: p.commitTxid, revealTxid: p.revealTxid }
+				if (p.broadcastStatus === 'failed' && rowTracksPair(p.revealTxid, watched.revealTxid)) {
+					clearConfirmationPoll()
+					setError(settledFailure(p.broadcastError))
+					setPhase('error')
+					return
+				}
+				// Confirmed on whichever pair was mined first: the proposal is on its way either way.
+				if (phaseForBroadcastStatus(p.broadcastStatus, p.status) === 'done') {
 					clearConfirmationPoll()
 					setPhase('done')
+					return
+				}
+				// Not yet promoted by the background task — reconcile against the chain.
+				const resolved = await resolveBroadcastStatus(watched)
+				if (resolved.ok && resolved.data.broadcastStatus === 'reveal_confirmed') {
+					const promoted = await reportBroadcastProgress({
+						baseUrl,
+						actionId,
+						broadcastStatus: 'reveal_confirmed',
+						commitTxid: watched.commitTxid,
+						revealTxid: watched.revealTxid,
+					})
+					if (!promoted.ok) return
+					applyProposal(promoted.data)
+					// A 200 is not a confirmation (#605): beside other pairs the orchestrator keeps the
+					// row at `reveal_broadcasted` until its own node sees the block. Keep polling until
+					// the row it wrote back is done.
+					if (phaseForBroadcastStatus(promoted.data.broadcastStatus, promoted.data.status) === 'done') {
+						clearConfirmationPoll()
+						setPhase('done')
+					}
 				}
 			}
-		}
-		pollRef.current = setInterval(() => void tick(), CONFIRMATION_POLL_INTERVAL_MS)
-	}, [baseUrl, actionId, applyProposal, clearConfirmationPoll])
+			pollRef.current = setInterval(() => void tick(), CONFIRMATION_POLL_INTERVAL_MS)
+		},
+		[baseUrl, actionId, applyProposal, clearConfirmationPoll],
+	)
 
 	// Stop any active poll when the hook unmounts.
 	useEffect(() => clearConfirmationPoll, [clearConfirmationPoll])
@@ -322,7 +332,9 @@ export function useBroadcastProposal(
 				nextPhase = phaseForBroadcastStatus(res.data.broadcastStatus, res.data.proposalStatus) ?? nextPhase
 			}
 			setPhase(nextPhase)
-			if (nextPhase === 'awaiting-confirmation') startConfirmationPoll()
+			if (nextPhase === 'awaiting-confirmation') {
+				startConfirmationPoll({ commitTxid: res.data.commitTxid, revealTxid: res.data.revealTxid })
+			}
 		} finally {
 			broadcastStarted.current = false
 			inFlightActionIds.delete(actionId)

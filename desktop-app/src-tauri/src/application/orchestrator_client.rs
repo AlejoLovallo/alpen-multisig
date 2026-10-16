@@ -167,6 +167,11 @@ pub trait OrchestratorClient: Send + Sync {
     /// Claim broadcast coordination slot before desktop submits to Bitcoin (P-066).
     async fn claim_broadcast(&self, action_id: &str) -> Result<Proposal, OrchestratorError>;
 
+    /// Whether this signer may register their own pair now (#605), asked before the device signs
+    /// a commit. Answers like the registration: `409` with the orchestrator's refusal.
+    async fn check_broadcast_attempt(&self, action_id: &str)
+        -> Result<Proposal, OrchestratorError>;
+
     /// Register this signer's own commit + reveal pair beside the one in flight, before it is
     /// broadcast (#605). The row then tracks the new pair.
     async fn register_broadcast_attempt(

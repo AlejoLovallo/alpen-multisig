@@ -256,6 +256,7 @@ impl ProposalRepository for InMemoryProposalRepository {
         reveal_txid: Option<&str>,
         error: Option<&str>,
         attempt: Option<BroadcastAttempt>,
+        live: &[String],
     ) -> Result<Option<Proposal>, AppError> {
         // Checked and written under one write lock, like the registration it must not overwrite.
         // The pair is listed only when this same write applies, so a report that lost the race
@@ -277,10 +278,10 @@ impl ProposalRepository for InMemoryProposalRepository {
                     proposal.broadcast_attempts.push(attempt);
                 }
             }
-            // After the attempt is listed, so a failed second pair puts the row back on the
-            // earlier one (#605).
+            // After the attempt is listed, so a failed second pair puts the row back on an
+            // earlier one the node still has (#605).
             let write =
-                broadcast_write_for_report(proposal, status, commit_txid, reveal_txid, error);
+                broadcast_write_for_report(proposal, status, commit_txid, reveal_txid, error, live);
             apply_broadcast_status(
                 proposal,
                 write.status,

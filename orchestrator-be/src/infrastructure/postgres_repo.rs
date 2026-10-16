@@ -611,6 +611,7 @@ impl ProposalRepository for PostgresProposalRepository {
         reveal_txid: Option<&str>,
         error: Option<&str>,
         attempt: Option<BroadcastAttempt>,
+        live: &[String],
     ) -> Result<Option<Proposal>, AppError> {
         let proposal_status_db = proposal_status.map(status_to_db);
 
@@ -667,8 +668,9 @@ impl ProposalRepository for PostgresProposalRepository {
             }
         }
 
-        // A failed report for the tracked pair puts the row back on the previous one (#605).
-        let write = broadcast_write_for_report(&current, status, commit_txid, reveal_txid, error);
+        // A failed report for the tracked pair puts the row back on an earlier live one (#605).
+        let write =
+            broadcast_write_for_report(&current, status, commit_txid, reveal_txid, error, live);
         sqlx::query(UPDATE_BROADCAST_STATUS)
             .bind(write.status.to_string())
             .bind(proposal_status_db)
@@ -914,6 +916,7 @@ mod tests {
             Some(REVEAL_A),
             None,
             Some(attempt(SIGNER_A, COMMIT_A, REVEAL_A)),
+            &[],
         )
         .await
         .unwrap();
@@ -973,6 +976,7 @@ mod tests {
                 Some(REVEAL_A),
                 Some("dropped"),
                 Some(attempt(SIGNER_A, COMMIT_A, REVEAL_A)),
+                &[],
             )
             .await
             .unwrap()
@@ -989,6 +993,7 @@ mod tests {
                 Some(REVEAL_C),
                 None,
                 Some(attempt(SIGNER_A, COMMIT_C, REVEAL_C)),
+                &[],
             )
             .await
             .unwrap()
@@ -1032,6 +1037,48 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Conflict(_)), "{err:?}");
+    }
+
+    /// A `failed` report for the tracked pair goes back to an earlier pair the node still has, and
+    /// is marked `failed` when none is left.
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn postgres_a_failed_pair_falls_back_only_to_a_live_one() {
+        let Some(repo) = repo().await else {
+            return;
+        };
+        let action_id = save_with_pair_of_a(&repo).await;
+        repo.register_additional_pair(&action_id, attempt(SIGNER_B, COMMIT_B, REVEAL_B), &[])
+            .await
+            .unwrap();
+        let fail = |commit, reveal, live: Vec<String>| {
+            let repo = &repo;
+            let action_id = &action_id;
+            async move {
+                repo.update_reported_pair_status(
+                    action_id,
+                    BroadcastStatus::Failed,
+                    None,
+                    Some(commit),
+                    Some(reveal),
+                    Some("rejected"),
+                    None,
+                    &live,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            }
+        };
+
+        let back = fail(COMMIT_B, REVEAL_B, vec![REVEAL_A.to_string()]).await;
+        assert_eq!(back.broadcast_status, BroadcastStatus::CommitBroadcasted);
+        assert_eq!(back.reveal_txid.as_deref(), Some(REVEAL_A));
+        assert!(back.broadcast_error.is_none());
+
+        let failed = fail(COMMIT_A, REVEAL_A, Vec::new()).await;
+        assert_eq!(failed.broadcast_status, BroadcastStatus::Failed);
+        assert_eq!(failed.reveal_txid.as_deref(), Some(REVEAL_A));
     }
 
     #[tokio::test]

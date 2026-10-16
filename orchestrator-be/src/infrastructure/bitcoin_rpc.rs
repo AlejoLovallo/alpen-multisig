@@ -17,15 +17,15 @@ pub(crate) trait BitcoinRpcClient: Send + Sync {
     /// Fails if the transaction is not yet in a block.
     async fn get_block_height_for_txid(&self, txid: &str) -> Result<u64, AppError>;
 
-    /// Where a confirmed `txid` sits, including the block's timestamp when this client knows it.
+    /// Where a confirmed `txid` sits, with the transaction itself when this client reads it.
     ///
     /// Fails the same way as [`get_block_height_for_txid`] when the transaction is not in a block.
-    /// The default has no timestamp: only a client that read one can tell a reveal mined long
-    /// before it was registered from one mined after (#605).
+    /// The default reads no transaction; it exists for test doubles. The node client always
+    /// returns it, so the reconcile can check that a mined reveal carries the proposal (#605).
     async fn get_mined_reveal(&self, txid: &str) -> Result<MinedReveal, AppError> {
         Ok(MinedReveal {
             height: self.get_block_height_for_txid(txid).await?,
-            block_time: None,
+            tx: None,
         })
     }
 
@@ -42,12 +42,21 @@ pub(crate) trait BitcoinRpcClient: Send + Sync {
 }
 
 /// A transaction the node found in a block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MinedReveal {
     pub height: u64,
-    /// Unix seconds of the block, when the client read one. A miner may stamp a block behind the
-    /// wall clock; callers that compare it with a registration time allow for that.
-    pub block_time: Option<i64>,
+    /// The decoded transaction. `None` only from a client that does not read transactions.
+    pub tx: Option<bitcoin::Transaction>,
+}
+
+/// The node's transaction index, as `getindexinfo` reports it (#605).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxIndex {
+    /// The node runs without `-txindex`.
+    Missing,
+    /// The index exists but has not caught up with the chain yet.
+    Syncing,
+    Synced,
 }
 
 pub(crate) struct HttpBitcoinRpcClient {
@@ -70,9 +79,50 @@ impl HttpBitcoinRpcClient {
     /// Whether the node keeps a transaction index (#605). Without one, `getrawtransaction` cannot
     /// find a mined transaction, so the reconcile cannot tell which of several pairs was mined.
     /// `Err` when the node could not be asked.
-    pub(crate) async fn txindex_enabled(&self) -> Result<bool, AppError> {
+    pub(crate) async fn txindex(&self) -> Result<TxIndex, AppError> {
         let info = self.call("getindexinfo", json!(["txindex"])).await?;
-        Ok(info.get("txindex").is_some())
+        Ok(match info.get("txindex") {
+            None => TxIndex::Missing,
+            Some(index) if index.get("synced").and_then(Value::as_bool) == Some(true) => {
+                TxIndex::Synced
+            }
+            Some(_) => TxIndex::Syncing,
+        })
+    }
+
+    /// `getrawtransaction` for `txid` and the height of the block holding it.
+    async fn locate(&self, txid: &str) -> Result<(Value, u64), AppError> {
+        // getrawtransaction works for any tx via txindex, unlike gettransaction which
+        // requires the tx to be in the node's wallet.
+        let result = self.call("getrawtransaction", json!([txid, true])).await?;
+
+        // Bitcoin Core 23+ includes blockheight directly; fall back to getblockheader.
+        if let Some(height) = result.get("blockheight").and_then(|v| v.as_u64()) {
+            return Ok((result, height));
+        }
+
+        let blockhash = result
+            .get("blockhash")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "getrawtransaction: tx {txid} has no blockhash — not yet confirmed"
+                ))
+            })?;
+
+        let header = self
+            .call("getblockheader", json!([blockhash, true]))
+            .await?;
+
+        let height = header
+            .get("height")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "getblockheader: missing `height` for blockhash {blockhash}"
+                ))
+            })?;
+        Ok((result, height))
     }
 
     /// Any RPC call, for tests that drive a real regtest node.
@@ -155,43 +205,24 @@ impl BitcoinRpcClient for HttpBitcoinRpcClient {
     }
 
     async fn get_block_height_for_txid(&self, txid: &str) -> Result<u64, AppError> {
-        Ok(self.get_mined_reveal(txid).await?.height)
+        Ok(self.locate(txid).await?.1)
     }
 
     async fn get_mined_reveal(&self, txid: &str) -> Result<MinedReveal, AppError> {
-        // getrawtransaction works for any tx via txindex, unlike gettransaction which
-        // requires the tx to be in the node's wallet.
-        let result = self.call("getrawtransaction", json!([txid, true])).await?;
-        let block_time = result.get("blocktime").and_then(|v| v.as_i64());
-
-        // Bitcoin Core 23+ includes blockheight directly; fall back to getblockheader.
-        if let Some(height) = result.get("blockheight").and_then(|v| v.as_u64()) {
-            return Ok(MinedReveal { height, block_time });
-        }
-
-        let blockhash = result
-            .get("blockhash")
-            .and_then(|v| v.as_str())
+        let (result, height) = self.locate(txid).await?;
+        let tx = result
+            .get("hex")
+            .and_then(Value::as_str)
+            .and_then(|hex| bitcoin::consensus::encode::deserialize_hex(hex).ok())
             .ok_or_else(|| {
-                AppError::BadRequest(format!(
-                    "getrawtransaction: tx {txid} has no blockhash — not yet confirmed"
+                AppError::Internal(anyhow::anyhow!(
+                    "getrawtransaction: tx {txid} came back without a decodable `hex`"
                 ))
             })?;
-
-        let header = self
-            .call("getblockheader", json!([blockhash, true]))
-            .await?;
-
-        let height = header
-            .get("height")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| {
-                AppError::BadRequest(format!(
-                    "getblockheader: missing `height` for blockhash {blockhash}"
-                ))
-            })?;
-        let block_time = block_time.or_else(|| header.get("time").and_then(|v| v.as_i64()));
-        Ok(MinedReveal { height, block_time })
+        Ok(MinedReveal {
+            height,
+            tx: Some(tx),
+        })
     }
 
     async fn get_tx_position_in_block(&self, txid: &str) -> Result<usize, AppError> {

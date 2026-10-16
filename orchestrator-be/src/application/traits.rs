@@ -73,6 +73,9 @@ pub(crate) trait ProposalRepository: Send + Sync {
     ///
     /// `attempt` is recorded in that same write, and only when the update applies. A report that
     /// loses the race is not listed, so a reveal from another action cannot later confirm this one.
+    ///
+    /// `live` lists the reveals of pairs the node still has; a `failed` report for the tracked
+    /// pair puts the row back on the newest of them (see `broadcast_write_for_report`).
     #[allow(clippy::too_many_arguments)]
     async fn update_reported_pair_status(
         &self,
@@ -83,6 +86,7 @@ pub(crate) trait ProposalRepository: Send + Sync {
         reveal_txid: Option<&str>,
         error: Option<&str>,
         attempt: Option<BroadcastAttempt>,
+        live: &[String],
     ) -> Result<Option<Proposal>, AppError>;
 
     /// Mark the proposal `reveal_confirmed` on this commit + reveal, but only while it still

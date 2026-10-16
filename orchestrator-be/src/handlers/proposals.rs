@@ -400,6 +400,29 @@ pub async fn register_broadcast_attempt(
     Ok(Json(proposal_response(&state, proposal).await))
 }
 
+/// Coordination-only: whether this signer may send their own pair now, asked before the device
+/// signs anything (#605). `409` with the same text the registration would answer.
+#[tracing::instrument(skip(state, auth), fields(action_id, authority = ?auth.authority))]
+pub async fn check_broadcast_attempt(
+    State(state): State<AppState>,
+    auth: AuthenticatedSession,
+    Path(action_id): Path<String>,
+) -> Result<Json<ProposalResponse>> {
+    let action_id = ActionId(action_id);
+    let proposal = proposals::check_additional_pair(
+        state.repo.as_ref(),
+        proposals::SessionContext {
+            authority: auth.authority,
+            signer_pubkey: &auth.signer_pubkey,
+        },
+        &state.asm_rpc_url,
+        state.btc_client.as_ref(),
+        &action_id,
+    )
+    .await?;
+    Ok(Json(proposal_response(&state, proposal).await))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ReportBroadcastProgressBody {
     pub broadcast_status: String,

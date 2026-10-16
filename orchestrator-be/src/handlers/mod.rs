@@ -55,6 +55,10 @@ pub fn router(state: AppState) -> Router {
             post(proposals::register_broadcast_attempt),
         )
         .route(
+            "/proposals/:action_id/broadcast/attempts/check",
+            get(proposals::check_broadcast_attempt),
+        )
+        .route(
             "/proposals/:action_id/cancel",
             post(proposals::create_cancel_proposal),
         )
@@ -802,6 +806,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+
+        // Asked before signing: A already has a pair on its way, B may send one.
+        let check_uri = format!("/proposals/{action_id}/broadcast/attempts/check");
+        for (token, expected) in [(&token_a, StatusCode::CONFLICT), (&token_b, StatusCode::OK)] {
+            let resp = app
+                .clone()
+                .oneshot(json_request("GET", &check_uri, None, Some(token)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), expected);
+        }
 
         // Signer B registers its own.
         let (commit_b, reveal_b) = ("c".repeat(64), "d".repeat(64));
