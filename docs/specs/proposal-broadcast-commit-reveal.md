@@ -523,7 +523,8 @@ acts on; the others are refused on the sequence number and cost only their fees.
   see the runbook for other deployments.
 - **A settled proposal takes no broadcast report.** A report that would move a `reveal_confirmed`
   row back (a `failed`, an earlier status) leaves it: its pair is the one the ASM executed. So does any
-  broadcast report on a proposal that is no longer `approved` (unless it asks for a proposal status),
+  broadcast report on a proposal that is no longer `approved` (unless it asks for a proposal status;
+  a report that asks for `enacted` still does not move a target already `canceled`),
   since nothing revisits such a row to repair it — except a `superseded` row, which still lists a
   pair. An immediate action can be retired while the reveal that executed it is not listed yet; the
   import lists it, and if the ASM executed it the row returns to `approved` at `reveal_confirmed`

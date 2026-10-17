@@ -547,7 +547,9 @@ pub(crate) struct ReportEffect {
 /// It moves the row only when it names the pair the row tracks (or tags an empty claim), the row
 /// is not confirmed already — a confirmed pair is the one the ASM executed, and a `failed` or an
 /// earlier status would put a loser in its place — and the proposal is still approved, unless the
-/// report asks for a proposal status. Its pair is listed whenever the proposal is approved or
+/// report asks for a proposal status. It does not mark a `canceled` target `enacted`: a cancel
+/// that landed during the report already wrote that, and putting `enacted` back leaves both rows
+/// where no later read applies the cancel. Its pair is listed whenever the proposal is approved or
 /// superseded, even beside the tracked one: a pair sent by the manual fallback and imported later
 /// may be the one the ASM executed, and the reconcile counts only a reveal it did. A pair that
 /// would take its signer
@@ -561,9 +563,12 @@ pub(crate) fn report_effect(
     attempt: Option<&BroadcastAttempt>,
 ) -> Result<ReportEffect, &'static str> {
     let approved = current.status == ProposalStatus::Approved;
+    let undoes_a_cancel = current.status == ProposalStatus::Canceled
+        && proposal_status == Some(ProposalStatus::Enacted);
     let settled = (current.broadcast_status == BroadcastStatus::RevealConfirmed
         && status != BroadcastStatus::RevealConfirmed)
-        || (!approved && proposal_status.is_none());
+        || (!approved && proposal_status.is_none())
+        || undoes_a_cancel;
     let moves_row =
         reports_tracked_pair(reported_reveal, current.reveal_txid.as_deref()) && !settled;
     // A superseded row still lists a pair. An immediate action can be retired before its
@@ -7576,6 +7581,41 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(kept.status, ProposalStatus::Canceled);
+    }
+
+    /// The report decided `enacted` before the lock. By the write, a cancel has already marked the
+    /// target `canceled`. The report must not put `enacted` back.
+    #[tokio::test]
+    async fn a_report_does_not_enact_a_target_a_cancel_already_canceled() {
+        let repo = new_repo();
+        let proposal = save_approved_proposal(&repo, Authority::StrataAdmin, 1).await;
+        repo.update_broadcast_status(
+            &proposal.action_id,
+            BroadcastStatus::RevealConfirmed,
+            Some(ProposalStatus::Canceled),
+            Some(COMMIT_A),
+            Some(REVEAL_A),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let updated = repo
+            .update_reported_pair_status(
+                &proposal.action_id,
+                BroadcastStatus::RevealConfirmed,
+                Some(ProposalStatus::Enacted),
+                Some(COMMIT_A),
+                Some(REVEAL_A),
+                None,
+                None,
+                &[],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(updated.status, ProposalStatus::Canceled);
     }
 
     /// A supersede applies only to the row this read judged. Once a reveal is confirmed, a stale
