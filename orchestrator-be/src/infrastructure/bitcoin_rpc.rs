@@ -17,8 +17,46 @@ pub(crate) trait BitcoinRpcClient: Send + Sync {
     /// Fails if the transaction is not yet in a block.
     async fn get_block_height_for_txid(&self, txid: &str) -> Result<u64, AppError>;
 
+    /// Where a confirmed `txid` sits, with the transaction itself when this client reads it.
+    ///
+    /// Fails the same way as [`get_block_height_for_txid`] when the transaction is not in a block.
+    /// The default reads no transaction; it exists for test doubles. The node client always
+    /// returns it, so the reconcile can check that a mined reveal carries the proposal (#605).
+    async fn get_mined_reveal(&self, txid: &str) -> Result<MinedReveal, AppError> {
+        Ok(MinedReveal {
+            height: self.get_block_height_for_txid(txid).await?,
+            tx: None,
+        })
+    }
+
     /// Return the current chain tip height (`getblockcount`).
     async fn get_chain_tip(&self) -> Result<u64, AppError>;
+
+    /// Return where a mined `txid` sits in its block's transaction list (0 = coinbase). Used to
+    /// order two reveals mined in the same block (#605). Fails if it is not in a block.
+    async fn get_tx_position_in_block(&self, _txid: &str) -> Result<usize, AppError> {
+        Err(AppError::BadRequest(
+            "this bitcoin client cannot place a transaction in its block".to_string(),
+        ))
+    }
+}
+
+/// A transaction the node found in a block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MinedReveal {
+    pub height: u64,
+    /// The decoded transaction. `None` only from a client that does not read transactions.
+    pub tx: Option<bitcoin::Transaction>,
+}
+
+/// The node's transaction index, as `getindexinfo` reports it (#605).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxIndex {
+    /// The node runs without `-txindex`.
+    Missing,
+    /// The index exists but has not caught up with the chain yet.
+    Syncing,
+    Synced,
 }
 
 pub(crate) struct HttpBitcoinRpcClient {
@@ -36,6 +74,61 @@ impl HttpBitcoinRpcClient {
             pass: pass.to_string(),
             client: http_client::shared(),
         }
+    }
+
+    /// Whether the node keeps a transaction index (#605). Without one, `getrawtransaction` cannot
+    /// find a mined transaction, so the reconcile cannot tell which of several pairs was mined.
+    /// `Err` when the node could not be asked.
+    pub(crate) async fn txindex(&self) -> Result<TxIndex, AppError> {
+        let info = self.call("getindexinfo", json!(["txindex"])).await?;
+        Ok(match info.get("txindex") {
+            None => TxIndex::Missing,
+            Some(index) if index.get("synced").and_then(Value::as_bool) == Some(true) => {
+                TxIndex::Synced
+            }
+            Some(_) => TxIndex::Syncing,
+        })
+    }
+
+    /// `getrawtransaction` for `txid` and the height of the block holding it.
+    async fn locate(&self, txid: &str) -> Result<(Value, u64), AppError> {
+        // getrawtransaction works for any tx via txindex, unlike gettransaction which
+        // requires the tx to be in the node's wallet.
+        let result = self.call("getrawtransaction", json!([txid, true])).await?;
+
+        // Bitcoin Core 23+ includes blockheight directly; fall back to getblockheader.
+        if let Some(height) = result.get("blockheight").and_then(|v| v.as_u64()) {
+            return Ok((result, height));
+        }
+
+        let blockhash = result
+            .get("blockhash")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "getrawtransaction: tx {txid} has no blockhash — not yet confirmed"
+                ))
+            })?;
+
+        let header = self
+            .call("getblockheader", json!([blockhash, true]))
+            .await?;
+
+        let height = header
+            .get("height")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "getblockheader: missing `height` for blockhash {blockhash}"
+                ))
+            })?;
+        Ok((result, height))
+    }
+
+    /// Any RPC call, for tests that drive a real regtest node.
+    #[cfg(test)]
+    pub(crate) async fn rpc(&self, method: &str, params: Value) -> Result<Value, AppError> {
+        self.call(method, params).await
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, AppError> {
@@ -112,16 +205,29 @@ impl BitcoinRpcClient for HttpBitcoinRpcClient {
     }
 
     async fn get_block_height_for_txid(&self, txid: &str) -> Result<u64, AppError> {
-        // getrawtransaction works for any tx via txindex, unlike gettransaction which
-        // requires the tx to be in the node's wallet.
-        let result = self.call("getrawtransaction", json!([txid, true])).await?;
+        Ok(self.locate(txid).await?.1)
+    }
 
-        // Bitcoin Core 23+ includes blockheight directly; fall back to getblockheader.
-        if let Some(h) = result.get("blockheight").and_then(|v| v.as_u64()) {
-            return Ok(h);
-        }
+    async fn get_mined_reveal(&self, txid: &str) -> Result<MinedReveal, AppError> {
+        let (result, height) = self.locate(txid).await?;
+        let tx = result
+            .get("hex")
+            .and_then(Value::as_str)
+            .and_then(|hex| bitcoin::consensus::encode::deserialize_hex(hex).ok())
+            .ok_or_else(|| {
+                AppError::Internal(anyhow::anyhow!(
+                    "getrawtransaction: tx {txid} came back without a decodable `hex`"
+                ))
+            })?;
+        Ok(MinedReveal {
+            height,
+            tx: Some(tx),
+        })
+    }
 
-        let blockhash = result
+    async fn get_tx_position_in_block(&self, txid: &str) -> Result<usize, AppError> {
+        let tx = self.call("getrawtransaction", json!([txid, true])).await?;
+        let blockhash = tx
             .get("blockhash")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
@@ -129,18 +235,17 @@ impl BitcoinRpcClient for HttpBitcoinRpcClient {
                     "getrawtransaction: tx {txid} has no blockhash — not yet confirmed"
                 ))
             })?;
-
-        let header = self
-            .call("getblockheader", json!([blockhash, true]))
-            .await?;
-
-        header
-            .get("height")
-            .and_then(|v| v.as_u64())
+        let block = self.call("getblock", json!([blockhash, 1])).await?;
+        block
+            .get("tx")
+            .and_then(|v| v.as_array())
+            .and_then(|txids| {
+                txids
+                    .iter()
+                    .position(|t| t.as_str().is_some_and(|t| t.eq_ignore_ascii_case(txid)))
+            })
             .ok_or_else(|| {
-                AppError::BadRequest(format!(
-                    "getblockheader: missing `height` for blockhash {blockhash}"
-                ))
+                AppError::BadRequest(format!("getblock: tx {txid} is not in block {blockhash}"))
             })
     }
 

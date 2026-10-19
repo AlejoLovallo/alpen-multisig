@@ -137,15 +137,32 @@ Request body:
 
 ### 3) Read proposal status
 
-`GET /proposals` and `GET /proposals/:action_id` include `broadcastStatus`, `commitTxid`, `revealTxid`, `broadcastError` when present, and `broadcastClaimStale` (see "One broadcast in flight per authority").
+`GET /proposals` and `GET /proposals/:action_id` include `broadcastStatus`, `commitTxid`, `revealTxid`, `broadcastError` when present, `broadcastClaimStale` (see "One broadcast in flight per authority"), and `broadcastAttempts` — every commit + reveal pair sent, oldest first (see "Another signer's commit + reveal").
+
+### 4) Register another signer's pair (#605)
+
+`POST /proposals/:action_id/broadcast/attempts` with `{ "commit_txid": "hex", "reveal_txid": "hex" }` (64-char txids).
+
+- Same checks as the claim: session authority, `approved`, threshold snapshot, sequence number still open.
+- `409` when there is no pair in flight to send beside, or when the caller already sent a pair for this proposal.
+- The caller registering the same pair again returns `200` and leaves the row as it is, so a registration whose response was lost can be retried.
+- `409` when the caller already listed `MAX_PAIRS_PER_SIGNER` pairs. The same limit applies to a pair listed by a progress report (a claimer's pre-registration).
+
+### 5) Check before signing another signer's pair (#605)
+
+`GET /proposals/:action_id/broadcast/attempts/check`
+
+- Every check of the registration above that does not need txids; answers `200` with the `Proposal`, or the same `409`s.
+- The desktop calls it before the device signs a commit, and claims instead when the answer is that no pair is in flight.
+- Returns the updated `Proposal` JSON. See "Another signer's commit + reveal".
 
 ## Technical Design
 
 ### Orchestrator (`orchestrator-be`)
 
 - **No** `broadcast_tx` module or signing key in server config.
-- Application: `claim_broadcast_coordination`, `report_broadcast_progress`.
-- Repository: `claim_broadcast`, `update_broadcast_status`.
+- Application: `claim_broadcast_coordination`, `report_broadcast_progress`, `register_additional_pair`, `check_additional_pair` (#605).
+- Repository: `claim_broadcast`, `update_broadcast_status`, `register_additional_pair`, `update_reported_pair_status`, `confirm_tracked_reveal` (#605).
 - Bitcoin RPC on server: `/ready` health check only.
 
 ### Desktop Tauri (`desktop-app/src-tauri`)
@@ -377,6 +394,157 @@ server clock, so no desktop's clock can reopen Send early, and a payload without
 `false`. Rows that were already `commit_broadcasted`, `commit_confirmed` or `reveal_broadcasted`
 when the column was added copy `updated_at` into it. Postgres locks every proposal of the authority before the update, so two
 claims of different proposals cannot both pass.
+
+### Another signer's commit + reveal (#605)
+
+PRD 5.c.ii.3.a. A pair broadcast at a low fee can sit in the mempool while every other signer is
+locked out: the claim is taken, and recreating the proposal fails on the sequence number. Any
+signer of the authority who has **not** sent a pair for the proposal can send their own beside it.
+Every pair carries the same signed payload, so whichever reveal is mined first is the one the ASM
+acts on; the others are refused on the sequence number and cost only their fees.
+
+- **Pairs.** Every pair is kept in `broadcast_attempts` (`broadcaster_pubkey`, `commit_txid`,
+  `reveal_txid`, `created_at`; key `(action_id, reveal_txid)`). A progress report carrying both
+  txids of the pair the row tracks (or of an untagged claim) records the pair with the reporting signer (idempotent), so the claimer's pre-registration
+  is the first pair. Pairs registered before #605 are backfilled with no broadcaster.
+- **When.** A pair already listed under another signer is refused as such (`409`, "already listed
+  for this proposal"). Only beside a pair on its way: `approved` and `commit_broadcasted` with a txid,
+  `commit_confirmed` or `reveal_broadcasted` (`decide_additional_pair`). An empty claim is a
+  signer still at the device; `idle`, `failed` and a stale empty claim go through the claim. One
+  pair per signer: whoever already sent one bumps its fee (CPFP on the reveal change), and the
+  desktop holds one stored bundle per proposal. The same signer registering the same pair again
+  succeeds without changing the row: it is the retry of a registration whose response was lost,
+  and the desktop retries it before broadcasting. A signer's earlier pair whose commit the node finds
+  nowhere — neither in the mempool nor in a block, as when the registering session died before
+  broadcasting, or the pair was dropped — no longer counts as theirs on its way, so they may register
+  another (`abandoned_pairs_of`). Only a node with `-txindex` can answer "nowhere"; without one the
+  signer is refused as before. A signer lists at most `MAX_PAIRS_PER_SIGNER` (3) pairs per proposal,
+  abandoned ones included (`409`, "the most commit and reveal pairs allowed"): registration takes any
+  txids, each pair takes the row over, and every reconcile asks the node about every pair. The limit
+  holds for pairs listed by a claimer's pre-registration too (`exceeds_pair_limit`), so claiming and
+  reporting `failed` over and over is bounded the same way. A report about the pair the row tracks
+  keeps the row's commit txid: only the reveal identifies the pair, and the reconcile checks that the
+  mined reveal spends that commit.
+- **The row tracks the latest pair.** Registering sets the row's `commit_txid` / `reveal_txid` to
+  the new pair, `commit_broadcasted`, claim time now, error cleared — under a row lock. From there
+  the new sender's desktop reports on the row as any claimer would; the per-authority gate is
+  unchanged, since this proposal is already the authority's in-flight one.
+- **Reports about a replaced pair do not move the row.** A `PATCH` whose `reveal_txid` differs from the
+  row's leaves the status, txids and error as they are: the earlier sender's settle loop would otherwise
+  mark the new pair `failed` or move its status. Its pair is not recorded either: every pair of the
+  proposal was already recorded while the row tracked it, or registered, and the import screen reports
+  any bundle against the open proposal, so an unknown pair may belong to another action and must not be
+  able to confirm this one. A `PATCH` that names no reveal does not change a row that already
+  tracks one (an untagged claim still accepts it — that is the pre-registration). The comparison is made
+  in the write itself (`update_reported_pair_status`, a conditional `UPDATE`), so a pair registered after
+  the report read the row is not overwritten either. The pair is inserted in that same write, and only
+  when the update applies: a report that read an empty claim and lost the race is not listed. Txids are
+  stored lowercase. The desktop already
+  reports only to a row that carries its own reveal txid (`BundleRow::Ours`), and a `failed` report now
+  names its pair. A pre-registration is a success only when the response still tracks that reveal; a
+  200 that tracks another pair aborts the send before anything is broadcast and reports nothing.
+- **Only a reveal that carries the proposal counts.** Registration takes any well-formed txids, so
+  the reconcile checks every mined reveal it considers: its first input must spend the pair's commit,
+  and its envelope must decode — the way the ASM reads it (`parse_tx`: taproot leaf script,
+  `parse_envelope_payload`, SSZ `SignedPayload`) — to this proposal's sequence number and action,
+  signed over its sighash by at least `required_signatures` distinct approvers of the proposal, each
+  checked with the ASM's own verifier (`reveal_carries_proposal`, `signed_by_quorum`). A mined transaction that does not is ignored, however low its block,
+  and the row stays in flight. A pair first reported after it was mined (the manual fallback,
+  imported later) still counts: what it carries decides, not when it was registered.
+- **A failed pair falls back only to a live one.** A `failed` report for the pair the row tracks,
+  when another pair is listed, sets the row back to the newest other pair that may still be on its
+  way, at `commit_broadcasted`, and clears the error. Only a pair whose commit the node answers is
+  nowhere — neither in its mempool nor in a block — is dead; a node that could not answer (a timeout,
+  an index still syncing) does not make a pair dead, since `failed` beside a live pair would stop its
+  watchers and reopen the authority's claim gate. With no other pair left, the row becomes `failed`,
+  and a fresh claim may send again. A `failed` report never lists its pair: a pair that reached the
+  orchestrator is listed already, and one whose pre-registration never landed was never broadcast.
+- **Reconcile picks the pair mined first.** `confirm_reveal_if_mined` looks up the row's reveal and
+  every listed pair's; the lowest block height wins, and two reveals in one block are ordered by their
+  place in it (`getblock`) — the first listed is the one the ASM executed. A tie the node cannot order
+  waits for the next read. A lookup the node cannot answer leaves the row alone — "not in a block" is
+  the only miss that is skipped, and Bitcoin Core's -5 counts as that only with `-txindex` ("No such
+  mempool or blockchain transaction"); without it ("Use -txindex …") or while the index syncs, a mined
+  reveal looks the same, so the answer is not taken. The winner's txids are written explicitly, and only while the
+  row still tracks the reveal observed on that read (`confirm_tracked_reveal`); a pair registered in between
+  waits for the next read. The activation height and the queue id come from the winner.
+- **With other pairs, only the reconcile confirms.** When another pair is listed, a `reveal_confirmed`
+  `PATCH` on a row not yet confirmed records its pair as `reveal_broadcasted` and then runs the same
+  reconcile, so an earlier pair in a lower block still wins. A node that does not see the reveal yet
+  leaves the row at `reveal_broadcasted` until the next read. A lone pair has nothing to race, so its
+  `reveal_confirmed` is taken as before. So is a report about the tracked pair that the node cannot
+  check because it runs without `-txindex` (its answer about the reported reveal says so): it could
+  never find a mined reveal, and the proposal would otherwise never confirm. A report about a pair
+  the row no longer tracks is still ignored. Which pair won and its activation height are then the
+  desktop's word, as before #605; the orchestrator logs a warning for each such report.
+- **Node requirement.** Choosing between several pairs needs `getrawtransaction` to find mined
+  transactions, so the orchestrator's Bitcoin node must run with `-txindex=1` for the orchestrator to
+  decide which of several pairs won; without it the reconcile cannot confirm them, and only the
+  tracked pair's own report confirms the row, unchecked. If a replaced pair is the one mined and the
+  tracked pair then fails, nothing confirms the proposal. The orchestrator checks `getindexinfo` at startup and logs an error when
+  the index is missing, and a warning while it is not yet synced. Staging (`staging/entrypoint-bitcoin.sh`) and
+  `scripts/bitcoind-asm-runner.sh` set it; see the runbook for other deployments.
+- **Watchers stop on a confirmed row, not on a 200.** The desktop's settle loop and the send screen's
+  poll report `reveal_confirmed` and stop only once the row they get back says `reveal_confirmed`;
+  otherwise the bundle stays tracked and the next check reports again. The send screen watches the
+  pair it sent, not whichever pair the row tracks: it asks the chain about its own txids and reports
+  their confirmation. A `failed` row ends the watch whichever pair it names: a failed pair falls back
+  to any other the node still has, so none is left. A row confirmed on another signer's pair shows the
+  proposal done on the send screen. The settle loop keeps the losing bundle (`NotOurs`): it reports
+  nothing, but resubmits the reveal while the commit is live, since mining it is what returns the
+  commit output (the ASM refuses it on the sequence number), and stops once it is mined or gone.
+- **Txids are validated.** Every txid in a `PATCH` or a registration must be 64 hex chars (`400`
+  otherwise). A malformed pair backfilled from before this check is skipped by the reconcile instead of
+  holding back the other pairs.
+- **An import names the pair it updates.** The import modal sends a txid the row already has when
+  the bundle also advances the broadcast status: a report that names no reveal does not move a row
+  that tracks one.
+- **The import says when it was ignored.** A `PATCH` about a pair the row does not track still answers
+  `200`; the detail screen compares the reveal it imported with the one the row tracks and shows a notice
+  when they differ — including an import that named no reveal while the row tracks one.
+- **Desktop.** The detail screen offers *Send your own commit + reveal* under the in-flight stage
+  (`canSendAdditionalPair`) — to a signer with no pair, or to one whose earlier pair this desktop no
+  longer keeps (`proposals_has_stored_bundle`), and never when the orchestrator sends no
+  `broadcastAttempts` (one that predates the endpoint) — and lists every pair once there is more than one (*Current*, *Sent*,
+  *Mined*, *Not used*). The send screen opens with `?pair=additional`; while a pair is in flight it
+  prepares a fresh send instead of resuming, and `proposals_broadcast` runs with
+  `additional_pair: true` (`SendMode::AdditionalPair`). Before the device signs anything it asks
+  `GET /proposals/:id/broadcast/attempts/check`, which runs every check of the registration that does not
+  need txids (approved, threshold, sequence number, a pair in flight, no live pair of this signer) and
+  answers the same `409`s, so a refusal costs no signature. When the answer is that no pair is in flight
+  any more, the send claims the row instead, as an ordinary send. A desktop that still stores a bundle
+  for the proposal refuses before asking (`BundleInFlight`): the stored one may be live, and a second
+  send would replace it. Otherwise no claim: the pair is
+  registered through the endpoint above instead of the pre-registration report — retried (3 attempts)
+  like that report, except on a `409`, which is a decided refusal — and nothing is reported on the row
+  while the answer is a refusal, so the other signer's pair is untouched. A registration whose answer
+  never came back may have landed: the send reads the row, and reports `failed` naming its pair only
+  when the row tracks that pair — an empty claim at that point is another signer's. A claim's lost
+  pre-registration reports `failed` naming its pair directly: the claimed row is its own. Build,
+  reservation, `PendingReveals`, broadcast and settle are unchanged. The detail screen reads again every
+  10 s whether this desktop still holds a bundle, since the settle loop can drop one without the row
+  changing.
+- **Accepted limits.** A pair backfilled with no broadcaster does not lock its sender out. A retry
+  after `failed` leaves the earlier attempt listed, so the new pair is not a lone pair: the node decides
+  with `-txindex`, and without it the desktop's report is taken, as above. The pre-check and the
+  registration are two calls: the row can move between them, and the registration then refuses after
+  the device signed. The per-signer limit counts every pair listed, including a pre-registered pair
+  whose broadcast the node refused: a signer whose sends failed three times cannot send this proposal
+  again, and another signer has to. A bundle import reports with the importer's session: on an empty claim it tags the
+  row and lists the pair under the importer. Without `-txindex` the node cannot answer that a commit is nowhere, so a signer
+  whose pair was dropped cannot send another: when the row tracks a pair whose sender's desktop died
+  before broadcasting it and every other pair was dropped, only a signer who has sent no pair can move
+  the proposal until that desktop returns and reports `failed`.
+- **Deferred to #616.** The orchestrator does not yet ask the ASM whether a reveal executed:
+  - A lone pair's report is still the desktop's word.
+  - The quorum check uses the proposal's approvers, not the role's `ThresholdConfig` in index order,
+    so a member can get a reveal mined with approvals the ASM rejects, and it is confirmed.
+  - A reveal without the administration tag, or beyond `max_seqno_gap`, can be confirmed.
+  - A read that cannot judge a reveal can still let the sweep retire the proposal.
+  - A cancel of a target can lose the race against its target's read.
+
+  #616 judges every reveal from the ASM's state around its block and makes the sweep and cancel
+  writes conditional. It requires `-txindex=1` and Bitcoin Core ≥ 29.
 
 ### Frontend (`desktop-app/src`)
 
