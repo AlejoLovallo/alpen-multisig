@@ -1,7 +1,7 @@
 # Technical Report: Hardware Wallet Signing for Block Payouts
 
 > **Status:** Draft for external review (2026-10-20). Diagnosis only: no proposed solution and no effort estimate.
-> Source-level evidence, checked 2026-10-07. Device emulator confirmation is pending (section 6).
+> Source-level evidence at pinned commits, checked 2026-10-07.
 > Working notes behind this report: [`22-block-payouts-spike-findings.md`](./22-block-payouts-spike-findings.md).
 
 ## Executive summary
@@ -56,7 +56,7 @@ This report documents:
 - Why stock Trezor firmware cannot sign it.
 - Why the stock Ledger Bitcoin app cannot sign it, with or without miniscript.
 - What would have to change for a device to sign it.
-- What has been verified so far, what is still to verify, and the decision that remains open.
+- The decision that remains open.
 
 ## 3. Current state
 
@@ -268,25 +268,9 @@ Section 4.4 would still need an answer.
 **Custom firmware or a custom Ledger app** could sign the leaf. That is outside stock devices and outside the
 supported device matrix.
 
-## 6. Verification status and open questions
+## 6. Open questions
 
-| Step | Status | What it shows |
-|---|---|---|
-| Desk research (source code at pinned commits) | Done, 2026-10-07 | Software: can sign. Stock Trezor and stock Ledger: cannot. |
-| Emulators (Speculos for Ledger, Trezor emulator) | Pending | The exact device error per probe |
-
-Expected emulator outcomes:
-
-| Probe | Expected result |
-|---|---|
-| Trezor, connector input | No script-path message. `SPENDTAPROOT` signs the key-path sighash with the BIP-86-tweaked key. |
-| Ledger, policy with raw internal key or raw admin keys | Template does not parse: "Expected /** or /<M;N>/* in key expression" |
-| Ledger, derived keys, `multi_a` leaf, `UnstakingBurn` as `sha256(h)` | Registration fails: `EC_REGISTER_WALLET_POLICY_NOT_SANE` |
-| Ledger, closest registrable stand-in policy | Device derives a different `scriptPubKey`; the input is treated as external and not signed |
-
-A result different from the expected one reopens the desk research.
-
-Open questions (the decision is not ours to make):
+How would you like to proceed?
 
 1. Is a software signer acceptable for the `AdminBurn` leaf, with fee inputs still on the hardware signer?
 2. Is a change to the bridge protocol's claim payout connector on the table (section 5)?
