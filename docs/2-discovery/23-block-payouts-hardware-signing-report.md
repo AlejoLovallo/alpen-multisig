@@ -183,7 +183,7 @@ Evidence in `trezor-firmware` at tag `core/v2.12.5`:
 - `write_witness_p2tr` writes a single signature, commented "Taproot key path spending without annex"
   ([`scripts.py`](https://github.com/trezor/trezor-firmware/blob/core/v2.12.5/core/src/apps/bitcoin/scripts.py)).
 
-Roadmap signals:
+**Roadmap signals:**
 
 - Draft [PR #6936](https://github.com/trezor/trezor-firmware/pull/6936) (miniscript, updated 2026-09-22) states
   "Taproot is not supported. Currently only WSH is supported." It is not in any released firmware.
@@ -209,7 +209,7 @@ input only if it matches.
 | 2.1.2 (3 April 2023) | Up to 8 leaves; leaves limited to `pk`, `multi_a`, `sortedmulti_a` | No |
 | 2.2.0 (29 January 2024) to 2.5.1 | Full taproot miniscript; `musig()` from 2.4.0 | No: three blockers below |
 
-Policy language rules ([`doc/wallet.md`](https://github.com/LedgerHQ/app-bitcoin-new/blob/master/doc/wallet.md)):
+**Policy language rules** ([`doc/wallet.md`](https://github.com/LedgerHQ/app-bitcoin-new/blob/master/doc/wallet.md)):
 
 - A tap leaf must be `multi_a`, `sortedmulti_a`, or a valid taproot miniscript.
 - Keys are **xpubs**, never raw public keys, and every key is **derived** (`/**` or `/<M;N>/*`).
@@ -224,9 +224,9 @@ Three blockers, each sufficient on its own:
 
 | # | Blocker | Connector | What Ledger requires |
 |---|---|---|---|
-| 1 | Leaf shape | `<K> OP_EQUAL` | `multi_a` ends in `<k> OP_NUMEQUAL` |
-| 2 | Internal key | Raw BIP-327 aggregate of operator keys, not derived after aggregation | A derived key expression; `musig(...)` is derived after aggregation |
-| 3 | Sibling leaf | `UnstakingBurn` = `sha256(h)`, needs no signature | Every leaf must require a signature |
+| 1 | **Leaf shape** | `<K> OP_EQUAL` | `multi_a` ends in `<k> OP_NUMEQUAL` |
+| 2 | **Internal key** | Raw BIP-327 aggregate of operator keys, not derived after aggregation | A derived key expression; `musig(...)` is derived after aggregation |
+| 3 | **Sibling leaf** | `UnstakingBurn` = `sha256(h)`, needs no signature | Every leaf must require a signature |
 
 A fourth mismatch sits inside leaf 0: the admin keys are raw x-only keys from `params.toml`, not xpub children at a
 derivation step. Blockers 1–3 already close the policy.
