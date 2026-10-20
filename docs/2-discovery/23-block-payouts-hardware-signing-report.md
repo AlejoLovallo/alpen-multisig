@@ -92,7 +92,7 @@ Admin keys keep the order of the bridge `params.toml` `[keys.admin]` list. The s
 ```text
 <admin_1> OP_CHECKSIG
 <admin_2> OP_CHECKSIGADD
-…
+...
 <admin_M> OP_CHECKSIGADD
 <K> OP_EQUAL
 ```
@@ -101,9 +101,9 @@ Each admin key is a raw 32-byte x-only public key. Worked 2-of-3 with illustrati
 points), 104 bytes:
 
 ```text
-20 1111…11 ac      <admin_1> OP_CHECKSIG
-20 2222…22 ba      <admin_2> OP_CHECKSIGADD
-20 3333…33 ba      <admin_3> OP_CHECKSIGADD
+20 11...11 ac      <admin_1> OP_CHECKSIG
+20 22...22 ba      <admin_2> OP_CHECKSIGADD
+20 33...33 ba      <admin_3> OP_CHECKSIGADD
 52 87              OP_2 OP_EQUAL
 ```
 
@@ -137,7 +137,7 @@ For a 2-of-3 where admins 0 and 1 signed:
 **Sighash** (`get_signing_info`, [`connectors/src/lib.rs`](https://github.com/alpenlabs/strata-bridge/blob/5d3c8dc4bef3246b88b2aa0cdfbe857891422e03/crates/connectors/src/lib.rs)):
 
 - BIP-341 `SIGHASH_DEFAULT`. No sighash byte appended to the signature.
-- **Script-path** message: the hash includes the leaf hash of `AdminBurn` (BIP-342 extension).
+- **Script-path message:** the hash includes the leaf hash of `AdminBurn` (BIP-342 extension).
 - The admin key signs **untweaked**: a plain BIP-340 signature with the admin's key.
 - The signature commits to every input and output, including fee inputs and change.
 
