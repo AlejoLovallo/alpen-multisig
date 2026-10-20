@@ -56,7 +56,6 @@ This report documents:
 - Why stock Trezor firmware cannot sign it.
 - Why the stock Ledger Bitcoin app cannot sign it, with or without miniscript.
 - What would have to change for a device to sign it.
-- The decision that remains open.
 
 ## 3. Current state
 
@@ -268,16 +267,7 @@ Section 4.4 would still need an answer.
 **Custom firmware or a custom Ledger app** could sign the leaf. That is outside stock devices and outside the
 supported device matrix.
 
-## 6. Open questions
-
-How would you like to proceed?
-
-1. Is a software signer acceptable for the `AdminBurn` leaf, with fee inputs still on the hardware signer?
-2. Is a change to the bridge protocol's claim payout connector on the table (section 5)?
-3. Or should the PRD requirement that all Payout Administrator transactions are signed on the hardware signer change
-   for this input?
-
-## 7. References
+## 6. References
 
 - `strata-bridge` `main` @ `5d3c8dc`:
   [`claim_payout.rs`](https://github.com/alpenlabs/strata-bridge/blob/5d3c8dc4bef3246b88b2aa0cdfbe857891422e03/crates/connectors/src/claim_payout.rs),
