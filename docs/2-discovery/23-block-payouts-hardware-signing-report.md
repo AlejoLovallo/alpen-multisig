@@ -17,7 +17,7 @@ operators' N/N aggregate, not an admin key.
 Fee inputs from the Admin Wallet are not affected. They are BIP-86 key-path spends, and both device families already
 sign them in the app today.
 
-Findings:
+**Findings:**
 
 - **Trezor** (Safe 7, Safe 5, Safe 3 and Model T at core 2.12.5; Model One at legacy 1.14.1): blocked at firmware.
   Taproot signing is key-path only. There is no message, input type, or witness writer for a tapscript spend.
