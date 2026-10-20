@@ -78,12 +78,12 @@ Sources: `strata-bridge` at `3b69ece` (draft [PR #800](https://github.com/alpenl
 
 | Piece | Value |
 |---|---|
-| Internal key | N/N aggregate of the operator keys (`n_of_n_pubkey`). Its key-path spend is the normal operator payout. |
-| Leaf 0, `AdminBurn` | `threshold_multisig_script(admin_pubkeys, admin_threshold)`. The leaf a Payout Admin signs. |
-| Leaf 1, `UnstakingBurn` | `OP_SIZE 32 OP_EQUALVERIFY OP_SHA256 <unstaking_image> OP_EQUAL`. Never spent by `block_payout`. |
-| Leaf version | `TapScript` (`0xc0`) |
-| Tree shape | Two leaves, both at depth 1. Leaf 0 on the left, leaf 1 its sibling. |
-| Output value | Minimal non-dust (330 sats on signet) |
+| **Internal key** | N/N aggregate of the operator keys (`n_of_n_pubkey`). Its key-path spend is the normal operator payout. |
+| **Leaf 0, `AdminBurn`** | `threshold_multisig_script(admin_pubkeys, admin_threshold)`. The leaf a Payout Admin signs. |
+| **Leaf 1, `UnstakingBurn`** | `OP_SIZE 32 OP_EQUALVERIFY OP_SHA256 <unstaking_image> OP_EQUAL`. Never spent by `block_payout`. |
+| **Leaf version** | `TapScript` (`0xc0`) |
+| **Tree shape** | Two leaves, both at depth 1. Leaf 0 on the left, leaf 1 its sibling. |
+| **Output value** | Minimal non-dust (330 sats on signet) |
 
 Admin keys keep the order of the bridge `params.toml` `[keys.admin]` list. The script does not sort them.
 
@@ -255,10 +255,10 @@ Diagnostic only. This lists the conditions under which a stock device could sign
 
 **Ledger** could register and sign the output if **all** of these hold in the bridge protocol:
 
-- The `AdminBurn` leaf ends in `OP_NUMEQUAL` (miniscript `multi_a`).
-- Each admin key is an xpub child at the same `/<M;N>/*` index as the rest of the policy.
-- The N/N internal key is a derived aggregate, `musig(...)/<M;N>/*`, of at most 5 operator xpubs.
-- `UnstakingBurn` requires a signature, or leaves the tree.
+1. The `AdminBurn` leaf ends in `OP_NUMEQUAL` (miniscript `multi_a`).
+2. Each admin key is an xpub child at the same `/<M;N>/*` index as the rest of the policy.
+3. The N/N internal key is a derived aggregate, `musig(...)/<M;N>/*`, of at most 5 operator xpubs.
+4. `UnstakingBurn` requires a signature, or leaves the tree.
 
 Section 4.4 would still need an answer.
 
@@ -276,7 +276,11 @@ supported device matrix.
   [`not_presigned.rs`](https://github.com/alpenlabs/strata-bridge/blob/5d3c8dc4bef3246b88b2aa0cdfbe857891422e03/crates/tx-graph/src/transactions/not_presigned.rs),
   [`game_graph.rs`](https://github.com/alpenlabs/strata-bridge/blob/5d3c8dc4bef3246b88b2aa0cdfbe857891422e03/crates/tx-graph/src/game_graph.rs).
   Same files at `3b69ece` (draft [PR #800](https://github.com/alpenlabs/strata-bridge/pull/800)).
-- Trezor firmware `core/v2.12.5`: `bitcoin.py`, `sig_hasher.py`, `scripts.py`, `messages-bitcoin.proto` (links in 4.2).
+- Trezor firmware `core/v2.12.5`:
+  [`bitcoin.py`](https://github.com/trezor/trezor-firmware/blob/core/v2.12.5/core/src/apps/bitcoin/sign_tx/bitcoin.py),
+  [`sig_hasher.py`](https://github.com/trezor/trezor-firmware/blob/core/v2.12.5/core/src/apps/bitcoin/sign_tx/sig_hasher.py),
+  [`scripts.py`](https://github.com/trezor/trezor-firmware/blob/core/v2.12.5/core/src/apps/bitcoin/scripts.py),
+  [`messages-bitcoin.proto`](https://github.com/trezor/trezor-firmware/blob/core/v2.12.5/common/protob/messages-bitcoin.proto).
 - Ledger `app-bitcoin-new`: [`doc/wallet.md`](https://github.com/LedgerHQ/app-bitcoin-new/blob/master/doc/wallet.md),
   [`doc/musig.md`](https://github.com/LedgerHQ/app-bitcoin-new/blob/dab93a1af0e623d107c227c35a3fb51da4f7585c/doc/musig.md),
   [`policy.c`](https://github.com/LedgerHQ/app-bitcoin-new/blob/dab93a1af0e623d107c227c35a3fb51da4f7585c/src/handler/lib/policy.c).
