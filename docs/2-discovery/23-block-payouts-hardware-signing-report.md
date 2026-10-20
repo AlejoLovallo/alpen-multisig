@@ -19,9 +19,9 @@ sign them in the app today.
 
 **Findings:**
 
-- **Trezor** (Safe 7, Safe 5, Safe 3 and Model T at core 2.12.5; Model One at legacy 1.14.1): blocked at firmware.
+- **Trezor (Safe 7, Safe 5, Safe 3 and Model T at core 2.12.5; Model One at legacy 1.14.1):** blocked at firmware.
   Taproot signing is key-path only. There is no message, input type, or witness writer for a tapscript spend.
-- **Ledger** (Bitcoin app through 2.5.1, on every model): blocked by the wallet policy language. The device signs
+- **Ledger (Bitcoin app through 2.5.1, on every model):** blocked by the wallet policy language. The device signs
   script paths only for outputs it can register as a wallet policy, and this output cannot be registered. Three
   independent reasons, each enough on its own: the leaf ends in `OP_EQUAL` instead of miniscript's `OP_NUMEQUAL`;
   the internal key is a raw aggregate that no derived key expression produces; and the sibling leaf requires no
@@ -203,7 +203,7 @@ Ledger does sign taproot script paths, but only for outputs that match a **regis
 descriptor template plus a list of keys. The device derives the expected `scriptPubKey` from the policy and signs an
 input only if it matches.
 
-| App version | Taproot script-path support | Can it sign `AdminBurn`? |
+| App version | Taproot script-path support | Can it sign AdminBurn? |
 |---|---|---|
 | Up to 2.1.1 (incl. 2.0.x) | None. Key-path `tr(KP)` only. | No |
 | 2.1.2 (3 April 2023) | Up to 8 leaves; leaves limited to `pk`, `multi_a`, `sortedmulti_a` | No |
