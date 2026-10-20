@@ -74,7 +74,7 @@ This report documents:
 Sources: `strata-bridge` at `3b69ece` (draft [PR #800](https://github.com/alpenlabs/strata-bridge/pull/800)) and at
 `main` `5d3c8dc`. The files below are identical at both commits.
 
-**The output being spent** ([`claim_payout.rs`](https://github.com/alpenlabs/strata-bridge/blob/5d3c8dc4bef3246b88b2aa0cdfbe857891422e03/crates/connectors/src/claim_payout.rs)):
+**The output being spent ([`claim_payout.rs`](https://github.com/alpenlabs/strata-bridge/blob/5d3c8dc4bef3246b88b2aa0cdfbe857891422e03/crates/connectors/src/claim_payout.rs)):**
 
 | Piece | Value |
 |---|---|
@@ -87,7 +87,7 @@ Sources: `strata-bridge` at `3b69ece` (draft [PR #800](https://github.com/alpenl
 
 Admin keys keep the order of the bridge `params.toml` `[keys.admin]` list. The script does not sort them.
 
-**Leaf 0 — `AdminBurn`** ([`general.rs`](https://github.com/alpenlabs/strata-bridge/blob/5d3c8dc4bef3246b88b2aa0cdfbe857891422e03/crates/primitives/src/scripts/general.rs#L34), lines 34–56):
+**Leaf 0 — `AdminBurn` ([`general.rs`](https://github.com/alpenlabs/strata-bridge/blob/5d3c8dc4bef3246b88b2aa0cdfbe857891422e03/crates/primitives/src/scripts/general.rs#L34), lines 34–56):**
 
 ```text
 <admin_1> OP_CHECKSIG
@@ -122,7 +122,7 @@ miniscript.
 | 1 | 32 | Internal x-only key: the raw N/N aggregate |
 | 33 | 32 | TapLeaf hash of leaf 1 (the sibling) |
 
-**Witness** (`get_taproot_witness`): one item per admin key, in descending index order. Each item is the 64-byte
+**Witness (`get_taproot_witness`):** one item per admin key, in descending index order. Each item is the 64-byte
 Schnorr signature if that admin signed, or an empty push otherwise. Only the `K` lowest-index signatures are kept.
 For a 2-of-3 where admins 0 and 1 signed:
 
@@ -134,7 +134,7 @@ For a 2-of-3 where admins 0 and 1 signed:
 <control block>
 ```
 
-**Sighash** (`get_signing_info`, [`connectors/src/lib.rs`](https://github.com/alpenlabs/strata-bridge/blob/5d3c8dc4bef3246b88b2aa0cdfbe857891422e03/crates/connectors/src/lib.rs)):
+**Sighash (`get_signing_info`, [`connectors/src/lib.rs`](https://github.com/alpenlabs/strata-bridge/blob/5d3c8dc4bef3246b88b2aa0cdfbe857891422e03/crates/connectors/src/lib.rs)):**
 
 - BIP-341 `SIGHASH_DEFAULT`. No sighash byte appended to the signature.
 - **Script-path message:** the hash includes the leaf hash of `AdminBurn` (BIP-342 extension).
@@ -209,7 +209,7 @@ input only if it matches.
 | 2.1.2 (3 April 2023) | Up to 8 leaves; leaves limited to `pk`, `multi_a`, `sortedmulti_a` | No |
 | 2.2.0 (29 January 2024) to 2.5.1 | Full taproot miniscript; `musig()` from 2.4.0 | No: three blockers below |
 
-**Policy language rules** ([`doc/wallet.md`](https://github.com/LedgerHQ/app-bitcoin-new/blob/master/doc/wallet.md)):
+**Policy language rules ([`doc/wallet.md`](https://github.com/LedgerHQ/app-bitcoin-new/blob/master/doc/wallet.md)):**
 
 - A tap leaf must be `multi_a`, `sortedmulti_a`, or a valid taproot miniscript.
 - Keys are **xpubs**, never raw public keys, and every key is **derived** (`/**` or `/<M;N>/*`).
