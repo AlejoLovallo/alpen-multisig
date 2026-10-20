@@ -3,6 +3,7 @@
 > **Status:** S1a recorded (2026-10-07). Later steps append a section here.
 > Discovery material — not SSOT, not committed scope.
 > Plan: [`21-block-payouts-spike-plan.md`](./21-block-payouts-spike-plan.md).
+> External report built from Track A: [`23-block-payouts-hardware-signing-report.md`](./23-block-payouts-hardware-signing-report.md).
 
 ## Track A — S1a desk research: can an admin sign `AdminBurn` on Trezor or Ledger?
 

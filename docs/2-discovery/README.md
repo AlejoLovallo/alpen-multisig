@@ -62,6 +62,7 @@ The discovery plan was organised around five focused POCs. Each one reduced a sp
 | [`../0-prd/04-relevant-block-payouts-transactions.md`](../0-prd/04-relevant-block-payouts-transactions.md) | On-chain shape of Claim and Admin Block Payouts transactions |
 | [`21-block-payouts-spike-plan.md`](./21-block-payouts-spike-plan.md) | Spike plan — technical context, four tracks with go/no-go criteria, step-by-step execution sequence |
 | [`22-block-payouts-spike-findings.md`](./22-block-payouts-spike-findings.md) | Spike findings — S1a: disassembled `AdminBurn` script and stock Trezor/Ledger signing verdict |
+| [`23-block-payouts-hardware-signing-report.md`](./23-block-payouts-hardware-signing-report.md) | Technical report (external draft) — why stock Trezor/Ledger cannot sign the `AdminBurn` leaf; diagnosis only |
 
 ### Reference material
 
