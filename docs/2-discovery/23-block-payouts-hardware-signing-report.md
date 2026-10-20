@@ -1,4 +1,4 @@
-# Technical Report: Hardware Wallet Signing for Block Payouts
+# Technical Report: Hardware Wallet Signing for Strata Block Payouts
 
 > **Status:** Draft for external review (2026-10-20). Diagnosis only: no proposed solution and no effort estimate.
 > Source-level evidence at pinned commits, checked 2026-10-07.
@@ -215,7 +215,7 @@ Policy language rules ([`doc/wallet.md`](https://github.com/LedgerHQ/app-bitcoin
 - Keys are **xpubs**, never raw public keys, and every key is **derived** (`/**` or `/<M;N>/*`).
 - `musig()` keys (2.4.0+) are aggregated from at most 5 xpubs and then derived
   ([`doc/musig.md`](https://github.com/LedgerHQ/app-bitcoin-new/blob/dab93a1af0e623d107c227c35a3fb51da4f7585c/doc/musig.md)).
-- Every leaf must be *sane*. A leaf that can be satisfied without a signature fails registration with
+- Every leaf must be sane. A leaf that can be satisfied without a signature fails registration with
   "Miniscript does not always require a signature"
   ([`policy.c`](https://github.com/LedgerHQ/app-bitcoin-new/blob/dab93a1af0e623d107c227c35a3fb51da4f7585c/src/handler/lib/policy.c#L1841-L1844),
   `EC_REGISTER_WALLET_POLICY_NOT_SANE`).
