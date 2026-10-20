@@ -6,7 +6,7 @@
 
 ## Executive summary
 
-A `block_payout` spends the **`AdminBurn`** path of the bridge's claim payout connector. That path is a taproot
+A `block_payout` spends the `AdminBurn` path of the bridge's claim payout connector. That path is a taproot
 **script-path** spend over a threshold of admin keys. The bridge protocol defines its shape; the multisig app does not.
 
 A Payout Administrator **can** sign `AdminBurn` with a software key. The upstream test `admin_burn_payout` does it and
