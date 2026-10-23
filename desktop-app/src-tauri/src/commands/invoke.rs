@@ -48,6 +48,7 @@ fn attach_production(builder: tauri::Builder<Wry>) -> tauri::Builder<Wry> {
         super::proposals::proposals_broadcast,
         super::proposals::proposals_create_cancel,
         super::proposals::proposals_resubmit_reveal,
+        super::proposals::proposals_has_stored_bundle,
         super::proposals::proposals_prepare_broadcast_manual,
         super::proposals::proposals_broadcast_manual,
         super::admin_id_certificate::admin_id_certificate_message,
@@ -83,6 +84,7 @@ fn attach_production(builder: tauri::Builder<Wry>) -> tauri::Builder<Wry> {
         super::fee_rates::fee_rates_estimate,
         super::system::write_clipboard,
         super::system::save_json_file,
+        super::system::read_dropped_json,
     ])
 }
 
@@ -123,6 +125,7 @@ fn attach_with_dev_signing(builder: tauri::Builder<Wry>) -> tauri::Builder<Wry> 
         super::proposals::proposals_broadcast,
         super::proposals::proposals_create_cancel,
         super::proposals::proposals_resubmit_reveal,
+        super::proposals::proposals_has_stored_bundle,
         super::proposals::proposals_prepare_broadcast_manual,
         super::proposals::proposals_broadcast_manual,
         super::admin_id_certificate::admin_id_certificate_message,
@@ -163,5 +166,6 @@ fn attach_with_dev_signing(builder: tauri::Builder<Wry>) -> tauri::Builder<Wry> 
         super::fee_rates::fee_rates_estimate,
         super::system::write_clipboard,
         super::system::save_json_file,
+        super::system::read_dropped_json,
     ])
 }

@@ -32,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
         &config.bitcoin_rpc_user,
         &config.bitcoin_rpc_pass,
     ));
+    warn_without_txindex(btc_client.clone());
 
     let state = if let Some(database_url) = &config.database_url {
         let pool = PgPoolOptions::new()
@@ -92,4 +93,28 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app).await.context("server error")?;
 
     Ok(())
+}
+
+/// A node without `-txindex` cannot find a mined reveal, so the orchestrator cannot tell which of a
+/// proposal's commit + reveal pairs was mined first and takes the desktop's report unchecked (#605). Checked once in the background so a slow node does not hold
+/// back startup; the operator sees it in the log.
+fn warn_without_txindex(btc_client: Arc<infrastructure::bitcoin_rpc::HttpBitcoinRpcClient>) {
+    tokio::spawn(async move {
+        use infrastructure::bitcoin_rpc::TxIndex;
+        match btc_client.txindex().await {
+            Ok(TxIndex::Synced) => {
+                tracing::info!("bitcoin node keeps a transaction index (-txindex)")
+            }
+            Ok(TxIndex::Syncing) => tracing::warn!(
+                "bitcoin node is still building its transaction index: until it is synced, the \
+                 reconcile cannot confirm a proposal with more than one commit + reveal pair"
+            ),
+            Ok(TxIndex::Missing) => tracing::error!(
+                "bitcoin node runs without -txindex: for a proposal with more than one commit + \
+                 reveal pair the orchestrator cannot check which was mined first and takes the \
+                 desktop's report; restart bitcoind with -txindex=1"
+            ),
+            Err(e) => tracing::warn!(error = %e, "could not check the bitcoin node for -txindex"),
+        }
+    });
 }
