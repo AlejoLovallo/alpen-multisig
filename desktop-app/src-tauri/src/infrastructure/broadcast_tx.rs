@@ -18,6 +18,7 @@ use strata_l1_envelope_fmt::builder::EnvelopeScriptBuilder;
 use strata_l1_txfmt::{MagicBytes, ParseConfig};
 
 use crate::domain::proposal::ProposalSignature;
+use crate::domain::signer_id::SignerId;
 use crate::infrastructure::admin_wallet::wallet::{device_hrp_network, render_address_with_hrp};
 use crate::infrastructure::hw_wallet::hw_psbt_signer::HwDeviceType;
 
@@ -43,9 +44,10 @@ pub fn build_signed_payload_bytes(
     let indexed: Vec<IndexedSignature> = signatures
         .iter()
         .map(|sig| {
+            let signer = SignerId::from_pubkey_hex(&sig.signer_pubkey);
             let index = canonical_pubkeys_hex
                 .iter()
-                .position(|k| k.eq_ignore_ascii_case(&sig.signer_pubkey))
+                .position(|k| signer.is_some() && SignerId::from_pubkey_hex(k) == signer)
                 .ok_or_else(|| {
                     format!(
                         "signer {} not found in canonical key set",
@@ -121,7 +123,14 @@ pub fn build_signed_payload_bytes(
 }
 
 /// Compute the SPS-65 sighash for a proposal's action and sequence number.
-pub fn compute_sighash(seq_no: u64, action_hex: &str) -> Result<[u8; 32], String> {
+///
+/// `_network` is not read at this pin. From the v0.5 pin on it feeds `SigningMessage::for_action`,
+/// whose message names the network.
+pub fn compute_sighash(
+    seq_no: u64,
+    action_hex: &str,
+    _network: bitcoin::Network,
+) -> Result<[u8; 32], String> {
     let action_bytes = hex::decode(action_hex).map_err(|e| format!("invalid action hex: {e}"))?;
     let action = MultisigAction::from_ssz_bytes(&action_bytes)
         .map_err(|e| format!("invalid SSZ action: {e:?}"))?;
