@@ -97,6 +97,40 @@ There is **no** bridge RPC/duty/S2 method that returns an unsigned AdminBurn. As
 7. **Hardware wallet:** still impossible on stock Trezor/Ledger. Software keys are the viable path this spike proved.
 8. **No admin-burn RPC** on the bridge node.
 
+# Strata bridge mockup reasons
+
+The spike **does** use real `strata-bridge` crates (`ClaimPayoutConnector`, `AdminBurnTx`, sighash, witness). What is mocked is the **live bridge stack**: no operator nodes, Secret Service, FoundationDB, SP1, or a protocol `ClaimTx`.
+
+That is intentional. Light Stage 1 asked whether we can **build, software-sign, and broadcast** an AdminBurn, and whether we can **depend on bridge code** without exploding the app workspace. It did not require proving the full claim-game on a running mosaic.
+
+### Why not run the strata-bridge node
+
+1. **Admin burn is already external to the node.** There is no `GraphDuty`, S2 stub, or RPC that returns an unsigned AdminBurn. Operators do not sign this path. A running bridge would only observe the spend on chain (`PayoutConnectorSpent`) after the fact.
+2. **The pin clash is measured without a node.** Path-deps compile `tx-graph` / `connectors`. That is enough to know the app workspace cannot absorb them today.
+3. **A fake Claim is enough for Bitcoin.** AdminBurn only needs the payout connector at **vout 1** of `claim_txid`. A locally funded taproot output with the same script is a consensus-valid spend. Contest connector, CPFP, MuSig2 presigns, and operator N/N as a live aggregate are irrelevant to “does bitcoind accept this witness?”.
+
+### What stayed mocked (and why)
+
+| Mock | Reason |
+|---|---|
+| Random admin keys, N/N, `unstaking_image` | Production values live in `params.toml` + per-graph stake data. No loader in alpen-multisig yet; wrong values only matter when spending a **real** Claim output. |
+| Funded tx with connector at vout 1 (not `ClaimTx`) | Same tap tree / vout index `AdminBurnTx` expects. Avoids assembling the full game graph. |
+| bitcoind wallet coinbase as fee | Product fee path is Admin Wallet BIP-86 (desktop). Out of spike scope; still a real L1 fee input. |
+| In-process `collect_threshold` | Product coordination (orchestrator, several machines) is Stage 2. Crypto is the same: K independent `SigningInfo::sign` calls. |
+| No false-claim proof | `verify_contest` / `verify_ack` are on draft bridge PR #800, not `main`. Format still unspecified in the app. |
+
+### What is *not* a mock
+
+- Script, tap tree, control block, BIP-341 script-path sighash, Schnorr signatures, version-3 tx.
+- `bitcoind` mempool + mine on the ignored regtest test.
+- Compile of real upstream crates (isolated workspace).
+
+### When the live node *would* be required
+
+Only for the stretch not done here: take a `claim_txid` from a running graph, rebuild the connector from **that** graph’s N/N + `[keys.admin]` + `unstaking_image`, burn it, and watch the bridge GSM abort. That is Stage 2 / S6 in the develop plan, not a blocker for the software-signing go.
+
+To reproduce this spike you need the **source** of `strata-bridge` as a sibling path (`../../strata-bridge`). You do **not** need to start the node.
+
 ## What this spike is not
 
 - Desktop app / Tauri / UI
