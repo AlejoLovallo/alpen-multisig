@@ -1,0 +1,21 @@
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "block-payout-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Feasibility spike: K-of-M software signing of AdminBurn (block_payout) without a hardware wallet."
+
+[dependencies]
+bitcoin = { version = "0.32.9", features = ["rand-std", "serde"] }
+secp256k1 = { version = "0.29.1", features = ["global-context", "std", "rand-std"] }
+strata-bridge-connectors = { path = "../../strata-bridge/crates/connectors" }
+strata-bridge-tx-graph = { path = "../../strata-bridge/crates/tx-graph" }
+
+[dev-dependencies]
+corepc-node = { version = "0.12.0", features = ["30_2", "download"] }
+strata-bridge-connectors = { path = "../../strata-bridge/crates/connectors", features = ["test_utils"] }
