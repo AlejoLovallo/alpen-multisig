@@ -6,6 +6,7 @@
 
 pub mod build;
 pub mod fixture;
+pub mod from_bridge;
 pub mod sign;
 
 pub use build::{build_admin_burn, dummy_fee_input, FEE};

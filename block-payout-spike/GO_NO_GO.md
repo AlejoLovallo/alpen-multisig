@@ -1,5 +1,7 @@
 # GO / NO-GO — block_payout without hardware wallet
 
+> **Actualización 2026-10-29:** la tabla «Parent workspace extra check» y el mapa de datos están superados por [`INFORME_PUNTOS_3_Y_4.md`](INFORME_PUNTOS_3_Y_4.md). Contra el release v0.4.1 los pins de la app ya coinciden con los del bridge.
+
 Spike crate: `alpen-multisig/block-payout-spike/`
 Date: 2026-10-26
 

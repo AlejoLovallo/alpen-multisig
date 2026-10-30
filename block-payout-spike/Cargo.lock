@@ -289,10 +289,14 @@ name = "block-payout-spike"
 version = "0.1.0"
 dependencies = [
  "bitcoin",
+ "bitcoin-bosd",
  "corepc-node",
  "secp256k1",
+ "serde_json",
  "strata-bridge-connectors",
+ "strata-bridge-primitives",
  "strata-bridge-tx-graph",
+ "strata-l1-txfmt",
 ]
 
 [[package]]
